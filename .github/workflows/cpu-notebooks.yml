@@ -12,15 +12,20 @@ on:
         default: synthetic
         options: [synthetic, yfinance, alpaca]
       universe_file:
-        description: "Repository CSV with a symbol column (Alpaca only)"
+        description: "Repository CSV with a symbol column"
         type: string
         default: assets/universe.example.csv
+      universe_source:
+        description: "Use a repository universe file or fetch current S&P 500 constituents from Wikipedia"
+        type: choice
+        default: repository
+        options: [repository, sp500_wikipedia]
       start:
-        description: "UTC start (Alpaca only)"
+        description: "UTC start; yfinance one-minute range must be at most eight days"
         type: string
-        default: "2026-06-01"
+        default: "2026-07-20"
       end:
-        description: "UTC end (Alpaca only)"
+        description: "UTC end"
         type: string
         default: "2026-07-27"
       max_weight:
@@ -114,19 +119,29 @@ jobs:
           cache: pip
       - name: Install CPU-only dependencies
         run: pip install -r requirements.txt
+      - name: Select research universe
+        run: |
+          if [ "${{ inputs.universe_source }}" = "sp500_wikipedia" ]; then
+            python -m cufolio_cpu.universe --output artifacts/current_sp500_universe.csv
+            echo "UNIVERSE_FILE=artifacts/current_sp500_universe.csv" >> "$GITHUB_ENV"
+          else
+            echo "UNIVERSE_FILE=${{ inputs.universe_file }}" >> "$GITHUB_ENV"
+          fi
       - name: Download regular-session one-minute Yahoo Finance bars
         run: |
           python -m cufolio_cpu.yfinance_data \
-            --symbols "${{ inputs.universe_file }}" \
+            --symbols "$UNIVERSE_FILE" \
             --start "${{ inputs.start }}" \
             --end "${{ inputs.end }}" \
-            --output artifacts/yfinance_minute_bars.csv
+            --output artifacts/yfinance_minute_bars.csv \
+            --report artifacts/yfinance_download_report.csv
       - name: Aggregate daily returns and calculate research weights
         run: |
           python -m cufolio_cpu.research \
             --input artifacts/yfinance_minute_bars.csv \
             --output-dir artifacts/research \
-            --max-weight "${{ inputs.max_weight }}"
+            --max-weight "${{ inputs.max_weight }}" \
+            --allow-insufficient
       - uses: actions/upload-artifact@v4
         with:
           name: yfinance-minute-return-research
