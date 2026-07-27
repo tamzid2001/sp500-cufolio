@@ -48,7 +48,12 @@ def run_research(
     result = mean_cvar_weights(
         complete, max_weight=max_weight, risk_aversion=risk_aversion
     )
-    weights = result.weights.rename("target_weight").sort_values(ascending=False).reset_index(names="symbol")
+    weights = (
+        result.weights.rename("target_weight")
+        .sort_values(ascending=False)
+        .rename_axis("symbol")
+        .reset_index()
+    )
     weights["solver_status"] = result.status
     weights["historical_expected_daily_return"] = result.expected_return
     weights["historical_cvar"] = result.cvar

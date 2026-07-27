@@ -102,6 +102,27 @@ by itself validate a prediction of the next 500 minutes or create a buy/order
 instruction. The manual workflow can fetch a current 500-symbol convenience
 universe from Wikipedia, but that universe is not point-in-time historical
 membership and must not be used to claim a survivorship-bias-free backtest.
+
+### Forward 500-trading-minute research
+
+The manual yfinance workflow additionally runs a separate, research-only
+forward-horizon model. It uses trailing intraday returns and volatility to rank
+stocks by predicted forward log return, validates later time blocks with a
+purge that excludes labels overlapping the test window, and writes:
+
+```text
+forward_500m_research/forward_500m_validation.csv
+forward_500m_research/forward_500m_candidate_portfolio.csv
+forward_500m_research/forward_500m_status.json
+```
+
+The requested horizon is 500 **trading** minutes. One-minute bars represent it
+exactly; fifteen-minute bars require 34 bars, so the output explicitly reports
+an effective 510-minute horizon. The candidate portfolio is generated only
+after 20 actual market sessions and at least two purged validation folds. It is
+research output, not an optimal personal portfolio, a buy recommendation, or
+an order instruction.
+
 The resulting target weights are research output only—not investment advice,
 account-specific share quantities, or order instructions.
 

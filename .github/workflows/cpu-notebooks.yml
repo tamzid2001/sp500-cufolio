@@ -154,6 +154,15 @@ jobs:
             --max-weight "${{ inputs.max_weight }}" \
             --min-bars-per-session "$MIN_BARS_PER_SESSION" \
             --allow-insufficient
+      - name: Validate forward 500-minute research candidates
+        run: |
+          python -m cufolio_cpu.intraday_forward \
+            --input artifacts/yfinance_intraday_bars.csv \
+            --interval "${{ inputs.yfinance_interval }}" \
+            --output-dir artifacts/forward_500m_research \
+            --horizon-minutes 500 \
+            --top-n 20 \
+            --max-weight 0.10
       - uses: actions/upload-artifact@v4
         with:
           name: yfinance-intraday-return-research
