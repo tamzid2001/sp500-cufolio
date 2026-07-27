@@ -72,23 +72,32 @@ Alpaca's separate `StockHistoricalDataClient`/`StockBarsRequest` API surface.
 
 ## Paper-only portfolio execution
 
-`assets/paper_target_weights.csv` is the current reviewed, fully invested
-long-only target allocation: EXPD, HST, AES, EA, LYV, LIN, SNA, and VICI are
-capped at 10%; AKAM, AZO, DXCM, QCOM, IDXX, KIM, and APTV split the remaining
-20%. It contains the exact `symbol,target_weight` contract accepted by the
-executor. A replacement daily research output may be used only when it has the
-same columns, unique positive weights summing to 1.0, and no weight exceeding
-the configured 10% cap.
+`daily_cycle` is a current-S&P-500, one-trading-day long-only strategy. Each
+market-hours cycle fetches the current 500-company universe (503 listed share
+classes), takes only the 90 completed sessions before today's open, scores all
+eligible symbols, then runs a capped long-only Mean-CVaR solve on the strongest
+50 candidates using 2,000 joint bootstrap scenarios. It makes at most 20
+candidates available to the solver and limits each holding to 10%. Because the
+data cutoff and bootstrap seed are fixed to the session date, every 15-minute
+cycle has the same daily target rather than using an in-progress daily close.
 
-The executor is deliberately isolated from the research code. It is pinned to
-`https://paper-api.alpaca.markets/v2` and has no live-account switch. During
-regular market hours, a cycle checks the paper account, clock, assets,
-positions, and open orders; uses fractional day market orders; keeps the
-account cash-only; and skips drift below both the $1 order minimum and a 25 bps
-absolute portfolio-weight band. It never opens a short position or sells a
-non-target security. If a target is overweight, it submits only the sell orders
-and waits for them to fill before a later cycle submits replacement buys. Any
-open order for a target blocks a new cycle.
+The paper workflow runs every 15 minutes on weekdays, at minutes 3, 18, 33,
+and 48 to avoid the top-of-hour Actions queue. It uses fractional day market
+orders, keeps purchases cash-only, and ignores movement below both $1 and a
+25 bps absolute portfolio-weight drift band. A changed daily target sells all
+old target holdings first and waits for fills before making the new buys.
+
+At 14:48 America/New_York, a separate Action solves and commits the dated
+target for the next market session using only completed prior-session data.
+Beginning 30 minutes before the close, the 15-minute loop reads that already
+solved target, retains positions that overlap it, and uses Alpaca's
+position-close endpoint only for positions absent from it. New names are bought
+after the following open. This minimizes needless sell/buy churn across daily
+portfolios; overlapping positions can span the session boundary. Use a
+dedicated strategy account because removed manual positions would be treated as
+non-target strategy holdings. The GitHub scheduler is best-effort and can be
+delayed, so it cannot guarantee a pre-close exit; use an always-on/self-hosted
+runner or broker-hosted scheduling when a guaranteed exit deadline is required.
 
 Create a local `.env` from `.env.example` and set the two keys there (the file
 is ignored by Git). Export them before a plan-only local preview:
@@ -102,22 +111,48 @@ python -m cufolio_cpu.paper_rebalance \
   --report artifacts/paper-rebalance/local-plan.json
 ```
 
-Add `--execute` only to send the planned orders, and only to Alpaca's paper
-endpoint:
+Run a current-S&P-500 paper preview locally:
 
 ```bash
-python -m cufolio_cpu.paper_rebalance \
-  --targets assets/paper_target_weights.csv \
-  --report artifacts/paper-rebalance/local-execution.json \
-  --execute
+python -m cufolio_cpu.daily_cycle \
+  --mode paper \
+  --targets assets/active_daily_target.csv \
+  --target-status assets/active_daily_target_status.json \
+  --report artifacts/daily-cycle/local-plan.json
 ```
 
-`.github/workflows/paper-rebalance.yml` runs one cycle every 15 minutes on
-weekdays (and exits when the paper market is closed). Set `ALPACA_API_KEY` and
+Add `--execute` to submit the paper orders. `.github/workflows/paper-rebalance.yml`
+passes that flag only on its scheduled runs; a manually dispatched run remains
+plan-only unless its `execute` input is checked. Set `ALPACA_API_KEY` and
 `ALPACA_SECRET_KEY` as repository Actions secrets; do not put them in a tracked
-file. Scheduled GitHub Actions are best-effort and can start late under GitHub
-load, but concurrency is locked so execution cycles cannot overlap. A manually
-dispatched run plans only unless its `execute` input is checked.
+file. Concurrency is locked so cycles cannot overlap.
+
+`assets/paper_target_weights.csv` remains available for a deliberate, ad-hoc
+rebalance through `cufolio_cpu.paper_rebalance`; it is no longer the scheduled
+strategy input.
+
+### Live mode is deliberately manual
+
+The scheduler is paper-only. To enable a live preview or order submission, set
+the separate `ALPACA_LIVE_API_KEY` and `ALPACA_LIVE_SECRET_KEY` variables and
+use both explicit safeguards:
+
+```bash
+python -m cufolio_cpu.prepare_daily_target \
+  --mode live \
+  --output assets/live_daily_target.csv \
+  --status assets/live_daily_target_status.json
+
+python -m cufolio_cpu.daily_cycle \
+  --mode live \
+  --allow-live-trading \
+  --targets assets/live_daily_target.csv \
+  --target-status assets/live_daily_target_status.json \
+  --report artifacts/daily-cycle/live-plan.json
+```
+
+Only add `--execute` after reviewing the plan. Live credentials never fall back
+to the paper variables, and no GitHub Actions live-trading workflow is enabled.
 
 ## yfinance (credential-free research)
 
@@ -184,8 +219,7 @@ account-specific share quantities, or order instructions.
 then executes every CPU notebook with deterministic synthetic data. It neither
 installs nor connects to NVIDIA software or infrastructure.
 
-This is research software with an opt-in paper-trading executor, not investment
-advice or a live-money execution system.
+This is research software with opt-in execution tooling, not investment advice.
 
 ## Attribution
 

@@ -2,7 +2,8 @@ name: Paper portfolio rebalance
 
 on:
   schedule:
-    - cron: "*/15 * * * 1-5"
+    # Offset from the top of the hour to reduce GitHub scheduler congestion.
+    - cron: "3,18,33,48 * * * 1-5"
   workflow_dispatch:
     inputs:
       execute:
@@ -45,8 +46,11 @@ jobs:
         shell: bash
         run: |
           args=(
-            --targets assets/paper_target_weights.csv
             --report artifacts/paper-rebalance/report.json
+            --targets assets/active_daily_target.csv
+            --target-status assets/active_daily_target_status.json
+            --mode paper
+            --close-buffer-minutes 30
             --max-weight 0.10
             --min-order-notional "${{ inputs.min_order_notional || '1.00' }}"
             --min-weight-drift 0.0025
@@ -54,7 +58,7 @@ jobs:
           if [[ "${{ github.event_name }}" == "schedule" || "${{ inputs.execute }}" == "true" ]]; then
             args+=(--execute)
           fi
-          python -m cufolio_cpu.paper_rebalance "${args[@]}"
+          python -m cufolio_cpu.daily_cycle "${args[@]}"
       - uses: actions/upload-artifact@v4
         if: always()
         with:

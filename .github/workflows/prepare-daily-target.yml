@@ -1,0 +1,67 @@
+name: Prepare next-session paper target
+
+on:
+  schedule:
+    # 14:48 America/New_York is 72 minutes before the regular-session close.
+    - cron: "48 14 * * 1-5"
+      timezone: "America/New_York"
+  workflow_dispatch:
+    inputs:
+      top_n:
+        description: "Maximum long-only candidates passed to the optimizer"
+        type: string
+        default: "20"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: cufolio-prepare-daily-target
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    env:
+      PYTHONPATH: ${{ github.workspace }}/src
+      ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
+      ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Verify paper credentials are available
+        run: |
+          test -n "$ALPACA_API_KEY"
+          test -n "$ALPACA_SECRET_KEY"
+      - name: Prepare tomorrow's full-S&P-500 target
+        run: |
+          python -m cufolio_cpu.prepare_daily_target \
+            --mode paper \
+            --output assets/active_daily_target.csv \
+            --status assets/active_daily_target_status.json \
+            --lookback-calendar-days 180 \
+            --lookback-sessions 90 \
+            --candidate-count 50 \
+            --top-n "${{ inputs.top_n || '20' }}" \
+            --max-weight 0.10 \
+            --scenario-count 2000
+      - name: Commit the dated target for the next market session
+        shell: bash
+        run: |
+          if git diff --quiet -- assets/active_daily_target.csv assets/active_daily_target_status.json; then
+            echo "No next-session target was produced."
+            exit 0
+          fi
+          git config user.name "cufolio paper target bot"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add assets/active_daily_target.csv assets/active_daily_target_status.json
+          git commit -m "Prepare next-session paper target"
+          git push
