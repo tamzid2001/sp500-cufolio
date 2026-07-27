@@ -1,4 +1,4 @@
-"""Credential-free Yahoo Finance downloader for short-horizon research data."""
+"""Credential-free Yahoo Finance intraday-bar downloader for research data."""
 
 from __future__ import annotations
 
@@ -11,7 +11,13 @@ import pandas as pd
 
 from .alpaca import load_symbols
 
-MAX_ONE_MINUTE_WINDOW = pd.Timedelta("8D")
+# These are deliberately conservative guards based on the current Yahoo
+# Finance responses observed by this project.  They prevent a truncated server
+# response from being mistaken for a full research history.
+MAX_WINDOW_BY_INTERVAL = {
+    "1m": pd.Timedelta("8D"),
+    "15m": pd.Timedelta("60D"),
+}
 
 
 def _utc_timestamp(value: str | datetime) -> pd.Timestamp:
@@ -38,27 +44,32 @@ def _close_frame(raw: pd.DataFrame, symbol: str) -> pd.DataFrame:
     return result.loc[:, ["timestamp", "symbol", "close"]]
 
 
-def download_minute_bars(
+def download_intraday_bars(
     symbols: list[str],
     start: str | datetime,
     end: str | datetime,
     *,
+    interval: str = "1m",
     batch_size: int = 25,
     retries: int = 3,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Download regular-session one-minute bars without sending any orders.
+    """Download regular-session intraday bars without sending any orders.
 
-    Yahoo Finance currently limits one-minute retrieval to a short recent
-    window. The explicit eight-day guard prevents a partial response being
-    mistaken for a complete historical S&P 500 backtest.
+    The supported intervals have explicit server-window guards so a partial
+    Yahoo response cannot be mistaken for a complete historical backtest.
     """
     if batch_size < 1:
         raise ValueError("batch_size must be positive")
+    if interval not in MAX_WINDOW_BY_INTERVAL:
+        raise ValueError(f"unsupported interval {interval!r}; choose from {sorted(MAX_WINDOW_BY_INTERVAL)}")
     start_at, end_at = _utc_timestamp(start), _utc_timestamp(end)
     if start_at >= end_at:
         raise ValueError("start must precede end")
-    if end_at - start_at > MAX_ONE_MINUTE_WINDOW:
-        raise ValueError("Yahoo Finance one-minute retrieval is currently limited to an eight-day window")
+    max_window = MAX_WINDOW_BY_INTERVAL[interval]
+    if end_at - start_at > max_window:
+        raise ValueError(
+            f"Yahoo Finance {interval} retrieval is currently limited to a {max_window.days}-day window"
+        )
 
     import yfinance as yf
 
@@ -73,7 +84,7 @@ def download_minute_bars(
                     tickers=batch,
                     start=start_at.to_pydatetime(),
                     end=end_at.to_pydatetime(),
-                    interval="1m",
+                    interval=interval,
                     auto_adjust=True,
                     prepost=False,
                     group_by="ticker",
@@ -87,6 +98,7 @@ def download_minute_bars(
                     report_rows.append(
                         {
                             "symbol": symbol,
+                            "interval": interval,
                             "status": "downloaded" if not frame.empty else "no_data",
                             "rows": len(frame),
                             "message": "",
@@ -99,34 +111,53 @@ def download_minute_bars(
                     time.sleep(2**attempt)
         else:
             report_rows.extend(
-                {"symbol": symbol, "status": "request_failed", "rows": 0, "message": str(last_error)}
+                {
+                    "symbol": symbol,
+                    "interval": interval,
+                    "status": "request_failed",
+                    "rows": 0,
+                    "message": str(last_error),
+                }
                 for symbol in batch
             )
         if offset + batch_size < len(symbols):
             time.sleep(0.25)
     result = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
-    report = pd.DataFrame(report_rows, columns=["symbol", "status", "rows", "message"])
+    report = pd.DataFrame(report_rows, columns=["symbol", "interval", "status", "rows", "message"])
     if result.empty:
         return pd.DataFrame(columns=["timestamp", "symbol", "close"]), report
     return result.sort_values(["symbol", "timestamp"]).drop_duplicates(["symbol", "timestamp"]), report
 
 
+# Kept for callers of the original one-minute-only public helper.
+def download_minute_bars(
+    symbols: list[str], start: str | datetime, end: str | datetime, **kwargs: object
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Backward-compatible alias for ``download_intraday_bars(..., interval='1m')``."""
+    if "interval" in kwargs:
+        raise TypeError("download_minute_bars always uses interval='1m'")
+    return download_intraday_bars(symbols, start, end, interval="1m", **kwargs)
+
+
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Download Yahoo Finance one-minute bars; never submits orders.")
+    parser = argparse.ArgumentParser(description="Download Yahoo Finance intraday bars; never submits orders.")
     parser.add_argument("--symbols", required=True, help="CSV containing a symbol column")
-    parser.add_argument("--start", required=True, help="UTC start date/time; maximum eight days before end")
+    parser.add_argument("--start", required=True, help="UTC start date/time")
     parser.add_argument("--end", required=True, help="UTC end date/time")
-    parser.add_argument("--output", required=True, help="minute-bar CSV output path")
+    parser.add_argument("--interval", choices=sorted(MAX_WINDOW_BY_INTERVAL), default="1m")
+    parser.add_argument("--output", required=True, help="intraday-bar CSV output path")
     parser.add_argument("--report", required=True, help="per-symbol data-retrieval report CSV")
     parser.add_argument("--batch-size", type=int, default=25)
     args = parser.parse_args()
-    bars, report = download_minute_bars(load_symbols(args.symbols), args.start, args.end, batch_size=args.batch_size)
+    bars, report = download_intraday_bars(
+        load_symbols(args.symbols), args.start, args.end, interval=args.interval, batch_size=args.batch_size
+    )
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
     bars.to_csv(output, index=False)
     report.to_csv(args.report, index=False)
     count = bars["symbol"].nunique() if not bars.empty else 0
-    print(f"Wrote {len(bars):,} one-minute bars for {count} symbols to {output}")
+    print(f"Wrote {len(bars):,} {args.interval} bars for {count} symbols to {output}")
     if bars.empty:
         raise RuntimeError(f"Yahoo Finance returned no usable bars; inspect {args.report}")
 

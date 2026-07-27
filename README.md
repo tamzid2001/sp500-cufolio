@@ -79,22 +79,29 @@ pip install -r requirements.txt
 python -m cufolio_cpu.yfinance_data \
   --symbols assets/universe.example.csv \
   --start 2026-07-20 --end 2026-07-27 \
-  --output data/yfinance_minute_bars.csv \
+  --interval 1m \
+  --output data/yfinance_intraday_bars.csv \
   --report data/yfinance_download_report.csv
 python -m cufolio_cpu.research \
-  --input data/yfinance_minute_bars.csv --output-dir outputs/research
+  --input data/yfinance_intraday_bars.csv --output-dir outputs/research
 ```
 
-The manual `yfinance` workflow performs these same steps and uploads its
-minute bars, daily log returns, daily simple returns, and `research_target_weights.csv`.
-The observed Yahoo Finance API limit is currently eight calendar days for
-one-minute bars, so the code rejects larger ranges instead of producing an
-incomplete history. Five market sessions validate the data pipeline but do not
-meet the 20-session minimum for model weights; the workflow emits an explicit
-`research_status.json` rather than a fabricated allocation. The manual workflow
-can fetch a current 500-symbol convenience universe from Wikipedia, but that
-universe is not point-in-time historical membership and must not be used to
-claim a survivorship-bias-free backtest.
+The manual `yfinance` workflow performs the same steps and uploads intraday
+bars, daily log returns, daily simple returns, and `research_target_weights.csv`.
+Use the `1m` interval for an eight-calendar-day maximum window, or `15m` for a
+60-calendar-day maximum window. The workflow uses at least 300 one-minute
+return observations or 20 fifteen-minute return observations per regular
+session, respectively. In both modes it computes session returns from intraday
+log returns and never crosses an overnight boundary.
+
+Five market sessions validate the data pipeline but do not meet the 20-session
+minimum for model weights; the workflow emits an explicit
+`research_status.json` rather than a fabricated allocation. A 15-minute window
+can provide enough daily observations for the *research* optimizer. It does not
+by itself validate a prediction of the next 500 minutes or create a buy/order
+instruction. The manual workflow can fetch a current 500-symbol convenience
+universe from Wikipedia, but that universe is not point-in-time historical
+membership and must not be used to claim a survivorship-bias-free backtest.
 The resulting target weights are research output only—not investment advice,
 account-specific share quantities, or order instructions.
 

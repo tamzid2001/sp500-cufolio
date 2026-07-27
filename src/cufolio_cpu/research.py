@@ -1,4 +1,4 @@
-"""Produce reproducible research weights from a local minute-bar file."""
+"""Produce reproducible research weights from a local intraday-bar file."""
 
 from __future__ import annotations
 
@@ -58,17 +58,24 @@ def run_research(
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Create research target weights from one-minute bars.")
-    parser.add_argument("--input", required=True, help="minute-bar CSV: timestamp,symbol,close")
+    parser = argparse.ArgumentParser(description="Create research target weights from intraday bars.")
+    parser.add_argument("--input", required=True, help="intraday-bar CSV: timestamp,symbol,close")
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--max-weight", type=float, default=0.05)
     parser.add_argument("--risk-aversion", type=float, default=5.0)
+    parser.add_argument(
+        "--min-bars-per-session",
+        type=int,
+        default=300,
+        help="minimum intraday return observations required for a complete session",
+    )
     parser.add_argument("--allow-insufficient", action="store_true")
     args = parser.parse_args()
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     logs, simple, weights, status = run_research(
         pd.read_csv(args.input),
+        min_minutes_per_session=args.min_bars_per_session,
         max_weight=args.max_weight,
         risk_aversion=args.risk_aversion,
         allow_insufficient=args.allow_insufficient,

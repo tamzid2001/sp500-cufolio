@@ -21,13 +21,18 @@ on:
         default: repository
         options: [repository, sp500_wikipedia]
       start:
-        description: "UTC start; yfinance one-minute range must be at most eight days"
+        description: "UTC start; 1m supports up to 8 days and 15m up to 60 days"
         type: string
-        default: "2026-07-20"
+        default: "2026-06-01"
       end:
         description: "UTC end"
         type: string
         default: "2026-07-27"
+      yfinance_interval:
+        description: "Yahoo Finance intraday interval"
+        type: choice
+        default: "15m"
+        options: ["1m", "15m"]
       max_weight:
         description: "Maximum research portfolio weight; use >= 1 / usable assets"
         type: string
@@ -108,7 +113,7 @@ jobs:
   yfinance-research:
     if: github.event_name == 'workflow_dispatch' && inputs.data_source == 'yfinance'
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 30
     env:
       PYTHONPATH: ${{ github.workspace }}/src
     steps:
@@ -127,22 +132,29 @@ jobs:
           else
             echo "UNIVERSE_FILE=${{ inputs.universe_file }}" >> "$GITHUB_ENV"
           fi
-      - name: Download regular-session one-minute Yahoo Finance bars
+      - name: Download regular-session Yahoo Finance intraday bars
         run: |
           python -m cufolio_cpu.yfinance_data \
             --symbols "$UNIVERSE_FILE" \
             --start "${{ inputs.start }}" \
             --end "${{ inputs.end }}" \
-            --output artifacts/yfinance_minute_bars.csv \
+            --interval "${{ inputs.yfinance_interval }}" \
+            --output artifacts/yfinance_intraday_bars.csv \
             --report artifacts/yfinance_download_report.csv
       - name: Aggregate daily returns and calculate research weights
         run: |
+          if [ "${{ inputs.yfinance_interval }}" = "15m" ]; then
+            MIN_BARS_PER_SESSION=20
+          else
+            MIN_BARS_PER_SESSION=300
+          fi
           python -m cufolio_cpu.research \
-            --input artifacts/yfinance_minute_bars.csv \
+            --input artifacts/yfinance_intraday_bars.csv \
             --output-dir artifacts/research \
             --max-weight "${{ inputs.max_weight }}" \
+            --min-bars-per-session "$MIN_BARS_PER_SESSION" \
             --allow-insufficient
       - uses: actions/upload-artifact@v4
         with:
-          name: yfinance-minute-return-research
+          name: yfinance-intraday-return-research
           path: artifacts
