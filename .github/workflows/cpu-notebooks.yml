@@ -7,10 +7,10 @@ on:
   workflow_dispatch:
     inputs:
       data_source:
-        description: "Synthetic CI data, or an optional Alpaca minute-bar download"
+        description: "Synthetic CI data, yfinance research data, or optional Alpaca minute-bar download"
         type: choice
         default: synthetic
-        options: [synthetic, alpaca]
+        options: [synthetic, yfinance, alpaca]
       universe_file:
         description: "Repository CSV with a symbol column (Alpaca only)"
         type: string
@@ -18,11 +18,15 @@ on:
       start:
         description: "UTC start (Alpaca only)"
         type: string
-        default: "2026-01-02"
+        default: "2026-06-01"
       end:
         description: "UTC end (Alpaca only)"
         type: string
-        default: "2026-01-31"
+        default: "2026-07-27"
+      max_weight:
+        description: "Maximum research portfolio weight; use >= 1 / usable assets"
+        type: string
+        default: "0.30"
 
 permissions:
   contents: read
@@ -95,3 +99,35 @@ jobs:
         with:
           name: alpaca-minute-bars
           path: artifacts/alpaca_minute_bars.csv
+
+  yfinance-research:
+    if: github.event_name == 'workflow_dispatch' && inputs.data_source == 'yfinance'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      PYTHONPATH: ${{ github.workspace }}/src
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install CPU-only dependencies
+        run: pip install -r requirements.txt
+      - name: Download regular-session one-minute Yahoo Finance bars
+        run: |
+          python -m cufolio_cpu.yfinance_data \
+            --symbols "${{ inputs.universe_file }}" \
+            --start "${{ inputs.start }}" \
+            --end "${{ inputs.end }}" \
+            --output artifacts/yfinance_minute_bars.csv
+      - name: Aggregate daily returns and calculate research weights
+        run: |
+          python -m cufolio_cpu.research \
+            --input artifacts/yfinance_minute_bars.csv \
+            --output-dir artifacts/research \
+            --max-weight "${{ inputs.max_weight }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: yfinance-minute-return-research
+          path: artifacts

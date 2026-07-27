@@ -70,6 +70,27 @@ The GitHub Actions workflow always runs synthetic data in normal CI. Its manual
 only downloads minute bars then writes a build artifact. The data client follows
 Alpaca's separate `StockHistoricalDataClient`/`StockBarsRequest` API surface.
 
+## yfinance (credential-free research)
+
+For a short recent research window, no Alpaca keys are required:
+
+```bash
+pip install -r requirements.txt
+python -m cufolio_cpu.yfinance_data \
+  --symbols assets/universe.example.csv \
+  --start 2026-06-01 --end 2026-07-27 \
+  --output data/yfinance_minute_bars.csv
+python -m cufolio_cpu.research \
+  --input data/yfinance_minute_bars.csv --output-dir outputs/research
+```
+
+The manual `yfinance` workflow performs these same steps and uploads its
+minute bars, daily log returns, daily simple returns, and `research_target_weights.csv`.
+Yahoo's documented one-minute interval is limited to the most recent 60 days,
+so the code rejects larger ranges instead of producing an incomplete history.
+The resulting target weights are research output only—not investment advice,
+account-specific share quantities, or order instructions.
+
 ## GitHub Actions
 
 `CPU notebooks` runs on ordinary Ubuntu GitHub-hosted runners. It runs tests,
