@@ -83,16 +83,20 @@ def main() -> None:
     parser.add_argument("--targets", default="assets/active_daily_target.csv")
     parser.add_argument("--target-status", default="assets/active_daily_target_status.json")
     parser.add_argument("--poll-seconds", type=int, default=20)
+    parser.add_argument("--run-seconds", type=int, default=None)
     args = parser.parse_args()
     if args.poll_seconds < 5:
         parser.error("--poll-seconds must be at least 5")
     client = AlpacaTradingClient.from_environment(mode="paper")
+    deadline = time.monotonic() + args.run_seconds if args.run_seconds else None
     while True:
         try:
             result = _run_once(client, Path(args.state), Path(args.targets), Path(args.target_status))
             print(json.dumps(result, default=str), flush=True)
         except Exception as error:  # retry on a future poll without losing durable state
             print(json.dumps({"status": "error", "reason": str(error)}), flush=True)
+        if deadline is not None and time.monotonic() >= deadline:
+            return
         time.sleep(args.poll_seconds)
 
 

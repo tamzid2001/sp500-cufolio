@@ -1,0 +1,54 @@
+name: Paper market-session runner
+
+on:
+  schedule:
+    - cron: "25 9 * * 1-5"
+      timezone: "America/New_York"
+  workflow_dispatch:
+    inputs:
+      session:
+        description: "AM starts at 09:25; PM is queued by the AM handoff."
+        type: choice
+        options: [am, pm]
+        default: am
+
+permissions:
+  contents: write
+  actions: write
+
+concurrency:
+  group: cufolio-paper-session-singleton
+  cancel-in-progress: false
+
+jobs:
+  trade:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    env:
+      PYTHONPATH: ${{ github.workspace }}/src
+      ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
+      ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: "3.12", cache: pip}
+      - run: pip install -r requirements.txt
+      - name: Run bounded paper-session loop
+        run: |
+          seconds=20100
+          if [ "${{ inputs.session }}" = "pm" ]; then seconds=5100; fi
+          python -m cufolio_cpu.trading_worker --run-seconds "$seconds"
+      - name: Persist durable trading state
+        if: always()
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -f var/paper_worker_state.json assets/active_daily_target.csv assets/active_daily_target_status.json
+          git diff --cached --quiet && exit 0
+          git commit -m "chore: record paper session state [skip ci]"
+          git pull --rebase origin main
+          git push origin HEAD:main
+      - name: Queue PM closeout handoff
+        if: success() && inputs.session != 'pm'
+        env: {GH_TOKEN: ${{ github.token }}}
+        run: gh workflow run paper-session-runner.yml --ref main -f session=pm
