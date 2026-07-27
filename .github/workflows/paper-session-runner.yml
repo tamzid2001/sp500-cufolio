@@ -36,9 +36,17 @@ jobs:
       - name: Persist durable trading state
         if: always()
         run: |
+          set -euo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add -f var/paper_worker_state.json assets/active_daily_target.csv assets/active_daily_target_status.json
+          files=(
+            var/paper_worker_state.json
+            assets/active_daily_target.csv
+            assets/active_daily_target_status.json
+          )
+          for file in "${files[@]}"; do
+            test ! -f "$file" || git add -f "$file"
+          done
           git diff --cached --quiet && exit 0
           git commit -m "chore: record paper session state [skip ci]"
           git pull --rebase origin main
