@@ -21,6 +21,8 @@ from sklearn.linear_model import Ridge
 from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
 
+from .optimize import forecast_mean_variance_weights
+
 NEW_YORK = ZoneInfo("America/New_York")
 INTERVAL_MINUTES = {"1m": 1, "15m": 15}
 FEATURE_COLUMNS = ("return_1", "return_4", "return_13", "return_26", "volatility_26")
@@ -119,7 +121,7 @@ def _purged_walk_forward(
     return pd.DataFrame(rows)
 
 
-def _capped_score_weights(predictions: pd.Series, *, top_n: int, max_weight: float) -> pd.Series:
+def _select_candidate_symbols(predictions: pd.Series, *, top_n: int, max_weight: float) -> pd.Index:
     if top_n < 2:
         raise ValueError("top_n must be at least two")
     selected = predictions.dropna().sort_values(ascending=False).head(top_n)
@@ -127,17 +129,7 @@ def _capped_score_weights(predictions: pd.Series, *, top_n: int, max_weight: flo
         raise ValueError("fewer than two assets have current features")
     if max_weight * len(selected) < 1 - 1e-12:
         raise ValueError("max_weight is too small for the selected candidate count")
-    # Shift scores above zero. This is a transparent score-weighted research
-    # allocation, not an estimate of account-specific optimal sizing.
-    raw = selected - selected.min() + np.finfo(float).eps
-    weights = raw / raw.sum()
-    while (weights > max_weight + 1e-12).any():
-        capped = weights > max_weight
-        excess = float((weights[capped] - max_weight).sum())
-        weights[capped] = max_weight
-        uncapped = ~capped
-        weights[uncapped] += excess * weights[uncapped] / weights[uncapped].sum()
-    return weights / weights.sum()
+    return selected.index
 
 
 def run_forward_research(
@@ -188,7 +180,19 @@ def run_forward_research(
     predicted = pd.Series(
         model.predict(current_features.loc[:, FEATURE_COLUMNS]), index=current_features["symbol"], name="predicted_forward_log_return"
     )
-    weights = _capped_score_weights(predicted, top_n=top_n, max_weight=max_weight)
+    selected_symbols = _select_candidate_symbols(predicted, top_n=top_n, max_weight=max_weight)
+    scenarios = (
+        history.pivot(index="timestamp", columns="symbol", values="forward_log_return")
+        .reindex(columns=selected_symbols)
+        .dropna(axis=0, how="any")
+    )
+    allocation = forecast_mean_variance_weights(
+        scenarios,
+        predicted.reindex(selected_symbols),
+        risk_aversion=10.0,
+        max_weight=max_weight,
+    )
+    weights = allocation.weights
     portfolio = (
         pd.DataFrame({"symbol": weights.index, "target_weight": weights.values})
         .assign(predicted_forward_log_return=lambda value: value["symbol"].map(predicted))
@@ -197,6 +201,10 @@ def run_forward_research(
     )
     status["model_run"] = True
     status["reason"] = "research_only"
+    status["objective"] = "maximize forecast return minus 10.0 times forward-return variance"
+    status["optimizer_status"] = allocation.status
+    status["portfolio_predicted_forward_log_return"] = allocation.expected_return
+    status["forward_return_scenarios"] = int(len(scenarios))
     status["latest_feature_timestamp"] = latest_timestamp.isoformat()
     return ForwardModelResult(validation, portfolio, status)
 

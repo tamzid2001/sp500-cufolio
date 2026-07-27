@@ -104,6 +104,44 @@ def mean_variance_weights(
     )
 
 
+def forecast_mean_variance_weights(
+    scenarios: pd.DataFrame,
+    expected_returns: pd.Series,
+    *,
+    risk_aversion: float = 10.0,
+    max_weight: float = 0.10,
+) -> OptimizationResult:
+    """Long-only mean–variance allocation using model forecasts as expected returns.
+
+    ``scenarios`` supplies the historical forward-return covariance matrix;
+    ``expected_returns`` is supplied by a separate causal forecast model. This
+    avoids substituting historical average return for the model prediction.
+    """
+    clean = _coerce_returns(scenarios)
+    forecast = expected_returns.reindex(clean.columns).astype(float)
+    if forecast.isna().any():
+        raise ValueError("expected_returns must cover every scenario column")
+    n_assets = clean.shape[1]
+    if max_weight * n_assets < 1 - 1e-12:
+        raise ValueError("max_weight is too small to construct a fully invested portfolio")
+    covariance = clean.cov().to_numpy() + np.eye(n_assets) * 1e-10
+    weights = cp.Variable(n_assets)
+    problem = cp.Problem(
+        cp.Maximize(forecast.to_numpy() @ weights - risk_aversion * cp.quad_form(weights, covariance)),
+        [cp.sum(weights) == 1, weights >= 0, weights <= max_weight],
+    )
+    problem.solve(solver=cp.CLARABEL)
+    if problem.status not in {cp.OPTIMAL, cp.OPTIMAL_INACCURATE} or weights.value is None:
+        raise RuntimeError(f"forecast Mean–variance solve failed with status {problem.status}")
+    vector = np.asarray(weights.value).ravel()
+    return OptimizationResult(
+        weights=pd.Series(vector, index=clean.columns),
+        expected_return=float(forecast.to_numpy() @ vector),
+        cvar=None,
+        status=str(problem.status),
+    )
+
+
 def efficient_frontier(
     returns: pd.DataFrame, risk_aversions: list[float], max_weight: float = 0.25
 ) -> pd.DataFrame:

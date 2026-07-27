@@ -108,7 +108,10 @@ membership and must not be used to claim a survivorship-bias-free backtest.
 The manual yfinance workflow additionally runs a separate, research-only
 forward-horizon model. It uses trailing intraday returns and volatility to rank
 stocks by predicted forward log return, validates later time blocks with a
-purge that excludes labels overlapping the test window, and writes:
+purge that excludes labels overlapping the test window, then applies a
+fully-invested, long-only mean–variance allocation to the highest-ranked
+candidates using predicted returns and historical forward-return covariance.
+It writes:
 
 ```text
 forward_500m_research/forward_500m_validation.csv
