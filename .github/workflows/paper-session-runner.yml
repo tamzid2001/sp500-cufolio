@@ -1,13 +1,10 @@
 name: Paper market-session runner
 
 on:
-  schedule:
-    - cron: "25 9 * * 1-5"
-      timezone: "America/New_York"
   workflow_dispatch:
     inputs:
       session:
-        description: "AM starts at 09:25; PM is queued by the AM handoff."
+        description: "Compatibility input; every run is a 5h45m continuous handoff."
         type: choice
         options: [am, pm]
         default: am
@@ -35,9 +32,7 @@ jobs:
       - run: pip install -r requirements.txt
       - name: Run bounded paper-session loop
         run: |
-          seconds=20700
-          if [ "${{ inputs.session }}" = "pm" ]; then seconds=5100; fi
-          python -m cufolio_cpu.trading_worker --run-seconds "$seconds"
+          python -m cufolio_cpu.trading_worker --run-seconds 20700
       - name: Persist durable trading state
         if: always()
         run: |
@@ -48,8 +43,8 @@ jobs:
           git commit -m "chore: record paper session state [skip ci]"
           git pull --rebase origin main
           git push origin HEAD:main
-      - name: Queue PM closeout handoff
-        if: ${{ success() && inputs.session != 'pm' }}
+      - name: Queue the next 5h45m handoff
+        if: ${{ success() }}
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh workflow run paper-session-runner.yml --ref main -f session=pm
+        run: gh workflow run paper-session-runner.yml --ref main -f session=am
