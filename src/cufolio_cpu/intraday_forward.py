@@ -160,10 +160,9 @@ def run_forward_research(
     if session_count < min_sessions or len(validation) < 2:
         status["reason"] = "insufficient complete regular-session history for purged validation"
         return ForwardModelResult(validation, pd.DataFrame(columns=["symbol", "target_weight"]), status)
-    latest_timestamp = dataset["timestamp"].max()
-    history = dataset[dataset["target_timestamp"] < latest_timestamp]
-    # Build current features from the same causal feature construction, then
-    # select rows at the latest feature timestamp (which have no known target).
+    # Build current features from the same causal feature construction.  The
+    # labelled dataset ends one forward horizon before the newest bar, so it
+    # must not be used to identify the rebalance-time feature row.
     feature_frame = _regular_session_bars(bars)
     group = feature_frame.groupby("symbol", sort=False)
     feature_frame["log_close"] = np.log(feature_frame["close"])
@@ -174,7 +173,9 @@ def run_forward_research(
     feature_frame["volatility_26"] = feature_frame.groupby("symbol", sort=False)["return_1"].transform(
         lambda value: value.rolling(26).std()
     )
-    current_features = feature_frame[feature_frame["timestamp"] == latest_timestamp].dropna(subset=FEATURE_COLUMNS)
+    latest_feature_timestamp = feature_frame["timestamp"].max()
+    history = dataset[dataset["target_timestamp"] < latest_feature_timestamp]
+    current_features = feature_frame[feature_frame["timestamp"] == latest_feature_timestamp].dropna(subset=FEATURE_COLUMNS)
     model = make_pipeline(StandardScaler(), Ridge(alpha=10.0))
     model.fit(history.loc[:, FEATURE_COLUMNS], history["forward_log_return"])
     predicted = pd.Series(
@@ -205,7 +206,7 @@ def run_forward_research(
     status["optimizer_status"] = allocation.status
     status["portfolio_predicted_forward_log_return"] = allocation.expected_return
     status["forward_return_scenarios"] = int(len(scenarios))
-    status["latest_feature_timestamp"] = latest_timestamp.isoformat()
+    status["latest_feature_timestamp"] = latest_feature_timestamp.isoformat()
     return ForwardModelResult(validation, portfolio, status)
 
 

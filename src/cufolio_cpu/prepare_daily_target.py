@@ -11,7 +11,7 @@ from zoneinfo import ZoneInfo
 
 import pandas as pd
 
-from .daily_selection import current_sp500_daily_targets
+from .intraday_selection import current_sp500_forward_targets
 from .paper_rebalance import AlpacaTradingClient
 
 NEW_YORK = ZoneInfo("America/New_York")
@@ -24,14 +24,12 @@ def _session_date(value: object) -> str:
 def prepare_daily_target(
     client: AlpacaTradingClient,
     *,
-    lookback_calendar_days: int = 180,
-    lookback_sessions: int = 90,
-    candidate_count: int = 50,
+    lookback_calendar_days: int = 60,
+    horizon_minutes: int = 500,
     top_n: int = 20,
     max_weight: Decimal = Decimal("0.10"),
-    scenario_count: int = 2_000,
 ) -> tuple[pd.DataFrame, dict[str, object]]:
-    """Build a target for Alpaca's next market session, without submitting orders."""
+    """Build tomorrow's target using the existing purged 15-minute model."""
     clock = client.get_clock()
     if not clock.get("is_open"):
         return pd.DataFrame(columns=["symbol", "target_weight"]), {
@@ -40,17 +38,15 @@ def prepare_daily_target(
             "prepared_at": datetime.now(NEW_YORK).isoformat(),
         }
     api_key, secret_key = client.market_data_credentials()
-    selection = current_sp500_daily_targets(
+    selection = current_sp500_forward_targets(
         api_key=api_key,
         secret_key=secret_key,
-        # Excludes today's unfinished daily bar, making this a true pre-close target.
-        as_of_session=str(clock["timestamp"]),
+        # The downloader itself excludes an unfinished 15-minute bar.
+        as_of=str(clock["timestamp"]),
         lookback_calendar_days=lookback_calendar_days,
-        lookback_sessions=lookback_sessions,
-        candidate_count=candidate_count,
+        horizon_minutes=horizon_minutes,
         top_n=top_n,
         max_weight=float(max_weight),
-        scenario_count=scenario_count,
     )
     status = dict(selection.status)
     status.update(
@@ -65,25 +61,21 @@ def prepare_daily_target(
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Prepare tomorrow's S&P 500 Mean-CVaR target.")
+    parser = argparse.ArgumentParser(description="Prepare tomorrow's 15-minute forward-model S&P 500 target.")
     parser.add_argument("--output", required=True)
     parser.add_argument("--status", required=True)
     parser.add_argument("--mode", choices=["paper", "live"], default="paper")
-    parser.add_argument("--lookback-calendar-days", type=int, default=180)
-    parser.add_argument("--lookback-sessions", type=int, default=90)
-    parser.add_argument("--candidate-count", type=int, default=50)
+    parser.add_argument("--lookback-calendar-days", type=int, default=60)
+    parser.add_argument("--horizon-minutes", type=int, default=500)
     parser.add_argument("--top-n", type=int, default=20)
     parser.add_argument("--max-weight", type=Decimal, default=Decimal("0.10"))
-    parser.add_argument("--scenario-count", type=int, default=2_000)
     args = parser.parse_args()
     targets, status = prepare_daily_target(
         AlpacaTradingClient.from_environment(mode=args.mode),
         lookback_calendar_days=args.lookback_calendar_days,
-        lookback_sessions=args.lookback_sessions,
-        candidate_count=args.candidate_count,
+        horizon_minutes=args.horizon_minutes,
         top_n=args.top_n,
         max_weight=args.max_weight,
-        scenario_count=args.scenario_count,
     )
     if targets.empty:
         print("No daily target prepared because the market is closed")

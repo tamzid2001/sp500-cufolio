@@ -72,14 +72,16 @@ Alpaca's separate `StockHistoricalDataClient`/`StockBarsRequest` API surface.
 
 ## Paper-only portfolio execution
 
-`daily_cycle` is a current-S&P-500, one-trading-day long-only strategy. Each
-market-hours cycle fetches the current 500-company universe (503 listed share
-classes), takes only the 90 completed sessions before today's open, scores all
-eligible symbols, then runs a capped long-only Mean-CVaR solve on the strongest
-50 candidates using 2,000 joint bootstrap scenarios. It makes at most 20
-candidates available to the solver and limits each holding to 10%. Because the
-data cutoff and bootstrap seed are fixed to the session date, every 15-minute
-cycle has the same daily target rather than using an in-progress daily close.
+`daily_cycle` is a current-S&P-500, one-trading-day long-only strategy. A
+separate pre-close target job downloads 60 calendar days of completed 15-minute
+Alpaca bars for all 503 listed S&P 500 share classes. It runs the existing
+purged forward-return model: 1/4/13/26-bar return and 26-bar volatility
+features, a requested 500-trading-minute forecast horizon (34 bars, or 510
+minutes), and three purged walk-forward validation folds. A ridge forecast and
+fully-invested, capped long-only forecast-minus-10-times-forward-variance solve
+then creates a maximum-20-name target, with a 10% maximum position weight.
+The newest incomplete 15-minute bar is excluded, and only a target with a
+successful model run is written.
 
 The paper workflow runs every 15 minutes on weekdays, at minutes 3, 18, 33,
 and 48 to avoid the top-of-hour Actions queue. It uses fractional day market
@@ -87,8 +89,9 @@ orders, keeps purchases cash-only, and ignores movement below both $1 and a
 25 bps absolute portfolio-weight drift band. A changed daily target sells all
 old target holdings first and waits for fills before making the new buys.
 
-At 14:48 America/New_York, a separate Action solves and commits the dated
-target for the next market session using only completed prior-session data.
+At 19:18 UTC on weekdays (15:18 America/New_York during daylight time), a
+separate Action solves and commits the dated target for the next market session
+using only completed 15-minute bars.
 Beginning 30 minutes before the close, the 15-minute loop reads that already
 solved target, retains positions that overlap it, and uses Alpaca's
 position-close endpoint only for positions absent from it. New names are bought

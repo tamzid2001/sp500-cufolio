@@ -2,9 +2,10 @@ name: Prepare next-session paper target
 
 on:
   schedule:
-    # 14:48 America/New_York is 72 minutes before the regular-session close.
-    - cron: "48 14 * * 1-5"
-      timezone: "America/New_York"
+    # GitHub Actions cron is UTC. 19:18 UTC is 15:18 ET during daylight time
+    # (and 14:18 ET during standard time), safely before the 16:00 ET close.
+    # This job solves tomorrow's target before the near-close transition cycle.
+    - cron: "18 19 * * 1-5"
   workflow_dispatch:
     inputs:
       top_n:
@@ -22,7 +23,7 @@ concurrency:
 jobs:
   prepare:
     runs-on: ubuntu-latest
-    timeout-minutes: 12
+    timeout-minutes: 25
     env:
       PYTHONPATH: ${{ github.workspace }}/src
       ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
@@ -41,18 +42,16 @@ jobs:
         run: |
           test -n "$ALPACA_API_KEY"
           test -n "$ALPACA_SECRET_KEY"
-      - name: Prepare tomorrow's full-S&P-500 target
+      - name: Prepare tomorrow's full-S&P-500 15-minute forward target
         run: |
           python -m cufolio_cpu.prepare_daily_target \
             --mode paper \
             --output assets/active_daily_target.csv \
             --status assets/active_daily_target_status.json \
-            --lookback-calendar-days 180 \
-            --lookback-sessions 90 \
-            --candidate-count 50 \
+            --lookback-calendar-days 60 \
+            --horizon-minutes 500 \
             --top-n "${{ inputs.top_n || '20' }}" \
-            --max-weight 0.10 \
-            --scenario-count 2000
+            --max-weight 0.10
       - name: Commit the dated target for the next market session
         shell: bash
         run: |
