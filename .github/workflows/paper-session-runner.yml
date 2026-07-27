@@ -35,7 +35,7 @@ jobs:
       - run: pip install -r requirements.txt
       - name: Run bounded paper-session loop
         run: |
-          seconds=20100
+          seconds=20700
           if [ "${{ inputs.session }}" = "pm" ]; then seconds=5100; fi
           python -m cufolio_cpu.trading_worker --run-seconds "$seconds"
       - name: Persist durable trading state
