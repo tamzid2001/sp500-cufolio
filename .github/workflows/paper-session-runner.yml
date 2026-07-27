@@ -49,6 +49,7 @@ jobs:
           git pull --rebase origin main
           git push origin HEAD:main
       - name: Queue PM closeout handoff
-        if: success() && inputs.session != 'pm'
-        env: {GH_TOKEN: ${{ github.token }}}
+        if: ${{ success() && inputs.session != 'pm' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: gh workflow run paper-session-runner.yml --ref main -f session=pm
