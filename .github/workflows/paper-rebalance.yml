@@ -1,0 +1,63 @@
+name: Paper portfolio rebalance
+
+on:
+  schedule:
+    - cron: "*/15 * * * 1-5"
+  workflow_dispatch:
+    inputs:
+      execute:
+        description: "Submit paper orders (unchecked = planning only)"
+        type: boolean
+        default: false
+      min_order_notional:
+        description: "Ignore smaller allocation drifts, in USD"
+        type: string
+        default: "1.00"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cufolio-paper-rebalance
+  cancel-in-progress: false
+
+jobs:
+  rebalance:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      PYTHONPATH: ${{ github.workspace }}/src
+      ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
+      ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Verify paper credentials are available
+        run: |
+          test -n "$ALPACA_API_KEY"
+          test -n "$ALPACA_SECRET_KEY"
+      - name: Plan or execute one paper-only rebalance cycle
+        shell: bash
+        run: |
+          args=(
+            --targets assets/paper_target_weights.csv
+            --report artifacts/paper-rebalance/report.json
+            --max-weight 0.10
+            --min-order-notional "${{ inputs.min_order_notional || '1.00' }}"
+            --min-weight-drift 0.0025
+          )
+          if [[ "${{ github.event_name }}" == "schedule" || "${{ inputs.execute }}" == "true" ]]; then
+            args+=(--execute)
+          fi
+          python -m cufolio_cpu.paper_rebalance "${args[@]}"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: paper-rebalance-report
+          path: artifacts/paper-rebalance/report.json
+          if-no-files-found: ignore

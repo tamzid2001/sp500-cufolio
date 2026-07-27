@@ -70,6 +70,55 @@ The GitHub Actions workflow always runs synthetic data in normal CI. Its manual
 only downloads minute bars then writes a build artifact. The data client follows
 Alpaca's separate `StockHistoricalDataClient`/`StockBarsRequest` API surface.
 
+## Paper-only portfolio execution
+
+`assets/paper_target_weights.csv` is the current reviewed, fully invested
+long-only target allocation: EXPD, HST, AES, EA, LYV, LIN, SNA, and VICI are
+capped at 10%; AKAM, AZO, DXCM, QCOM, IDXX, KIM, and APTV split the remaining
+20%. It contains the exact `symbol,target_weight` contract accepted by the
+executor. A replacement daily research output may be used only when it has the
+same columns, unique positive weights summing to 1.0, and no weight exceeding
+the configured 10% cap.
+
+The executor is deliberately isolated from the research code. It is pinned to
+`https://paper-api.alpaca.markets/v2` and has no live-account switch. During
+regular market hours, a cycle checks the paper account, clock, assets,
+positions, and open orders; uses fractional day market orders; keeps the
+account cash-only; and skips drift below both the $1 order minimum and a 25 bps
+absolute portfolio-weight band. It never opens a short position or sells a
+non-target security. If a target is overweight, it submits only the sell orders
+and waits for them to fill before a later cycle submits replacement buys. Any
+open order for a target blocks a new cycle.
+
+Create a local `.env` from `.env.example` and set the two keys there (the file
+is ignored by Git). Export them before a plan-only local preview:
+
+```bash
+set -a
+. ./.env
+set +a
+python -m cufolio_cpu.paper_rebalance \
+  --targets assets/paper_target_weights.csv \
+  --report artifacts/paper-rebalance/local-plan.json
+```
+
+Add `--execute` only to send the planned orders, and only to Alpaca's paper
+endpoint:
+
+```bash
+python -m cufolio_cpu.paper_rebalance \
+  --targets assets/paper_target_weights.csv \
+  --report artifacts/paper-rebalance/local-execution.json \
+  --execute
+```
+
+`.github/workflows/paper-rebalance.yml` runs one cycle every 15 minutes on
+weekdays (and exits when the paper market is closed). Set `ALPACA_API_KEY` and
+`ALPACA_SECRET_KEY` as repository Actions secrets; do not put them in a tracked
+file. Scheduled GitHub Actions are best-effort and can start late under GitHub
+load, but concurrency is locked so execution cycles cannot overlap. A manually
+dispatched run plans only unless its `execute` input is checked.
+
 ## yfinance (credential-free research)
 
 For a short recent research window, no Alpaca keys are required:
@@ -135,7 +184,8 @@ account-specific share quantities, or order instructions.
 then executes every CPU notebook with deterministic synthetic data. It neither
 installs nor connects to NVIDIA software or infrastructure.
 
-This is research software, not investment advice or an execution system.
+This is research software with an opt-in paper-trading executor, not investment
+advice or a live-money execution system.
 
 ## Attribution
 
