@@ -29,7 +29,8 @@ def run_research(
     daily_log, daily_simple = daily_returns_from_minute_bars(
         minute_bars, min_minutes_per_session=min_minutes_per_session
     )
-    complete = daily_simple.dropna(axis=1, thresh=max(20, len(daily_simple) // 2)).dropna(axis=0, how="any")
+    minimum_asset_observations = min(20, len(daily_simple))
+    complete = daily_simple.dropna(axis=1, thresh=minimum_asset_observations).dropna(axis=0, how="any")
     status: dict[str, object] = {
         "daily_sessions": int(len(daily_simple)),
         "usable_complete_sessions": int(len(complete)),
