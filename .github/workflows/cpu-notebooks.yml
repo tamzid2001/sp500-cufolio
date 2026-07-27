@@ -1,0 +1,97 @@
+name: CPU notebooks
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      data_source:
+        description: "Synthetic CI data, or an optional Alpaca minute-bar download"
+        type: choice
+        default: synthetic
+        options: [synthetic, alpaca]
+      universe_file:
+        description: "Repository CSV with a symbol column (Alpaca only)"
+        type: string
+        default: assets/universe.example.csv
+      start:
+        description: "UTC start (Alpaca only)"
+        type: string
+        default: "2026-01-02"
+      end:
+        description: "UTC end (Alpaca only)"
+        type: string
+        default: "2026-01-31"
+
+permissions:
+  contents: read
+
+jobs:
+  test-and-execute-notebooks:
+    if: github.event_name != 'workflow_dispatch' || inputs.data_source == 'synthetic'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      MPLBACKEND: Agg
+      PYTHONPATH: ${{ github.workspace }}/src
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install CPU-only dependencies
+        run: pip install -r requirements.txt
+      - name: Regenerate checked-in CPU notebooks
+        run: |
+          python tools/build_notebooks.py
+          git diff --exit-code -- notebooks
+      - name: Unit tests
+        run: pytest -q
+      - name: Execute CPU notebooks
+        run: |
+          mkdir -p artifacts/notebooks
+          for notebook in notebooks/*.ipynb; do
+            stem=$(basename "$notebook" .ipynb)
+            jupyter nbconvert --to notebook --execute "$notebook" \
+              --output "$stem.ipynb" \
+              --output-dir artifacts/notebooks \
+              --ExecutePreprocessor.timeout=240
+          done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: executed-cpu-notebooks
+          path: artifacts/notebooks
+
+  alpaca-minute-bars:
+    if: github.event_name == 'workflow_dispatch' && inputs.data_source == 'alpaca'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      PYTHONPATH: ${{ github.workspace }}/src
+      ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
+      ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install data-client dependencies
+        run: pip install -r requirements.txt
+      - name: Verify credentials are configured
+        run: |
+          test -n "$ALPACA_API_KEY"
+          test -n "$ALPACA_SECRET_KEY"
+      - name: Download one-minute bars only
+        run: |
+          python -m cufolio_cpu.alpaca \
+            --symbols "${{ inputs.universe_file }}" \
+            --start "${{ inputs.start }}" \
+            --end "${{ inputs.end }}" \
+            --output artifacts/alpaca_minute_bars.csv
+      - uses: actions/upload-artifact@v4
+        with:
+          name: alpaca-minute-bars
+          path: artifacts/alpaca_minute_bars.csv
