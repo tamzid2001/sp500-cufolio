@@ -82,7 +82,7 @@ python -m cufolio_cpu.trading_worker
 
 It persists completed actions in `var/paper_worker_state.json`, buys the
 prepared dated target immediately after the 9:30 AM New York open, corrects
-drift every 15 minutes through 3:15 PM, prepares tomorrow's target at 3:18 PM,
+drift every 15 minutes through 3:15 PM, prepares tomorrow's target at 3:45 PM,
 and flattens every position at 3:55 PM. It is paper-only.
 
 `daily_cycle` is a current-S&P-500, one-trading-day long-only strategy. A
@@ -102,7 +102,7 @@ orders, keeps purchases cash-only, and ignores movement below both $1 and a
 25 bps absolute portfolio-weight drift band. A changed daily target sells all
 old target holdings first and waits for fills before making the new buys.
 
-At 19:18 UTC on weekdays (15:18 America/New_York during daylight time), a
+At 3:45 PM America/New_York on weekdays, a
 separate Action solves and commits the dated target for the next market session
 using only completed 15-minute bars.
 Beginning 30 minutes before the close, the 15-minute loop reads that already

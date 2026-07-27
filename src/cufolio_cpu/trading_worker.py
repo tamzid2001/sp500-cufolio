@@ -59,7 +59,7 @@ def _run_once(client: AlpacaTradingClient, state_path: Path, targets: Path, stat
     if minute >= 15 * 60 + 55 and f"flatten:{day}" not in completed:
         return done(f"flatten:{day}", run_end_of_day_flatten(client, execute=True))
     # The next-session solve is complete before flattening and never submits orders.
-    if minute >= 15 * 60 + 18 and f"select:{day}" not in completed:
+    if minute >= 15 * 60 + 45 and f"select:{day}" not in completed:
         frame, target_status = prepare_daily_target(client)
         if frame.empty:
             return {"status": "selection_not_ready"}
