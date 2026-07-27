@@ -1,0 +1,49 @@
+name: Paper session watchdog
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+
+permissions:
+  actions: write
+  contents: read
+
+concurrency:
+  group: cufolio-paper-session-watchdog
+  cancel-in-progress: false
+
+jobs:
+  recover:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Restart a broken session chain only
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          runs="$(gh run list --repo "$REPOSITORY" --workflow 'Paper market-session runner' --limit 20 --json status,conclusion,updatedAt)"
+          RUNS="$runs" python - <<'PY' > decision.txt
+          import json, os
+          from datetime import datetime, timedelta, timezone
+
+          runs = json.loads(os.environ["RUNS"])
+          active = {"queued", "in_progress", "pending", "requested", "waiting"}
+          if any(run["status"] in active for run in runs):
+              print("healthy")
+              raise SystemExit
+          if not runs:
+              print("restart")
+              raise SystemExit
+          latest = max(runs, key=lambda run: run["updatedAt"])
+          updated = datetime.fromisoformat(latest["updatedAt"].replace("Z", "+00:00"))
+          stale = datetime.now(timezone.utc) - updated > timedelta(minutes=10)
+          print("restart" if latest["conclusion"] != "success" or stale else "healthy")
+          PY
+          if [ "$(cat decision.txt)" = healthy ]; then
+            echo "A session runner is active or the latest handoff is still healthy."
+            exit 0
+          fi
+          echo "::warning::Session chain is absent, failed, cancelled, or stale; dispatching recovery run."
+          gh workflow run paper-session-runner.yml --repo "$REPOSITORY" --ref main -f session=am
