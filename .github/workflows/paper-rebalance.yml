@@ -7,9 +7,9 @@ on:
   workflow_dispatch:
     inputs:
       execute:
-        description: "Submit paper orders (unchecked = planning only)"
+        description: "Submit paper orders (enabled by default)"
         type: boolean
-        default: false
+        default: true
       min_order_notional:
         description: "Ignore smaller allocation drifts, in USD"
         type: string
@@ -42,7 +42,7 @@ jobs:
         run: |
           test -n "$ALPACA_API_KEY"
           test -n "$ALPACA_SECRET_KEY"
-      - name: Plan or execute one paper-only rebalance cycle
+      - name: Execute one paper-only rebalance cycle
         shell: bash
         run: |
           args=(
