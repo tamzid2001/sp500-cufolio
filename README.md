@@ -72,6 +72,19 @@ Alpaca's separate `StockHistoricalDataClient`/`StockBarsRequest` API surface.
 
 ## Paper-only portfolio execution
 
+For execution, use the persistent worker on an always-on host rather than
+GitHub Actions' best-effort scheduler:
+
+```bash
+set -a; . ./.env; set +a
+python -m cufolio_cpu.trading_worker
+```
+
+It persists completed actions in `var/paper_worker_state.json`, buys the
+prepared dated target immediately after the 9:30 AM New York open, corrects
+drift every 15 minutes through 3:15 PM, prepares tomorrow's target at 3:18 PM,
+and flattens every position at 3:55 PM. It is paper-only.
+
 `daily_cycle` is a current-S&P-500, one-trading-day long-only strategy. A
 separate pre-close target job downloads 60 calendar days of completed 15-minute
 Alpaca bars for all 503 listed S&P 500 share classes. It runs the existing
