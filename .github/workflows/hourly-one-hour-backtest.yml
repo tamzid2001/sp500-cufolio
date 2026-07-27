@@ -1,6 +1,12 @@
 name: Hourly one-hour portfolio research backtest
 
 on:
+  pull_request:
+    paths:
+      - ".github/workflows/hourly-one-hour-backtest.yml"
+      - "src/cufolio_cpu/hourly_intraday_backtest.py"
+      - "tests/test_hourly_intraday_backtest.py"
+      - "README.md"
   workflow_dispatch:
     inputs:
       data_source:
@@ -80,7 +86,7 @@ jobs:
             --output artifacts/alpaca_one_minute_bars.csv
           echo "BAR_FILE=artifacts/alpaca_one_minute_bars.csv" >> "$GITHUB_ENV"
       - name: Generate deterministic one-minute research data
-        if: inputs.data_source == 'synthetic'
+        if: inputs.data_source != 'alpaca'
         run: |
           python -c 'from pathlib import Path; from cufolio_cpu.synthetic import synthetic_minute_bars; Path("artifacts").mkdir(exist_ok=True); synthetic_minute_bars(sessions=45).to_csv("artifacts/synthetic_one_minute_bars.csv", index=False)'
           echo "BAR_FILE=artifacts/synthetic_one_minute_bars.csv" >> "$GITHUB_ENV"
