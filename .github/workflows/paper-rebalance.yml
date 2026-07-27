@@ -2,8 +2,9 @@ name: Paper portfolio rebalance
 
 on:
   schedule:
-    # Offset from the top of the hour to reduce GitHub scheduler congestion.
-    - cron: "3,18,33,48 * * * 1-5"
+    # GitHub Actions' shortest supported interval is five minutes. This runs
+    # every 15 minutes on weekdays, at :00, :15, :30, and :45 UTC/local minute.
+    - cron: "*/15 * * * 1-5"
   workflow_dispatch:
     inputs:
       execute:
