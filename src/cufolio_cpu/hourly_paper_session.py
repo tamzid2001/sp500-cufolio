@@ -22,7 +22,12 @@ from typing import Any, Callable, Literal
 import numpy as np
 import pandas as pd
 
-from .alpaca import AlpacaMinuteBarStream, download_minute_bars, download_yfinance_minute_bars
+from .alpaca import (
+    AlpacaMinuteBarStream,
+    download_minute_bars,
+    download_minute_endpoint_bars,
+    download_yfinance_minute_bars,
+)
 from .hourly_intraday_backtest import NEW_YORK, generate_hourly_one_hour_candidate
 from .paper_rebalance import AlpacaTradingClient, load_target_weights, run_end_of_day_flatten, run_rebalance
 from .universe import current_sp500_universe
@@ -206,7 +211,15 @@ def _history_through(
     requested_symbols = {symbol.upper().strip() for symbol in symbols}
     streamed = minute_stream.completed_bars_through(decision_at) if minute_stream is not None else pd.DataFrame()
     if force_history_bootstrap:
-        combined = download_minute_bars(symbols, start, end)
+        # The durable historical portion retains exact decision and label
+        # endpoints only. Filter each IEX response before retaining it instead
+        # of materializing every one-minute row for the full S&P universe.
+        combined = download_minute_endpoint_bars(
+            symbols,
+            start,
+            end,
+            endpoint_times=CACHE_ENDPOINT_TIMES,
+        )
         if bars is not None and not bars.empty:
             combined = pd.concat([bars, combined], ignore_index=True)
     elif bars is None or bars.empty:

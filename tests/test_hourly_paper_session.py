@@ -162,6 +162,36 @@ def test_minute_endpoint_cache_appends_fresh_rows_and_skips_overnight_gap(tmp_pa
     pd.testing.assert_frame_equal(hourly_paper_session._read_minute_cache(cache_path), second)
 
 
+def test_history_bootstrap_downloads_only_required_iex_endpoints(tmp_path, monkeypatch) -> None:
+    calls = []
+
+    def fake_endpoint_download(symbols, start, end, *, endpoint_times):
+        calls.append((symbols, pd.Timestamp(start), pd.Timestamp(end), endpoint_times))
+        return pd.DataFrame(
+            {"timestamp": ["2026-07-28T13:20:00Z"], "symbol": ["AAA"], "close": [101]}
+        )
+
+    def unexpected_full_download(*_args, **_kwargs):
+        raise AssertionError("the bootstrap cache should not retain every one-minute row")
+
+    monkeypatch.setattr(hourly_paper_session, "download_minute_endpoint_bars", fake_endpoint_download)
+    monkeypatch.setattr(hourly_paper_session, "download_minute_bars", unexpected_full_download)
+    decision = pd.Timestamp("2026-07-28T14:20:00Z")
+    restored = hourly_paper_session._history_through(
+        None,
+        ["AAA"],
+        start="2026-06-01T13:20:00Z",
+        decision_at=decision,
+        cache_path=tmp_path / "minute-endpoints.csv.gz",
+        force_history_bootstrap=True,
+    )
+
+    assert calls == [
+        (["AAA"], pd.Timestamp("2026-06-01T13:20:00Z"), decision + pd.Timedelta(minutes=1), hourly_paper_session.CACHE_ENDPOINT_TIMES)
+    ]
+    assert restored.loc[0, "close"] == 101
+
+
 def test_current_session_minute_refresh_merges_only_completed_minutes(tmp_path, monkeypatch) -> None:
     cache_path = tmp_path / "minute-endpoints.csv.gz"
     calls: list[tuple[pd.Timestamp, pd.Timestamp]] = []
