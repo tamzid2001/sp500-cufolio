@@ -1,0 +1,105 @@
+name: Hourly one-hour portfolio research backtest
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/hourly-one-hour-backtest.yml"
+      - "src/cufolio_cpu/hourly_intraday_backtest.py"
+      - "tests/test_hourly_intraday_backtest.py"
+      - "README.md"
+  workflow_dispatch:
+    inputs:
+      data_source:
+        description: "Synthetic deterministic data or read-only Alpaca one-minute history"
+        type: choice
+        default: synthetic
+        options: [synthetic, alpaca]
+      universe_file:
+        description: "Repository CSV with a symbol column when universe_source=repository"
+        type: string
+        default: assets/universe.example.csv
+      universe_source:
+        description: "Repository file or current S&P 500 convenience universe (not point-in-time historical membership)"
+        type: choice
+        default: repository
+        options: [repository, sp500_wikipedia]
+      start:
+        description: "Alpaca historical start timestamp/date"
+        type: string
+        default: "2026-06-01"
+      end:
+        description: "Alpaca historical end timestamp/date"
+        type: string
+        default: "2026-07-27"
+      top_n:
+        description: "Maximum candidates for the long-only one-hour optimizer"
+        type: string
+        default: "10"
+      max_weight:
+        description: "Maximum portfolio weight per selected asset"
+        type: string
+        default: "0.20"
+      min_training_scenarios:
+        description: "Completed one-hour return windows required before a selection"
+        type: string
+        default: "20"
+
+permissions:
+  contents: read
+
+jobs:
+  backtest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      PYTHONPATH: ${{ github.workspace }}/src
+      ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
+      ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install research dependencies
+        run: pip install -r requirements.txt
+      - name: Verify causal hourly backtest engine
+        run: pytest -q tests/test_hourly_intraday_backtest.py
+      - name: Select historical universe
+        if: inputs.data_source == 'alpaca'
+        run: |
+          if [ "${{ inputs.universe_source }}" = "sp500_wikipedia" ]; then
+            python -m cufolio_cpu.universe --output artifacts/current_sp500_universe.csv
+            echo "UNIVERSE_FILE=artifacts/current_sp500_universe.csv" >> "$GITHUB_ENV"
+          else
+            echo "UNIVERSE_FILE=${{ inputs.universe_file }}" >> "$GITHUB_ENV"
+          fi
+      - name: Download read-only one-minute Alpaca history
+        if: inputs.data_source == 'alpaca'
+        run: |
+          test -n "$ALPACA_API_KEY"
+          test -n "$ALPACA_SECRET_KEY"
+          python -m cufolio_cpu.alpaca \
+            --symbols "$UNIVERSE_FILE" \
+            --start "${{ inputs.start }}" \
+            --end "${{ inputs.end }}" \
+            --output artifacts/alpaca_one_minute_bars.csv
+          echo "BAR_FILE=artifacts/alpaca_one_minute_bars.csv" >> "$GITHUB_ENV"
+      - name: Generate deterministic one-minute research data
+        if: inputs.data_source != 'alpaca'
+        run: |
+          python -c 'from pathlib import Path; from cufolio_cpu.synthetic import synthetic_minute_bars; Path("artifacts").mkdir(exist_ok=True); synthetic_minute_bars(sessions=45).to_csv("artifacts/synthetic_one_minute_bars.csv", index=False)'
+          echo "BAR_FILE=artifacts/synthetic_one_minute_bars.csv" >> "$GITHUB_ENV"
+      - name: Run hourly one-hour selection and 15-minute rebalancing backtest
+        run: |
+          python -m cufolio_cpu.hourly_intraday_backtest \
+            --input "$BAR_FILE" \
+            --output-dir artifacts/hourly_one_hour_backtest \
+            --top-n "${{ inputs.top_n || '10' }}" \
+            --max-weight "${{ inputs.max_weight || '0.20' }}" \
+            --min-training-scenarios "${{ inputs.min_training_scenarios || '20' }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hourly-one-hour-portfolio-backtest
+          path: artifacts
+          if-no-files-found: error

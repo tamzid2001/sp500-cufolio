@@ -229,6 +229,35 @@ an order instruction.
 The resulting target weights are research output only—not investment advice,
 account-specific share quantities, or order instructions.
 
+### One-hour targets with 15-minute rebalancing
+
+`cufolio_cpu.hourly_intraday_backtest` is a separate, research-only historical
+backtest for one-minute bars. It constructs exact same-session one-hour target
+returns at 09:30, 10:30, ..., 14:30 New York time. For example, it holds the
+09:30 selection through 10:30 and restores its target weights at 09:30, 09:45,
+10:00, and 10:15; at 10:30 it selects a fresh portfolio for 10:30--11:30.
+
+At every hourly decision it selects the highest trailing expected one-hour
+returns and solves a capped, long-only mean--variance allocation from only
+earlier **completed** one-hour outcomes. It records transaction costs and
+one-way turnover at every 15-minute rebalance. A target is rejected rather
+than filled with stale prices when a required one-minute endpoint is missing;
+overnight returns are never included. The optimizer is optimal only under its
+trailing mean/covariance assumptions, not a guarantee of future results.
+
+```bash
+python -m cufolio_cpu.hourly_intraday_backtest \
+  --input data/alpaca_one_minute_bars.csv \
+  --output-dir outputs/hourly_one_hour_backtest \
+  --top-n 20 --max-weight 0.10 --min-training-scenarios 20
+```
+
+The manual **Hourly one-hour portfolio research backtest** Action can use the
+provided Alpaca credentials to download read-only historical one-minute bars,
+or run the exact same engine against deterministic synthetic data. It uploads
+the hourly selections, 15-minute rebalance ledger, and data-quality status as
+an artifact; it never submits an order.
+
 ## GitHub Actions
 
 `CPU notebooks` runs on ordinary Ubuntu GitHub-hosted runners. It runs tests,
