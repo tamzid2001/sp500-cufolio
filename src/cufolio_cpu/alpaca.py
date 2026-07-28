@@ -4,10 +4,17 @@ from __future__ import annotations
 
 import argparse
 import os
+import ssl
+import threading
+from collections.abc import Mapping
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 
 import pandas as pd
+
+
+MINUTE_BAR_COLUMNS = ["timestamp", "symbol", "close"]
 
 
 def load_symbols(path: str | Path) -> list[str]:
@@ -35,18 +42,130 @@ def _utc_datetime(value: str | datetime) -> datetime:
     return timestamp.to_pydatetime()
 
 
-def download_minute_bars(
-    symbols: list[str], start: str | datetime, end: str | datetime, *, batch_size: int = 100
-) -> pd.DataFrame:
-    """Download one-minute stock bars using Alpaca's market-data API only."""
+def _market_data_credentials() -> tuple[str, str]:
     key = os.getenv("ALPACA_API_KEY")
     secret = os.getenv("ALPACA_SECRET_KEY")
     if not key or not secret:
         raise RuntimeError("ALPACA_API_KEY and ALPACA_SECRET_KEY must be set; no request was sent")
+    return key, secret
+
+
+def _empty_minute_bars() -> pd.DataFrame:
+    return pd.DataFrame(columns=MINUTE_BAR_COLUMNS)
+
+
+def _minute_bar_frame(rows: list[dict[str, object]]) -> pd.DataFrame:
+    if not rows:
+        return _empty_minute_bars()
+    result = pd.DataFrame(rows, columns=MINUTE_BAR_COLUMNS)
+    result["timestamp"] = pd.to_datetime(result["timestamp"], utc=True, errors="coerce")
+    result["symbol"] = result["symbol"].astype(str).str.upper().str.strip()
+    result["close"] = pd.to_numeric(result["close"], errors="coerce")
+    result = result.dropna(subset=MINUTE_BAR_COLUMNS)
+    result = result[(result["symbol"] != "") & (result["close"] > 0)]
+    return result.sort_values(["symbol", "timestamp"]).drop_duplicates(["symbol", "timestamp"], keep="last")
+
+
+class AlpacaMinuteBarStream:
+    """Keep completed one-minute IEX bars received over Alpaca's websocket.
+
+    The historical endpoint remains necessary for the initial training window,
+    but it must not be the source of a live cache refresh.  This stream uses
+    the IEX feed explicitly, which is available to paper accounts that do not
+    subscribe to SIP.  Its rows are only released to callers after the caller
+    supplies a completed-minute boundary.
+    """
+
+    def __init__(self, symbols: list[str]) -> None:
+        normalized = list(dict.fromkeys(symbol.upper().strip() for symbol in symbols if symbol.strip()))
+        if not normalized:
+            raise ValueError("at least one symbol is required for the Alpaca minute-bar stream")
+        self._symbols = normalized
+        self._lock = threading.Lock()
+        self._rows: list[dict[str, object]] = []
+        self._stream: Any | None = None
+        self._thread: threading.Thread | None = None
+        self._error: Exception | None = None
+
+    @property
+    def error(self) -> Exception | None:
+        return self._error
+
+    @property
+    def connected(self) -> bool:
+        """Whether Alpaca currently has an authenticated websocket transport."""
+        websocket = getattr(self._stream, "_ws", None)
+        return websocket is not None and not getattr(websocket, "closed", False) and self._error is None
+
+    def start(self) -> None:
+        """Open the IEX websocket in a daemon thread and subscribe to bars."""
+        if self._thread is not None:
+            return
+        key, secret = _market_data_credentials()
+        import certifi
+        from alpaca.data.enums import DataFeed
+        from alpaca.data.live import StockDataStream
+
+        # macOS framework Python often has no system roots configured.  Use
+        # certifi explicitly so the data connection has the same verified TLS
+        # behavior locally and on hosted GitHub runners.
+        ssl_context = ssl.create_default_context(cafile=certifi.where())
+        self._stream = StockDataStream(key, secret, feed=DataFeed.IEX, websocket_params={"ssl": ssl_context})
+        self._stream.subscribe_bars(self._on_bar, *self._symbols)
+        self._thread = threading.Thread(target=self._run, name="alpaca-iex-minute-bars", daemon=True)
+        self._thread.start()
+
+    async def _on_bar(self, bar: Any) -> None:
+        if isinstance(bar, Mapping):
+            symbol = bar.get("symbol")
+            timestamp = bar.get("timestamp")
+            close = bar.get("close")
+        else:
+            symbol = getattr(bar, "symbol", None)
+            timestamp = getattr(bar, "timestamp", None)
+            close = getattr(bar, "close", None)
+        if symbol is None or timestamp is None or close is None:
+            return
+        with self._lock:
+            self._rows.append({"timestamp": timestamp, "symbol": symbol, "close": close})
+
+    def _run(self) -> None:
+        assert self._stream is not None
+        try:
+            self._stream.run()
+        except Exception as error:  # The caller falls back without losing the scheduled event.
+            self._error = error
+
+    def completed_bars_through(self, completed_at: pd.Timestamp) -> pd.DataFrame:
+        """Return the stream rows no later than the caller's causal boundary."""
+        with self._lock:
+            rows = list(self._rows)
+        result = _minute_bar_frame(rows)
+        if result.empty:
+            return result
+        return result.loc[result["timestamp"] <= pd.Timestamp(completed_at).tz_convert("UTC")].copy()
+
+    def stop(self) -> None:
+        """Close the websocket without blocking the paper-session shutdown."""
+        if self._stream is not None:
+            try:
+                self._stream.stop()
+            except Exception as error:  # A disconnect is non-fatal during shutdown.
+                self._error = self._error or error
+        if self._thread is not None:
+            self._thread.join(timeout=5)
+
+
+def download_minute_bars(
+    symbols: list[str], start: str | datetime, end: str | datetime, *, batch_size: int = 100
+) -> pd.DataFrame:
+    """Download one-minute stock bars using Alpaca's market-data API only."""
+    key, secret = _market_data_credentials()
     if batch_size < 1:
         raise ValueError("batch_size must be positive")
 
     from alpaca.data.historical import StockHistoricalDataClient
+    from alpaca.data.enums import DataFeed
     from alpaca.data.requests import StockBarsRequest
     from alpaca.data.timeframe import TimeFrame
 
@@ -59,16 +178,53 @@ def download_minute_bars(
             timeframe=TimeFrame.Minute,
             start=_utc_datetime(start),
             end=_utc_datetime(end),
+            # The default feed can be SIP, which a paper-only account need
+            # not be entitled to query in real time.  IEX is deliberately
+            # selected for both the bootstrap and any narrow repair request.
+            feed=DataFeed.IEX,
         )
         frame = client.get_stock_bars(request).df
         if frame.empty:
             continue
         frames.append(frame.reset_index().loc[:, ["timestamp", "symbol", "close"]])
     if not frames:
-        return pd.DataFrame(columns=["timestamp", "symbol", "close"])
+        return _empty_minute_bars()
     result = pd.concat(frames, ignore_index=True)
     result["timestamp"] = pd.to_datetime(result["timestamp"], utc=True)
     return result.sort_values(["symbol", "timestamp"]).drop_duplicates(["symbol", "timestamp"])
+
+
+def download_yfinance_minute_bars(
+    symbols: list[str], start: str | datetime, end: str | datetime
+) -> pd.DataFrame:
+    """Return a best-effort Yahoo one-minute fallback mapped to Alpaca symbols.
+
+    This function is intentionally reserved for a short, current-session
+    repair after the websocket fails.  It never replaces the Alpaca IEX
+    historical bootstrap and keeps a share-class mapping (``BRK.B`` to
+    ``BRK-B``) local to the fallback boundary.
+    """
+    start_at, end_at = pd.Timestamp(start), pd.Timestamp(end)
+    if start_at.tzinfo is None:
+        start_at = start_at.tz_localize("UTC")
+    else:
+        start_at = start_at.tz_convert("UTC")
+    if end_at.tzinfo is None:
+        end_at = end_at.tz_localize("UTC")
+    else:
+        end_at = end_at.tz_convert("UTC")
+    if end_at - start_at > pd.Timedelta("8D"):
+        raise ValueError("Yahoo Finance fallback is limited to an eight-day one-minute window")
+
+    from .yfinance_data import download_minute_bars as download_yahoo_minute_bars
+
+    yahoo_to_alpaca = {symbol.upper().replace(".", "-"): symbol.upper() for symbol in symbols}
+    yahoo_bars, _ = download_yahoo_minute_bars(list(yahoo_to_alpaca), start_at, end_at)
+    if yahoo_bars.empty:
+        return _empty_minute_bars()
+    result = yahoo_bars.copy()
+    result["symbol"] = result["symbol"].astype(str).str.upper().map(yahoo_to_alpaca)
+    return _minute_bar_frame(result.to_dict("records"))
 
 
 def main() -> None:

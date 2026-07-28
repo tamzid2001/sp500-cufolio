@@ -22,7 +22,7 @@ from typing import Any, Callable, Literal
 import numpy as np
 import pandas as pd
 
-from .alpaca import download_minute_bars
+from .alpaca import AlpacaMinuteBarStream, download_minute_bars, download_yfinance_minute_bars
 from .hourly_intraday_backtest import NEW_YORK, generate_hourly_one_hour_candidate
 from .paper_rebalance import AlpacaTradingClient, load_target_weights, run_end_of_day_flatten, run_rebalance
 from .universe import current_sp500_universe
@@ -134,6 +134,7 @@ def _history_through(
     start: str,
     decision_at: pd.Timestamp,
     cache_path: Path | None = None,
+    minute_stream: AlpacaMinuteBarStream | None = None,
 ) -> pd.DataFrame:
     """Fetch only missing minute bars and merge them into the durable cache.
 
@@ -143,8 +144,14 @@ def _history_through(
     """
     end = decision_at + timedelta(minutes=1)
     requested_symbols = {symbol.upper().strip() for symbol in symbols}
+    streamed = minute_stream.completed_bars_through(decision_at) if minute_stream is not None else pd.DataFrame()
     if bars is None or bars.empty:
-        combined = download_minute_bars(symbols, start, end)
+        try:
+            combined = download_minute_bars(symbols, start, end)
+        except Exception:
+            # A full training bootstrap needs Alpaca IEX history. Yahoo's
+            # one-minute data is only a bounded, latest-bar repair path.
+            combined = download_yfinance_minute_bars(symbols, start, end)
     else:
         existing = _minute_cache_projection(bars)
         # A constituent can change between sessions.  Never allow a cached
@@ -165,8 +172,13 @@ def _history_through(
                 # so a partial response is repaired and deduplication retains the
                 # newest authoritative close.
                 fetch_start = decision_at if latest_local_day < decision_local_day else latest
-                incremental = download_minute_bars(symbols, fetch_start, end)
+                try:
+                    incremental = download_minute_bars(symbols, fetch_start, end)
+                except Exception:
+                    incremental = download_yfinance_minute_bars(symbols, fetch_start, end)
                 combined = pd.concat([existing, incremental], ignore_index=True) if not incremental.empty else existing
+    if not streamed.empty:
+        combined = pd.concat([combined, streamed], ignore_index=True)
     compact = _minute_cache_projection(combined)
     if cache_path is not None:
         _write_minute_cache(cache_path, compact)
@@ -227,8 +239,9 @@ def _refresh_current_session_minutes(
     session_day: date,
     observed_at: pd.Timestamp,
     cache_path: Path | None,
+    minute_stream: AlpacaMinuteBarStream | None = None,
 ) -> pd.DataFrame:
-    """Append one completed current-session minute range without look-ahead."""
+    """Append completed websocket bars; use Yahoo only after stream failure."""
     completed = _last_completed_session_minute(observed_at, session_day)
     if completed is None:
         return bars if bars is not None else pd.DataFrame(columns=["timestamp", "symbol", "close"])
@@ -250,7 +263,34 @@ def _refresh_current_session_minutes(
     if fetch_start > completed:
         return existing
     refresh_started = time.monotonic()
-    incremental = download_minute_bars(symbols, fetch_start, completed + timedelta(minutes=1))
+    incremental = pd.DataFrame(columns=["timestamp", "symbol", "close"])
+    source = "alpaca_iex_websocket"
+    if minute_stream is not None:
+        incremental = minute_stream.completed_bars_through(completed)
+        incremental = incremental.loc[
+            pd.to_datetime(incremental["timestamp"], utc=True, errors="coerce") >= fetch_start
+        ].copy()
+    if incremental.empty and minute_stream is None:
+        # This path is retained for deterministic callers that intentionally
+        # disable the stream. ``download_minute_bars`` explicitly selects IEX.
+        source = "alpaca_iex_rest_repair"
+        try:
+            incremental = download_minute_bars(symbols, fetch_start, completed + timedelta(minutes=1))
+        except Exception:
+            source = "yfinance_1m_fallback"
+            incremental = download_yfinance_minute_bars(symbols, fetch_start, completed + timedelta(minutes=1))
+    elif incremental.empty and (minute_stream.error is not None or not minute_stream.connected):
+        source = "yfinance_1m_fallback"
+        incremental = download_yfinance_minute_bars(symbols, fetch_start, completed + timedelta(minutes=1))
+    elif incremental.empty:
+        # A healthy connection can publish after this short polling cycle. Do
+        # not fall back to a SIP REST request or consume a partial minute.
+        print(
+            "MINUTE CACHE WEBSOCKET WAIT | "
+            f"from={fetch_start.isoformat()} through={completed.isoformat()} status=connected",
+            flush=True,
+        )
+        return existing
     # Treat provider end-boundary semantics conservatively: even if a response
     # happens to include the next in-progress timestamp, it cannot enter this
     # causal cache until that minute has closed on a later poll.
@@ -264,7 +304,7 @@ def _refresh_current_session_minutes(
         _write_minute_cache(cache_path, merged)
     print(
         "MINUTE CACHE REFRESHED | "
-        f"from={fetch_start.isoformat()} through={completed.isoformat()} downloaded={len(incremental):,} "
+        f"source={source} from={fetch_start.isoformat()} through={completed.isoformat()} downloaded={len(incremental):,} "
         f"elapsed={time.monotonic() - refresh_started:.1f}s {_cache_summary(merged)}",
         flush=True,
     )
@@ -421,6 +461,16 @@ def run_hourly_paper_session(
     completed_events = set(str(item) for item in checkpoint["completed_events"])
     minute_cache_file = Path(minute_cache_path) if minute_cache_path is not None else None
     bars: pd.DataFrame | None = _read_minute_cache(minute_cache_file) if minute_cache_file is not None else None
+    minute_stream: AlpacaMinuteBarStream | None = None
+    if minute_cache_polling:
+        try:
+            minute_stream = AlpacaMinuteBarStream(symbols)
+            minute_stream.start()
+            print(f"MINUTE CACHE WEBSOCKET STARTED | feed=iex symbols={len(symbols)}", flush=True)
+        except Exception as error:
+            # Never quietly switch to SIP. The scheduled IEX / Yahoo paths
+            # below remain available and the exact failure is logged.
+            print(f"MINUTE CACHE WEBSOCKET FAILED | feed=iex error={error}", flush=True)
     targets_by_start = _restore_targets(checkpoint)
     forecast_details = {
         _utc_timestamp(pd.Timestamp(target_start)): dict(details)
@@ -491,6 +541,7 @@ def run_hourly_paper_session(
             start=history_start,
             decision_at=prefetch_now,
             cache_path=minute_cache_file,
+            minute_stream=minute_stream,
         )
         print(
             "HOURLY HISTORY BOOTSTRAP READY | "
@@ -526,6 +577,7 @@ def run_hourly_paper_session(
                         session_day=session_day,
                         observed_at=current,
                         cache_path=minute_cache_file,
+                        minute_stream=minute_stream,
                     )
                 except Exception as error:
                     # This background cache is an acceleration only.  A
@@ -572,6 +624,7 @@ def run_hourly_paper_session(
                 start=history_start,
                 decision_at=event.selection_at,
                 cache_path=minute_cache_file,
+                minute_stream=minute_stream,
             )
             if now() > event.due_at + MAX_START_LAG:
                 if resume:
@@ -681,6 +734,7 @@ def run_hourly_paper_session(
                 start=history_start,
                 decision_at=event.due_at,
                 cache_path=minute_cache_file,
+                minute_stream=minute_stream,
             )
             print(
                 "HOURLY PAPER FLATTEN RESULT | "
@@ -707,6 +761,8 @@ def run_hourly_paper_session(
         f"session={session_day.isoformat()} completed_events={len(completed_events)} ledger_events={len(ledger)}",
         flush=True,
     )
+    if minute_stream is not None:
+        minute_stream.stop()
     return ledger
 
 

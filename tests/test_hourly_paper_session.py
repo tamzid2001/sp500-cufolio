@@ -203,6 +203,41 @@ def test_current_session_minute_refresh_merges_only_completed_minutes(tmp_path, 
     pd.testing.assert_frame_equal(hourly_paper_session._read_minute_cache(cache_path), refreshed)
 
 
+def test_current_session_uses_yahoo_only_when_iex_websocket_is_disconnected(tmp_path, monkeypatch) -> None:
+    class DisconnectedStream:
+        error = None
+        connected = False
+
+        def completed_bars_through(self, _completed):
+            return pd.DataFrame(columns=["timestamp", "symbol", "close"])
+
+    calls: list[tuple[pd.Timestamp, pd.Timestamp]] = []
+
+    def fake_yahoo(symbols, start, end):
+        calls.append((pd.Timestamp(start), pd.Timestamp(end)))
+        return pd.DataFrame(
+            {"timestamp": ["2026-07-28T14:20:00Z"], "symbol": ["AAA"], "close": [101]}
+        )
+
+    def fail_iex(*_args, **_kwargs):
+        raise AssertionError("a live refresh must not poll the Alpaca historical endpoint while streaming")
+
+    monkeypatch.setattr(hourly_paper_session, "download_minute_bars", fail_iex)
+    monkeypatch.setattr(hourly_paper_session, "download_yfinance_minute_bars", fake_yahoo)
+    refreshed = hourly_paper_session._refresh_current_session_minutes(
+        pd.DataFrame(columns=["timestamp", "symbol", "close"]),
+        ["AAA"],
+        session_day=date(2026, 7, 28),
+        observed_at=pd.Timestamp("2026-07-28T14:21:15Z"),
+        cache_path=tmp_path / "minute-endpoints.csv.gz",
+        minute_stream=DisconnectedStream(),
+    )
+
+    assert calls == [(pd.Timestamp("2026-07-28T13:20:00Z"), pd.Timestamp("2026-07-28T14:21:00Z"))]
+    assert refreshed.loc[0, "symbol"] == "AAA"
+    assert refreshed.loc[0, "close"] == 101
+
+
 def test_last_completed_session_minute_never_uses_partial_or_pre_session_bar() -> None:
     assert hourly_paper_session._last_completed_session_minute(
         pd.Timestamp("2026-07-28T13:20:59Z"), date(2026, 7, 28)
