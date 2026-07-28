@@ -96,6 +96,16 @@ def _decision_grid(session_day: date, *, interval_minutes: int) -> pd.DatetimeIn
     return pd.date_range(start, final_decision, freq=f"{interval_minutes}min")
 
 
+def _resolve_forecast_horizon_minutes(
+    interval_minutes: int, forecast_horizon_minutes: int | None
+) -> int:
+    """Allow a causal horizon no longer than the decision cadence."""
+    horizon = interval_minutes if forecast_horizon_minutes is None else forecast_horizon_minutes
+    if not 1 <= horizon <= interval_minutes:
+        raise ValueError("forecast_horizon_minutes must be between one and interval_minutes")
+    return horizon
+
+
 def _close_timestamp_known_at(boundary: pd.Timestamp) -> pd.Timestamp:
     """Return the left-labeled bar whose close is known at ``boundary``."""
     return boundary - MINUTE_BAR_WIDTH
@@ -107,14 +117,19 @@ def _as_utc_timestamp(value: object) -> pd.Timestamp:
 
 
 def _non_overlapping_label_panel(
-    closes: pd.DataFrame, session_days: list[date], *, interval_minutes: int
+    closes: pd.DataFrame,
+    session_days: list[date],
+    *,
+    interval_minutes: int,
+    forecast_horizon_minutes: int | None = None,
 ) -> tuple[pd.DataFrame, pd.Series]:
     """Return non-overlapping intraday log-return labels and their ends."""
+    horizon = _resolve_forecast_horizon_minutes(interval_minutes, forecast_horizon_minutes)
     rows: list[pd.Series] = []
     ends: dict[pd.Timestamp, pd.Timestamp] = {}
     for session_day in session_days:
         for decision_at in _decision_grid(session_day, interval_minutes=interval_minutes):
-            target_end = decision_at + timedelta(minutes=interval_minutes)
+            target_end = decision_at + timedelta(minutes=horizon)
             start_prices = closes.reindex([_close_timestamp_known_at(decision_at)]).iloc[0]
             end_prices = closes.reindex([_close_timestamp_known_at(target_end)]).iloc[0]
             row = np.log(end_prices / start_prices)
@@ -307,16 +322,18 @@ def _candidate_from_selection(
     *,
     decision: pd.Timestamp,
     interval_minutes: int,
+    forecast_horizon_minutes: int | None = None,
     prepared_at: pd.Timestamp | None = None,
 ) -> IntradayForecastCandidate:
+    horizon = _resolve_forecast_horizon_minutes(interval_minutes, forecast_horizon_minutes)
     status: dict[str, object] = {
         **diagnostic,
         "weights_generated": weights is not None and expected_by_asset is not None,
         "decision_timestamp": decision.isoformat(),
         "decision_price_timestamp": _close_timestamp_known_at(decision).isoformat(),
-        "target_end": (decision + timedelta(minutes=interval_minutes)).isoformat(),
+        "target_end": (decision + timedelta(minutes=horizon)).isoformat(),
         "forecast_interval_minutes": interval_minutes,
-        "forecast_horizon_minutes": interval_minutes,
+        "forecast_horizon_minutes": horizon,
         "causality_rule": (
             "training target_end is strictly earlier than the decision and the decision price is "
             "the preceding completed one-minute close"
@@ -340,7 +357,7 @@ def _candidate_from_selection(
 
 
 class RealtimeIntradayForecastEngine:
-    """Incremental causal 5- or 15-minute candidate generator.
+    """Incremental causal candidate generator with a fixed cadence and horizon.
 
     Expensive regular-session cleaning, pivoting, and historical labels are
     constructed exactly once per handoff slice. ``update_minute_bars`` only
@@ -354,6 +371,7 @@ class RealtimeIntradayForecastEngine:
         minute_bars: pd.DataFrame,
         *,
         interval_minutes: int = FORECAST_INTERVAL_MINUTES,
+        forecast_horizon_minutes: int | None = None,
         top_n: int = 20,
         max_weight: float = 0.10,
         risk_aversion: float = 10.0,
@@ -373,6 +391,9 @@ class RealtimeIntradayForecastEngine:
         )
         clean = _regular_session_minute_closes(minute_bars)
         self._interval_minutes = interval_minutes
+        self._forecast_horizon_minutes = _resolve_forecast_horizon_minutes(
+            interval_minutes, forecast_horizon_minutes
+        )
         self._top_n = top_n
         self._max_weight = max_weight
         self._risk_aversion = risk_aversion
@@ -383,13 +404,20 @@ class RealtimeIntradayForecastEngine:
         self._closes = clean.pivot(index="timestamp", columns="symbol", values="close").sort_index()
         self._available_days = sorted(set(clean["session_date"]))
         self._labels, self._target_ends = _non_overlapping_label_panel(
-            self._closes, self._available_days, interval_minutes=self._interval_minutes
+            self._closes,
+            self._available_days,
+            interval_minutes=self._interval_minutes,
+            forecast_horizon_minutes=self._forecast_horizon_minutes,
         )
         self._prepared: dict[pd.Timestamp, _PreparedIntradayTraining] = {}
 
     @property
     def interval_minutes(self) -> int:
         return self._interval_minutes
+
+    @property
+    def forecast_horizon_minutes(self) -> int:
+        return self._forecast_horizon_minutes
 
     def _validate_decision(self, decision: pd.Timestamp) -> date:
         session_day = decision.tz_convert(NEW_YORK).date()
@@ -404,14 +432,16 @@ class RealtimeIntradayForecastEngine:
     def _refresh_session_labels(self, session_day: date) -> None:
         decisions = _decision_grid(session_day, interval_minutes=self._interval_minutes)
         starts = self._closes.reindex(index=decisions - MINUTE_BAR_WIDTH)
-        ends = self._closes.reindex(index=decisions + timedelta(minutes=self._interval_minutes) - MINUTE_BAR_WIDTH)
+        ends = self._closes.reindex(
+            index=decisions + timedelta(minutes=self._forecast_horizon_minutes) - MINUTE_BAR_WIDTH
+        )
         refreshed = np.log(ends.to_numpy(dtype=float) / starts.to_numpy(dtype=float))
         rows = pd.DataFrame(refreshed, index=decisions, columns=self._closes.columns)
         rows.index.name = "decision_timestamp"
         keep = self._labels.index.tz_convert(NEW_YORK).date != session_day
         self._labels = pd.concat([self._labels.loc[keep], rows]).sort_index()
         ends_by_decision = pd.Series(
-            decisions + timedelta(minutes=self._interval_minutes), index=decisions, name="target_end"
+            decisions + timedelta(minutes=self._forecast_horizon_minutes), index=decisions, name="target_end"
         )
         self._target_ends = pd.concat([self._target_ends.loc[keep], ends_by_decision]).sort_index()
 
@@ -474,6 +504,7 @@ class RealtimeIntradayForecastEngine:
             diagnostic,
             decision=decision,
             interval_minutes=self._interval_minutes,
+            forecast_horizon_minutes=self._forecast_horizon_minutes,
             prepared_at=prepared_at,
         )
 
@@ -483,6 +514,7 @@ def generate_intraday_forecast_candidate(
     *,
     decision_at: str | pd.Timestamp,
     interval_minutes: int = FORECAST_INTERVAL_MINUTES,
+    forecast_horizon_minutes: int | None = None,
     top_n: int = 20,
     max_weight: float = 0.10,
     risk_aversion: float = 10.0,
@@ -502,6 +534,7 @@ def generate_intraday_forecast_candidate(
     engine = RealtimeIntradayForecastEngine(
         minute_bars,
         interval_minutes=interval_minutes,
+        forecast_horizon_minutes=forecast_horizon_minutes,
         top_n=top_n,
         max_weight=max_weight,
         risk_aversion=risk_aversion,

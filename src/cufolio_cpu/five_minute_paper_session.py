@@ -41,6 +41,9 @@ MINIMUM_HISTORY_SESSIONS = 10
 MAX_EVENT_LAG = timedelta(seconds=90)
 WAIT_HEARTBEAT_INTERVAL = timedelta(minutes=5)
 EVENT_PRIORITY_GUARD = timedelta(seconds=45)
+END_OF_DAY_HANDOFF_GUARD = timedelta(minutes=2)
+FORECAST_CADENCE_MINUTES = 5
+CLOSING_FORECAST_HORIZON_MINUTES = 4
 
 
 @dataclass(frozen=True)
@@ -49,6 +52,7 @@ class MinuteCacheUpdate:
 
     bars: pd.DataFrame
     new_rows: pd.DataFrame
+    elapsed_seconds: float = 0.0
 
 
 def _utc_timestamp(value: datetime | pd.Timestamp | None = None) -> pd.Timestamp:
@@ -59,8 +63,13 @@ def _utc_timestamp(value: datetime | pd.Timestamp | None = None) -> pd.Timestamp
 
 
 def five_minute_events(session_day: date) -> list[tuple[str, pd.Timestamp]]:
-    """Return one target order per causal five-minute decision plus 15:59 flatten."""
-    return [("forecast_and_order", at) for at in _decision_grid(session_day, interval_minutes=5)] + [
+    """Return 09:35--15:55 decisions and the 15:59 flat-close event.
+
+    The first 09:35 decision uses the completed 09:30--09:34 opening data.
+    The final 15:55 decision is handled by a separately trained four-minute
+    model so its target ends exactly at the 15:59 flatten boundary.
+    """
+    return [("forecast_and_order", at) for at in _decision_grid(session_day, interval_minutes=FORECAST_CADENCE_MINUTES)] + [
         (
             "flatten",
             (
@@ -69,6 +78,26 @@ def five_minute_events(session_day: date) -> list[tuple[str, pd.Timestamp]]:
             ).tz_convert("UTC"),
         )
     ]
+
+
+def _forecast_horizon_for_decision(decision_at: pd.Timestamp, session_day: date) -> int:
+    """Use the four-minute closing horizon only for the 15:55 decision."""
+    closing_decision = (
+        pd.Timestamp.combine(session_day, SESSION_CLOSE).tz_localize(NEW_YORK)
+        - timedelta(minutes=FORECAST_CADENCE_MINUTES)
+    ).tz_convert("UTC")
+    return CLOSING_FORECAST_HORIZON_MINUTES if decision_at == closing_decision else FORECAST_CADENCE_MINUTES
+
+
+def _handoff_must_wait_for_flatten(
+    kind: str, due_at: pd.Timestamp, stop_at: pd.Timestamp | None
+) -> bool:
+    """Permit a near-deadline 15:59 flatten to finish across Action handoffs."""
+    return bool(
+        kind == "flatten"
+        and stop_at is not None
+        and timedelta(0) < due_at - stop_at <= END_OF_DAY_HANDOFF_GUARD
+    )
 
 
 def _regular_minute_cache_projection(bars: pd.DataFrame) -> pd.DataFrame:
@@ -180,9 +209,14 @@ def _merge_current_minutes(
     The websocket is always preferred.  REST requests explicitly specify IEX
     in ``download_minute_bars``; no code path asks Alpaca for recent SIP data.
     """
+    refresh_started = time.monotonic()
     completed = _completed_bar_at(observed_at, session_day)
     if completed is None:
-        return MinuteCacheUpdate(bars, pd.DataFrame(columns=["timestamp", "symbol", "close"]))
+        return MinuteCacheUpdate(
+            bars,
+            pd.DataFrame(columns=["timestamp", "symbol", "close"]),
+            time.monotonic() - refresh_started,
+        )
     # ``bars`` is normalized at restore/bootstrap and every durable write.
     # Keeping it in that form avoids a multi-million-row clean/pivot in the
     # one-minute precomputation path.
@@ -235,10 +269,11 @@ def _merge_current_minutes(
             _write_minute_cache(cache_path, normalized)
         print(
             "FIVE MINUTE CACHE UPDATED | "
-            f"source={source} through={completed.isoformat()} rows={len(incremental):,} {_cache_summary(normalized)}",
+            f"source={source} through={completed.isoformat()} rows={len(incremental):,} "
+            f"elapsed={time.monotonic() - refresh_started:.3f}s {_cache_summary(normalized)}",
             flush=True,
         )
-    return MinuteCacheUpdate(normalized, incremental)
+    return MinuteCacheUpdate(normalized, incremental, time.monotonic() - refresh_started)
 
 
 def _prior_sessions(bars: pd.DataFrame, session_day: date) -> int:
@@ -344,26 +379,35 @@ def run_five_minute_paper_session(
             print(f"FIVE MINUTE HISTORY BOOTSTRAPPED | {_cache_summary(bars)}", flush=True)
         except Exception as error:
             _record_degraded(health, "alpaca_iex_history", _utc_timestamp(), error)
-    engine: RealtimeIntradayForecastEngine | None
-    try:
-        engine = RealtimeIntradayForecastEngine(
+    def build_engine(forecast_horizon_minutes: int) -> RealtimeIntradayForecastEngine:
+        return RealtimeIntradayForecastEngine(
             bars,
-            interval_minutes=5,
+            interval_minutes=FORECAST_CADENCE_MINUTES,
+            forecast_horizon_minutes=forecast_horizon_minutes,
             top_n=top_n,
             max_weight=float(max_weight),
             risk_aversion=risk_aversion,
         )
-        print(
-            "FIVE MINUTE FORECAST ENGINE READY | "
-            f"cache_sessions={_prior_sessions(bars, session_day)} interval=5m precompute_lead=60s",
-            flush=True,
-        )
-    except Exception as error:
-        # Preserve the paper account by refusing a target if a complete
-        # causal panel cannot be built. Do not silently rebuild it late at a
-        # decision boundary.
-        engine = None
-        print(f"FIVE MINUTE FORECAST ENGINE UNAVAILABLE | reason={error}", flush=True)
+
+    engines: dict[int, RealtimeIntradayForecastEngine] = {}
+    for forecast_horizon_minutes in (FORECAST_CADENCE_MINUTES, CLOSING_FORECAST_HORIZON_MINUTES):
+        try:
+            engines[forecast_horizon_minutes] = build_engine(forecast_horizon_minutes)
+            print(
+                "FIVE MINUTE FORECAST ENGINE READY | "
+                f"cache_sessions={_prior_sessions(bars, session_day)} cadence=5m "
+                f"horizon={forecast_horizon_minutes}m precompute_lead=60s",
+                flush=True,
+            )
+        except Exception as error:
+            # Preserve the paper account by refusing a target if a complete
+            # causal panel cannot be built. Do not silently rebuild it late at
+            # a decision boundary unless the exact bar repair succeeds first.
+            print(
+                "FIVE MINUTE FORECAST ENGINE UNAVAILABLE | "
+                f"cadence=5m horizon={forecast_horizon_minutes}m reason={error}",
+                flush=True,
+            )
     print(
         "FIVE MINUTE SESSION STARTED | "
         f"mode={client.mode} session={session_day.isoformat()} symbols={len(symbols)} "
@@ -384,7 +428,12 @@ def run_five_minute_paper_session(
             event_id = f"{kind}:{due_at.isoformat()}"
             if event_id in completed:
                 continue
-            if stop_at is not None and now() < due_at and due_at > stop_at:
+            if (
+                stop_at is not None
+                and now() < due_at
+                and due_at > stop_at
+                and not _handoff_must_wait_for_flatten(kind, due_at, stop_at)
+            ):
                 break
             heartbeat: pd.Timestamp | None = None
             while now() < due_at:
@@ -411,8 +460,9 @@ def run_five_minute_paper_session(
                             persist=False,
                         )
                         bars = update.bars
-                        if engine is not None and not update.new_rows.empty:
-                            engine.update_minute_bars(update.new_rows)
+                        if not update.new_rows.empty:
+                            for engine in engines.values():
+                                engine.update_minute_bars(update.new_rows)
                         last_minute_refresh = completed_minute
                     except Exception as error:
                         _record_degraded(health, "background_minute_precompute", current, error)
@@ -420,18 +470,21 @@ def run_five_minute_paper_session(
                 # their calculation is complete one minute before the final
                 # decision-price bar exists. The exact current-price screen
                 # remains deferred until the boundary below.
+                forecast_horizon_minutes = _forecast_horizon_for_decision(due_at, session_day)
+                selected_engine = engines.get(forecast_horizon_minutes)
                 if (
                     kind == "forecast_and_order"
                     and event_id not in prepared_event_ids
                     and current >= due_at - timedelta(minutes=1)
-                    and engine is not None
+                    and selected_engine is not None
                 ):
                     try:
-                        engine.prepare_for_decision(due_at, prepared_at=current)
+                        selected_engine.prepare_for_decision(due_at, prepared_at=current)
                         prepared_event_ids.add(event_id)
                         print(
                             "FIVE MINUTE FORECAST PREPARED | "
-                            f"decision={due_at.isoformat()} prepared_at={current.isoformat()} lead_seconds="
+                            f"decision={due_at.isoformat()} horizon={forecast_horizon_minutes}m "
+                            f"prepared_at={current.isoformat()} lead_seconds="
                             f"{max(0, int((due_at - current).total_seconds()))}",
                             flush=True,
                         )
@@ -457,14 +510,14 @@ def run_five_minute_paper_session(
                 if (
                     kind == "forecast_and_order"
                     and event_id not in prepared_event_ids
-                    and engine is not None
+                    and selected_engine is not None
                 ):
                     next_wakeup = min(next_wakeup, due_at - timedelta(minutes=1))
                 sleep(min(15.0, max(0.01, float((next_wakeup - current).total_seconds()))))
             observed = now()
             if stop_at is not None and observed > stop_at:
                 break
-            if observed > due_at + MAX_EVENT_LAG:
+            if observed > due_at + MAX_EVENT_LAG and kind != "flatten":
                 entry = {"event": "skipped_stale_five_minute_event", "scheduled_at": due_at.isoformat(), "observed_at": observed.isoformat(), "kind": kind, "reason": "maximum_event_lag_exceeded"}
                 ledger.append(entry)
                 completed.add(event_id)
@@ -472,13 +525,49 @@ def run_five_minute_paper_session(
                 print(f"FIVE MINUTE EVENT SKIPPED | scheduled={due_at.isoformat()} reason=maximum_event_lag_exceeded", flush=True)
                 continue
             if kind == "flatten":
+                # Persist every completed minute through 15:58 before closing
+                # positions.  Tomorrow's new checkpoint starts empty, while
+                # this cache provides its most recent completed-session data.
+                try:
+                    update = _merge_current_minutes(
+                        bars,
+                        symbols,
+                        session_day=session_day,
+                        observed_at=observed,
+                        cache_path=cache_file,
+                        minute_stream=stream,
+                        health=health,
+                        repair_from_rest=True,
+                        persist=True,
+                    )
+                    bars = update.bars
+                    if not update.new_rows.empty:
+                        for engine in engines.values():
+                            engine.update_minute_bars(update.new_rows)
+                    print(
+                        "FIVE MINUTE CACHE FINALIZED | "
+                        f"through={_completed_bar_at(observed, session_day).isoformat()} "
+                        f"elapsed={update.elapsed_seconds:.3f}s {_cache_summary(bars)}",
+                        flush=True,
+                    )
+                except Exception as error:
+                    # A cache failure must never prevent the risk-reducing
+                    # 15:59 flatten from being submitted.
+                    _record_degraded(health, "final_session_cache", observed, error)
                 report = run_end_of_day_flatten(client, execute=True)
-                ledger.append({"event": "end_of_day_flatten", "scheduled_at": due_at.isoformat(), "observed_at": observed.isoformat(), "paper_rebalance": report})
+                ledger.append({
+                    "event": "end_of_day_flatten",
+                    "scheduled_at": due_at.isoformat(),
+                    "observed_at": observed.isoformat(),
+                    "cache_through": _completed_bar_at(observed, session_day).isoformat(),
+                    "paper_rebalance": report,
+                })
                 completed.add(event_id)
                 persist()
                 print(f"FIVE MINUTE FLATTEN RESULT | {_execution_summary(report)}", flush=True)
                 continue
             try:
+                forecast_horizon_minutes = _forecast_horizon_for_decision(due_at, session_day)
                 update = _merge_current_minutes(
                     bars,
                     symbols,
@@ -491,17 +580,18 @@ def run_five_minute_paper_session(
                     persist=True,
                 )
                 bars = update.bars
+                if not update.new_rows.empty:
+                    for engine in engines.values():
+                        engine.update_minute_bars(update.new_rows)
+                engine = engines.get(forecast_horizon_minutes)
                 if engine is None:
-                    engine = RealtimeIntradayForecastEngine(
-                        bars,
-                        interval_minutes=5,
-                        top_n=top_n,
-                        max_weight=float(max_weight),
-                        risk_aversion=risk_aversion,
+                    engine = build_engine(forecast_horizon_minutes)
+                    engines[forecast_horizon_minutes] = engine
+                    print(
+                        "FIVE MINUTE FORECAST ENGINE RECOVERED | "
+                        f"source=exact_boundary_cache cadence=5m horizon={forecast_horizon_minutes}m",
+                        flush=True,
                     )
-                    print("FIVE MINUTE FORECAST ENGINE RECOVERED | source=exact_boundary_cache", flush=True)
-                elif not update.new_rows.empty:
-                    engine.update_minute_bars(update.new_rows)
                 forecast_started = time.monotonic()
                 candidate = engine.generate_candidate(due_at)
                 if not candidate.status["weights_generated"]:
@@ -516,6 +606,8 @@ def run_five_minute_paper_session(
                 entry = {
                     "event": "five_minute_forecast_target_order", "scheduled_at": due_at.isoformat(),
                     "observed_at": observed.isoformat(), "target_end": candidate.status["target_end"],
+                    "forecast_horizon_minutes": forecast_horizon_minutes,
+                    "cache_refresh_seconds": update.elapsed_seconds,
                     "candidate_file": candidate_path.name, "forecast_status": candidate.status,
                     "paper_rebalance": report,
                 }
@@ -525,6 +617,7 @@ def run_five_minute_paper_session(
                 print(
                     "FIVE MINUTE TARGET RESULT | "
                     f"decision={due_at.isoformat()} target_end={candidate.status['target_end']} "
+                    f"horizon={forecast_horizon_minutes}m cache_elapsed={update.elapsed_seconds:.3f}s "
                     f"weights={len(targets)} forecast_elapsed={time.monotonic() - forecast_started:.3f}s "
                     f"{_execution_summary(report)}",
                     flush=True,
