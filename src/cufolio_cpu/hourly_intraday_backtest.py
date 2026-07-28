@@ -1,12 +1,11 @@
 """Causal one-hour portfolio research backtest using exact one-minute bars.
 
 The strategy is deliberately separate from the daily target and paper-trading
-paths.  It selects a long-only mean--variance portfolio at 09:30, 10:30, ...,
-14:30 New York time, estimates one-hour returns from *completed* earlier
-hourly windows only, and restores that portfolio's weights every 15 minutes
-until the next hourly selection.  It never crosses an overnight boundary,
-never forward-fills a missing price, and never treats a missing interval as a
-zero return.
+paths.  It estimates one-hour returns from *completed* earlier hourly windows
+only, and restores a selected portfolio's weights every 15 minutes during the
+one-hour holding window.  It never crosses an overnight boundary, never
+forward-fills a missing price, and never treats a missing interval as a zero
+return.
 
 This is a historical research backtest.  Its optimizer is mathematically
 optimal only for the supplied trailing mean/covariance assumptions; it is not
@@ -76,6 +75,30 @@ def _regular_session_minute_closes(bars: pd.DataFrame) -> pd.DataFrame:
     return clean.sort_values(["timestamp", "symbol"]).reset_index(drop=True)
 
 
+def _exact_minute_prices(minute_bars: pd.DataFrame, at: pd.Timestamp) -> pd.Series:
+    """Return the exact observed one-minute close at ``at`` for each symbol.
+
+    This intentionally does not apply the regular-session filter: a forecast
+    made at 09:20 New York time relies on the exact 09:20 pre-market close,
+    while the one-hour training labels remain regular-session-only.  A missing
+    decision-minute quote is excluded rather than filled from an older quote.
+    """
+    required = {"timestamp", "symbol", "close"}
+    if missing := required.difference(minute_bars.columns):
+        raise ValueError(f"intraday bars are missing required columns: {sorted(missing)}")
+    clean = minute_bars.loc[:, ["timestamp", "symbol", "close"]].copy()
+    clean["timestamp"] = pd.to_datetime(clean["timestamp"], utc=True, errors="coerce")
+    clean["symbol"] = clean["symbol"].astype(str).str.upper().str.strip()
+    clean["close"] = pd.to_numeric(clean["close"], errors="coerce")
+    exact = clean.loc[
+        (clean["timestamp"] == at)
+        & clean["close"].notna()
+        & (clean["close"] > 0)
+        & clean["symbol"].ne("")
+    ]
+    return exact.drop_duplicates("symbol", keep="last").set_index("symbol")["close"]
+
+
 def _selection_timestamps(session_dates: pd.DatetimeIndex) -> list[pd.Timestamp]:
     """Return 09:30, 10:30, ..., 14:30 in UTC for every session date."""
     timestamps: list[pd.Timestamp] = []
@@ -139,9 +162,9 @@ def _quarter_hour_returns(
 def _target_weights(
     hourly_returns: pd.DataFrame,
     target_ends: pd.Series,
-    closes: pd.DataFrame,
     *,
     decision_at: pd.Timestamp,
+    current_prices: pd.Series,
     top_n: int,
     lookback_scenarios: int,
     min_training_scenarios: int,
@@ -151,7 +174,6 @@ def _target_weights(
     """Select an allocation using only labels completed strictly before a decision."""
     training = hourly_returns.loc[target_ends.reindex(hourly_returns.index) < decision_at]
     training = training.tail(lookback_scenarios)
-    current_prices = closes.reindex([decision_at]).iloc[0].dropna()
     eligible = training.columns[
         (training.notna().sum(axis=0) >= min_training_scenarios)
         & training.columns.isin(current_prices.index)
@@ -238,18 +260,21 @@ def generate_hourly_one_hour_candidate(
     minute_bars: pd.DataFrame,
     *,
     decision_at: str | pd.Timestamp,
+    target_start_at: str | pd.Timestamp | None = None,
     top_n: int = 20,
     lookback_scenarios: int = 120,
     min_training_scenarios: int = 20,
     max_weight: float = 0.10,
     risk_aversion: float = 10.0,
 ) -> HourlyCandidateResult:
-    """Create a research candidate at an exact hourly decision timestamp.
+    """Create a causal candidate for a one-hour regular-session target.
 
-    Unlike the backtest runner, this function does not require future
-    fifteen-minute execution prices.  It can therefore produce the 10:30
-    candidate after the 10:30 one-minute close is known, while retaining the
-    same strict completed-label rule used by the backtest.
+    ``decision_at`` is the exact observed pricing minute.  When
+    ``target_start_at`` is supplied, it may be a later hourly target; for
+    example, a 09:20 New York decision can forecast the 10:30--11:30 holding
+    window.  The forecast does not require the target window's prices to have
+    occurred.  With no target supplied, the legacy same-timestamp target is
+    retained for research-only candidate workflows.
     """
     if top_n < 2:
         raise ValueError("top_n must be at least two")
@@ -264,17 +289,32 @@ def generate_hourly_one_hour_candidate(
     if decision.tzinfo is None:
         raise ValueError("decision_at must include a UTC offset")
     decision = decision.tz_convert("UTC")
-    hourly_returns, target_ends, closes = build_one_hour_return_panel(minute_bars)
-    if decision not in target_ends.index:
+    target_start = pd.Timestamp(target_start_at) if target_start_at is not None else decision
+    if target_start.tzinfo is None:
+        raise ValueError("target_start_at must include a UTC offset")
+    target_start = target_start.tz_convert("UTC")
+    if target_start_at is not None and target_start <= decision:
+        raise ValueError("target_start_at must be strictly later than decision_at")
+    target_local = target_start.tz_convert(NEW_YORK)
+    if (
+        target_local.hour not in range(9, 15)
+        or target_local.minute != 30
+        or target_local.second != 0
+        or target_local.microsecond != 0
+        or target_start + HOLDING_DELTA
+        > target_local.normalize() + SESSION_CLOSE
+    ):
         raise ValueError(
-            "decision_at must be an exact 09:30, 10:30, ..., 14:30 New York selection timestamp "
-            "present in the supplied regular-session data"
+            "target_start_at must be an exact 09:30, 10:30, ..., 14:30 New York timestamp "
+            "with a complete same-session one-hour holding window"
         )
+    hourly_returns, target_ends, _ = build_one_hour_return_panel(minute_bars)
+    current_prices = _exact_minute_prices(minute_bars, decision)
     weights, diagnostic = _target_weights(
         hourly_returns,
         target_ends,
-        closes,
         decision_at=decision,
+        current_prices=current_prices,
         top_n=top_n,
         lookback_scenarios=lookback_scenarios,
         min_training_scenarios=min_training_scenarios,
@@ -285,7 +325,8 @@ def generate_hourly_one_hour_candidate(
         "research_only": True,
         "bar_interval": "1m",
         "decision_timestamp": decision.isoformat(),
-        "target_end": target_ends.loc[decision].isoformat(),
+        "target_start": target_start.isoformat(),
+        "target_end": (target_start + HOLDING_DELTA).isoformat(),
         "target_horizon_minutes": HOLDING_MINUTES,
         "execution_rebalance_frequency_minutes": REBALANCE_MINUTES,
         "weights_generated": weights is not None,
@@ -295,13 +336,14 @@ def generate_hourly_one_hour_candidate(
     }
     if weights is None:
         return HourlyCandidateResult(
-            pd.DataFrame(columns=["decision_timestamp", "target_end", "symbol", "target_weight"]),
+            pd.DataFrame(columns=["decision_timestamp", "target_start", "target_end", "symbol", "target_weight"]),
             status,
         )
     candidate = pd.DataFrame(
         {
             "decision_timestamp": decision,
-            "target_end": target_ends.loc[decision],
+            "target_start": target_start,
+            "target_end": target_start + HOLDING_DELTA,
             "symbol": weights.index,
             "target_weight": weights.to_numpy(dtype=float),
         }
@@ -351,8 +393,8 @@ def run_hourly_one_hour_backtest(
         weights, diagnostic = _target_weights(
             hourly_returns,
             target_ends,
-            closes,
             decision_at=decision_at,
+            current_prices=closes.reindex([decision_at]).iloc[0].dropna(),
             top_n=top_n,
             lookback_scenarios=lookback_scenarios,
             min_training_scenarios=min_training_scenarios,
@@ -480,6 +522,10 @@ def main() -> None:
         "--decision-at",
         help="UTC-offset timestamp for a causal candidate-only output (for example 2026-07-28T14:30:00Z)",
     )
+    parser.add_argument(
+        "--target-start-at",
+        help="optional later UTC-offset hourly target start for a forecast candidate",
+    )
     args = parser.parse_args()
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -488,6 +534,7 @@ def main() -> None:
         candidate = generate_hourly_one_hour_candidate(
             bars,
             decision_at=args.decision_at,
+            target_start_at=args.target_start_at,
             top_n=args.top_n,
             lookback_scenarios=args.lookback_scenarios,
             min_training_scenarios=args.min_training_scenarios,

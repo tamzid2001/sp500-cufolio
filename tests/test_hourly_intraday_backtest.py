@@ -103,6 +103,37 @@ def test_candidate_uses_only_completed_labels_and_needs_no_future_execution_pric
     assert (candidate.weights["target_weight"] <= 0.50 + 1e-12).all()
 
 
+def test_candidate_can_forecast_a_one_hour_window_seventy_minutes_before_its_start() -> None:
+    bars = _minute_bars()
+    selection = pd.Timestamp("2026-01-16 14:20:00+00:00")  # 09:20 New York pre-market
+    target_start = pd.Timestamp("2026-01-16 15:30:00+00:00")  # 10:30 New York
+    premarket_prices = pd.DataFrame(
+        [
+            {"timestamp": selection, "symbol": symbol, "close": close}
+            for symbol, close in {"AAA": 100.0, "BBB": 90.0, "CCC": 110.0}.items()
+        ]
+    )
+    observed = pd.concat([bars, premarket_prices], ignore_index=True)
+    observed = observed[pd.to_datetime(observed["timestamp"], utc=True) <= selection].copy()
+
+    candidate = generate_hourly_one_hour_candidate(
+        observed,
+        decision_at=selection,
+        target_start_at=target_start,
+        top_n=3,
+        lookback_scenarios=30,
+        min_training_scenarios=5,
+        max_weight=0.50,
+    )
+
+    assert candidate.status["weights_generated"] is True
+    assert candidate.status["decision_timestamp"] == selection.isoformat()
+    assert candidate.status["target_start"] == target_start.isoformat()
+    assert candidate.status["target_end"] == "2026-01-16T16:30:00+00:00"
+    assert pd.Timestamp(candidate.status["training_end"]) < selection
+    assert np.isclose(candidate.weights["target_weight"].sum(), 1.0)
+
+
 def test_candidate_keeps_a_complete_top_ranked_subset_when_other_assets_are_sparse() -> None:
     bars = _minute_bars()
     # Remove one endpoint for CCC from each historical hourly target.  AAA and

@@ -1,9 +1,10 @@
-"""Paper-only hourly portfolio session using causal one-minute candidates.
+"""Paper-only, 70-minute-ahead hourly portfolio forecast session.
 
 This runner is intentionally separate from the daily paper worker.  It holds
-one process for a bounded regular-session window, selects a new target at each
-completed hourly boundary, and submits *paper* rebalances every fifteen
-minutes.  It never accepts a live-trading mode or credentials.
+one process for a bounded regular-session window, forecasts each one-hour
+target 70 minutes before it begins, and submits *paper* rebalances every
+fifteen minutes during that target.  It never accepts a live-trading mode or
+credentials.
 """
 
 from __future__ import annotations
@@ -25,8 +26,8 @@ from .hourly_intraday_backtest import NEW_YORK, generate_hourly_one_hour_candida
 from .paper_rebalance import AlpacaTradingClient, load_target_weights, run_end_of_day_flatten, run_rebalance
 from .universe import current_sp500_universe
 
-SELECTION_HOURS = (10, 11, 12, 13, 14)
-SELECTION_DELAY = timedelta(minutes=5)
+TARGET_START_HOURS = (10, 11, 12, 13, 14)
+FORECAST_LEAD = timedelta(hours=1, minutes=10)
 MAX_START_LAG = timedelta(minutes=10)
 
 
@@ -34,24 +35,34 @@ MAX_START_LAG = timedelta(minutes=10)
 class SessionEvent:
     kind: Literal["select", "rebalance", "flatten"]
     due_at: pd.Timestamp
-    decision_at: pd.Timestamp | None = None
+    selection_at: pd.Timestamp | None = None
+    target_start: pd.Timestamp | None = None
 
 
 def session_events(session_day: date) -> list[SessionEvent]:
     """Return the exact paper-session schedule for a New York session date.
 
-    The 10:30, ..., 14:30 selections run five minutes after their decision
-    minute so the exact decision close is complete.  Each selection itself is
-    a rebalance, followed by the three remaining quarter-hour rebalances.  A
-    15:30 selection is intentionally impossible: it would require an
-    overnight label, so the runner flattens instead.
+    Forecasts are made at 09:20, 10:20, ..., 13:20 New York time using only
+    the exact observed selection-minute price.  They target the respectively
+    later 10:30--11:30 through 14:30--15:30 windows.  Each target is first
+    paper-rebalanced at its start and then at +15, +30, and +45 minutes.  A
+    15:30 target start is intentionally impossible because its one-hour
+    holding window would cross the regular-session close.
     """
     events: list[SessionEvent] = []
-    for hour in SELECTION_HOURS:
-        decision = pd.Timestamp.combine(session_day, clock_time(hour, 30)).tz_localize(NEW_YORK).tz_convert("UTC")
-        events.append(SessionEvent("select", decision + SELECTION_DELAY, decision))
-        for minutes in (15, 30, 45):
-            events.append(SessionEvent("rebalance", decision + timedelta(minutes=minutes), decision))
+    for hour in TARGET_START_HOURS:
+        target_start = pd.Timestamp.combine(session_day, clock_time(hour, 30)).tz_localize(NEW_YORK).tz_convert("UTC")
+        selection_at = target_start - FORECAST_LEAD
+        events.append(SessionEvent("select", selection_at, selection_at, target_start))
+        for minutes in (0, 15, 30, 45):
+            events.append(
+                SessionEvent(
+                    "rebalance",
+                    target_start + timedelta(minutes=minutes),
+                    selection_at,
+                    target_start,
+                )
+            )
     flatten_at = pd.Timestamp.combine(session_day, clock_time(15, 30)).tz_localize(NEW_YORK).tz_convert("UTC")
     events.append(SessionEvent("flatten", flatten_at))
     return sorted(events, key=lambda event: event.due_at)
@@ -119,80 +130,88 @@ def run_hourly_paper_session(
     universe.to_csv(output / "current_sp500_universe.csv", index=False)
     client = AlpacaTradingClient.from_environment(mode="paper")
     bars: pd.DataFrame | None = None
-    current_targets: dict[str, Decimal] | None = None
-    current_decision: pd.Timestamp | None = None
+    targets_by_start: dict[pd.Timestamp, dict[str, Decimal]] = {}
+    forecast_details: dict[pd.Timestamp, dict[str, object]] = {}
     ledger: list[dict[str, object]] = []
     # The full S&P one-minute history is the expensive operation.  Start it
-    # before the first 10:30 decision, then fetch only the new minutes at each
-    # hourly boundary.  This keeps the initial paper entry timely.
-    first_decision = session_events(session_day)[0].decision_at
-    assert first_decision is not None
+    # before the first 09:20 forecast, then fetch only the new minutes at each
+    # later forecast.  This keeps the 10:30 paper entry timely without looking
+    # past any forecast's exact observed minute.
+    events = session_events(session_day)
+    first_selection = events[0].selection_at
+    assert first_selection is not None
     prefetch_now = now()
-    if prefetch_now < first_decision:
+    if prefetch_now < first_selection:
         bars = download_minute_bars(symbols, history_start, prefetch_now + timedelta(minutes=1))
 
-    for event in session_events(session_day):
+    for event in events:
         while now() < event.due_at:
             sleep(min(30.0, float((event.due_at - now()).total_seconds())))
         observed_at = now()
         if event.kind == "select":
-            assert event.decision_at is not None
+            assert event.selection_at is not None
+            assert event.target_start is not None
             if observed_at > event.due_at + MAX_START_LAG:
                 raise RuntimeError(
-                    f"selection at {event.decision_at.isoformat()} is too late for a causal paper entry: "
+                    f"forecast selection at {event.selection_at.isoformat()} is too late for the planned paper entry: "
                     f"runner reached it at {observed_at.isoformat()}"
                 )
-            bars = _history_through(bars, symbols, start=history_start, decision_at=event.decision_at)
+            bars = _history_through(bars, symbols, start=history_start, decision_at=event.selection_at)
             if now() > event.due_at + MAX_START_LAG:
                 raise RuntimeError(
-                    f"history for {event.decision_at.isoformat()} was not available in time; "
-                    "refusing a stale paper entry"
+                    f"history for {event.selection_at.isoformat()} was not available in time; "
+                    "refusing a stale forecast"
                 )
             candidate = generate_hourly_one_hour_candidate(
                 bars,
-                decision_at=event.decision_at,
+                decision_at=event.selection_at,
+                target_start_at=event.target_start,
                 top_n=top_n,
                 lookback_scenarios=lookback_scenarios,
                 min_training_scenarios=min_training_scenarios,
                 max_weight=float(max_weight),
                 risk_aversion=risk_aversion,
             )
-            stamp = event.decision_at.strftime("%H%M")
-            candidate_path = output / f"candidate_{stamp}.csv"
+            stamp = event.target_start.strftime("%H%M")
+            candidate_path = output / f"candidate_for_{stamp}.csv"
             candidate.weights.to_csv(candidate_path, index=False)
             _write_json(output / f"candidate_{stamp}_status.json", candidate.status)
             if not candidate.status["weights_generated"]:
-                raise RuntimeError(f"no exact causal candidate at {event.decision_at.isoformat()}: {candidate.status}")
-            current_targets = load_target_weights(candidate_path, max_weight=max_weight)
-            current_decision = event.decision_at
-            report = run_rebalance(
-                client,
-                current_targets,
-                min_order_notional=min_order_notional,
-                min_weight_drift=min_weight_drift,
-                liquidate_non_target_positions=True,
-                execute=True,
-            )
+                raise RuntimeError(
+                    f"no exact causal forecast for {event.target_start.isoformat()} "
+                    f"from {event.selection_at.isoformat()}: {candidate.status}"
+                )
+            targets_by_start[event.target_start] = load_target_weights(candidate_path, max_weight=max_weight)
             expected_log = float(candidate.status["expected_one_hour_log_return"])
+            forecast_details[event.target_start] = {
+                "selection_timestamp": event.selection_at.isoformat(),
+                "target_start": event.target_start.isoformat(),
+                "target_end": candidate.status["target_end"],
+                "expected_one_hour_log_return": expected_log,
+                "expected_one_hour_simple_return": float(np.expm1(expected_log)),
+                "candidate_file": candidate_path.name,
+            }
             ledger.append(
                 {
-                    "event": "selection_and_paper_rebalance",
+                    "event": "forecast_selected",
                     "scheduled_at": event.due_at.isoformat(),
                     "observed_at": observed_at.isoformat(),
-                    "decision_timestamp": event.decision_at.isoformat(),
-                    "target_end": candidate.status["target_end"],
-                    "expected_one_hour_log_return": expected_log,
-                    "expected_one_hour_simple_return": float(np.expm1(expected_log)),
-                    "candidate_file": candidate_path.name,
-                    "paper_rebalance": report,
+                    **forecast_details[event.target_start],
                 }
             )
         elif event.kind == "rebalance":
-            if current_targets is None or current_decision != event.decision_at:
+            assert event.selection_at is not None
+            assert event.target_start is not None
+            if observed_at > event.due_at + MAX_START_LAG:
+                raise RuntimeError(
+                    f"paper rebalance for {event.target_start.isoformat()} is too late: "
+                    f"runner reached it at {observed_at.isoformat()}"
+                )
+            if event.target_start not in targets_by_start:
                 raise RuntimeError(f"missing active target for {event.due_at.isoformat()}")
             report = run_rebalance(
                 client,
-                current_targets,
+                targets_by_start[event.target_start],
                 min_order_notional=min_order_notional,
                 min_weight_drift=min_weight_drift,
                 liquidate_non_target_positions=True,
@@ -203,7 +222,7 @@ def run_hourly_paper_session(
                     "event": "quarter_hour_paper_rebalance",
                     "scheduled_at": event.due_at.isoformat(),
                     "observed_at": observed_at.isoformat(),
-                    "decision_timestamp": current_decision.isoformat(),
+                    **forecast_details[event.target_start],
                     "paper_rebalance": report,
                 }
             )
