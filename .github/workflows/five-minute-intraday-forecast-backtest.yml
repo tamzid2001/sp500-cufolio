@@ -116,7 +116,7 @@ jobs:
               pd.DataFrame(columns=["timestamp", "symbol", "close"]).to_csv(output, index=False)
               print("No yfinance endpoint repair was needed")
           else:
-              start = pd.Timestamp(f"{os.environ['SESSION_DATE']} 09:30", tz="America/New_York")
+              start = pd.Timestamp(f"{os.environ['SESSION_DATE']} 09:29", tz="America/New_York")
               end = pd.Timestamp(f"{os.environ['SESSION_DATE']} 16:00", tz="America/New_York")
               try:
                   bars = download_yfinance_minute_bars(symbols, start, end)
