@@ -49,6 +49,7 @@ def run_hourly_paper_daemon(
     history_start: str | None = None,
     history_calendar_days: int = DEFAULT_HISTORY_CALENDAR_DAYS,
     minute_cache_path: str | Path = "var/hourly_paper_24x7_minute_endpoints.csv.gz",
+    historical_minute_cache_path: str | Path | None = "var/iex_one_minute_history.csv.gz",
 ) -> None:
     """Keep an hourly paper session alive until this handoff slice expires."""
 
@@ -61,6 +62,7 @@ def run_hourly_paper_daemon(
     print(
         "HOURLY PAPER DAEMON STARTED | "
         f"mode=paper slice={run_seconds}s state={state} minute_cache={minute_cache_path} "
+        f"historical_minute_cache={historical_minute_cache_path or 'none'} "
         f"history_start={history_description} output={output}",
         flush=True,
     )
@@ -88,6 +90,7 @@ def run_hourly_paper_daemon(
                     max_weight=Decimal(max_weight),
                     checkpoint_path=state,
                     minute_cache_path=minute_cache_path,
+                    historical_minute_cache_path=historical_minute_cache_path,
                     stop_at=now + timedelta(seconds=max(0, deadline - time.monotonic() - 30)),
                     resume=True,
                 )
@@ -118,6 +121,11 @@ def main() -> None:
     parser.add_argument("--state", default="var/hourly_paper_24x7_state.json")
     parser.add_argument("--minute-cache", default="var/hourly_paper_24x7_minute_endpoints.csv.gz")
     parser.add_argument(
+        "--historical-minute-cache",
+        default="var/iex_one_minute_history.csv.gz",
+        help="retained IEX minute-history seed merged into every rolling live-cache handoff",
+    )
+    parser.add_argument(
         "--history-start",
         help="optional fixed UTC bootstrap start; the default is a rolling 45-calendar-day window",
     )
@@ -130,6 +138,7 @@ def main() -> None:
         run_seconds=args.run_seconds,
         state_path=args.state,
         minute_cache_path=args.minute_cache,
+        historical_minute_cache_path=args.historical_minute_cache,
         output_dir=args.output_dir,
         top_n=args.top_n,
         max_weight=args.max_weight,

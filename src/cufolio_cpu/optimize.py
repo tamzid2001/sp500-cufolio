@@ -18,9 +18,13 @@ class OptimizationResult:
 
 
 def _coerce_returns(returns: pd.DataFrame) -> pd.DataFrame:
-    clean = returns.dropna(axis=0, how="any").astype(float)
+    # An invalid market-data endpoint makes its complete return scenario
+    # unusable. Never pass an infinity through to a covariance solver.
+    clean = returns.replace([np.inf, -np.inf], np.nan).dropna(axis=0, how="any").astype(float)
     if len(clean) < 5 or clean.shape[1] < 2:
         raise ValueError("at least five complete observations and two assets are required")
+    if not np.isfinite(clean.to_numpy(dtype=float)).all():
+        raise ValueError("return scenarios must be finite")
     return clean
 
 
