@@ -1,10 +1,10 @@
-name: July 28 hourly causal paper session
+name: July 28 70-minute-ahead hourly paper session
 
 on:
-  # Starts at 09:45 ET to prefetch history before the first 10:30 decision.
+  # Starts at 09:20 ET to select the 10:30--11:30 forecast target.
   # It stays on the GitHub-hosted runner and ends by flattening at 15:30 ET.
   schedule:
-    - cron: "45 13 28 7 *"
+    - cron: "20 13 28 7 *"
   workflow_dispatch:
     inputs:
       session_date:
@@ -53,7 +53,7 @@ jobs:
         run: pip install -r requirements.txt
       - name: Verify hourly paper session schedule
         run: pytest -q tests/test_hourly_paper_session.py tests/test_hourly_intraday_backtest.py
-      - name: Run paper-only hourly candidate and rebalance loop
+      - name: Run paper-only hourly forecast and 15-minute rebalance loop
         run: |
           test -n "$ALPACA_API_KEY"
           test -n "$ALPACA_SECRET_KEY"
