@@ -9,6 +9,7 @@ from cufolio_cpu.hourly_intraday_backtest import (
     NEW_YORK,
     _quarter_hour_returns,
     build_one_hour_return_panel,
+    generate_hourly_one_hour_candidate,
     run_hourly_one_hour_backtest,
 )
 
@@ -79,3 +80,24 @@ def test_missing_execution_endpoint_is_not_forward_filled() -> None:
     closes.loc[missing_timestamp, "AAA"] = np.nan
 
     assert _quarter_hour_returns(closes, start, pd.Index(["AAA", "BBB"])) is None
+
+
+def test_candidate_uses_only_completed_labels_and_needs_no_future_execution_prices() -> None:
+    bars = _minute_bars()
+    decision = pd.Timestamp("2026-01-16 15:30:00+00:00")  # 10:30 New York time
+    observed = bars[pd.to_datetime(bars["timestamp"], utc=True) <= decision].copy()
+
+    candidate = generate_hourly_one_hour_candidate(
+        observed,
+        decision_at=decision,
+        top_n=3,
+        lookback_scenarios=30,
+        min_training_scenarios=5,
+        max_weight=0.50,
+    )
+
+    assert candidate.status["weights_generated"] is True
+    assert candidate.status["target_end"] == "2026-01-16T16:30:00+00:00"
+    assert pd.Timestamp(candidate.status["training_end"]) < decision
+    assert np.isclose(candidate.weights["target_weight"].sum(), 1.0)
+    assert (candidate.weights["target_weight"] <= 0.50 + 1e-12).all()

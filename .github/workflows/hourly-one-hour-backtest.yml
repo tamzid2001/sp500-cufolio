@@ -95,9 +95,9 @@ jobs:
           python -m cufolio_cpu.hourly_intraday_backtest \
             --input "$BAR_FILE" \
             --output-dir artifacts/hourly_one_hour_backtest \
-            --top-n "${{ inputs.top_n }}" \
-            --max-weight "${{ inputs.max_weight }}" \
-            --min-training-scenarios "${{ inputs.min_training_scenarios }}"
+            --top-n "${{ inputs.top_n || '10' }}" \
+            --max-weight "${{ inputs.max_weight || '0.20' }}" \
+            --min-training-scenarios "${{ inputs.min_training_scenarios || '20' }}"
       - uses: actions/upload-artifact@v4
         with:
           name: hourly-one-hour-portfolio-backtest

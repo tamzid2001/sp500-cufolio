@@ -1,0 +1,94 @@
+name: July 28 10:30 ET hourly research candidate
+
+on:
+  # The decision is 10:30 ET; this one-time run starts five minutes later so
+  # the exact 10:30 one-minute close can be fetched without look-ahead.
+  schedule:
+    - cron: "35 14 28 7 *"
+  workflow_dispatch:
+    inputs:
+      decision_at:
+        description: "Exact UTC decision timestamp; must be a regular-session hourly boundary"
+        type: string
+        default: "2026-07-28T14:30:00Z"
+      history_start:
+        description: "UTC history start for completed one-hour training outcomes"
+        type: string
+        default: "2026-06-01T13:30:00Z"
+      top_n:
+        description: "Maximum assets supplied to the capped long-only optimizer"
+        type: string
+        default: "20"
+      max_weight:
+        description: "Maximum portfolio weight for one asset"
+        type: string
+        default: "0.10"
+      min_training_scenarios:
+        description: "Minimum completed one-hour outcomes for each asset"
+        type: string
+        default: "20"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: july-28-1030-hourly-candidate
+  cancel-in-progress: false
+
+jobs:
+  candidate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      PYTHONPATH: ${{ github.workspace }}/src
+      ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
+      ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
+      DECISION_AT: ${{ inputs.decision_at || '2026-07-28T14:30:00Z' }}
+      HISTORY_START: ${{ inputs.history_start || '2026-06-01T13:30:00Z' }}
+      TOP_N: ${{ inputs.top_n || '20' }}
+      MAX_WEIGHT: ${{ inputs.max_weight || '0.10' }}
+      MIN_TRAINING_SCENARIOS: ${{ inputs.min_training_scenarios || '20' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install research dependencies
+        run: pip install -r requirements.txt
+      - name: Verify candidate causality checks
+        run: pytest -q tests/test_hourly_intraday_backtest.py
+      - name: Select current S&P 500 convenience universe
+        run: python -m cufolio_cpu.universe --output artifacts/current_sp500_universe.csv
+      - name: Derive the data endpoint immediately after the decision minute
+        run: |
+          END_AT="$(date --utc --date="$DECISION_AT + 1 minute" +"%Y-%m-%dT%H:%M:%SZ")"
+          echo "END_AT=$END_AT" >> "$GITHUB_ENV"
+      - name: Download read-only one-minute history through the decision minute
+        run: |
+          test -n "$ALPACA_API_KEY"
+          test -n "$ALPACA_SECRET_KEY"
+          python -m cufolio_cpu.alpaca \
+            --symbols artifacts/current_sp500_universe.csv \
+            --start "$HISTORY_START" \
+            --end "$END_AT" \
+            --output artifacts/one_minute_bars.csv.gz
+      - name: Generate the causal 10:30-to-11:30 research candidate
+        run: |
+          python -m cufolio_cpu.hourly_intraday_backtest \
+            --input artifacts/one_minute_bars.csv.gz \
+            --output-dir artifacts/hourly_1030_candidate \
+            --decision-at "$DECISION_AT" \
+            --top-n "$TOP_N" \
+            --max-weight "$MAX_WEIGHT" \
+            --min-training-scenarios "$MIN_TRAINING_SCENARIOS"
+      - name: Require an exact, causal candidate
+        run: |
+          python -c 'import json; from pathlib import Path; status = json.loads(Path("artifacts/hourly_1030_candidate/hourly_one_hour_candidate_status.json").read_text()); assert status["weights_generated"], status; assert status["training_end"] < status["decision_timestamp"], status'
+      - uses: actions/upload-artifact@v4
+        with:
+          name: july-28-1030-hourly-research-candidate
+          path: |
+            artifacts/current_sp500_universe.csv
+            artifacts/hourly_1030_candidate
+          if-no-files-found: error

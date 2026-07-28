@@ -14,7 +14,12 @@ def load_symbols(path: str | Path) -> list[str]:
     universe = pd.read_csv(path)
     if "symbol" not in universe.columns:
         raise ValueError(f"{path} must contain a 'symbol' column")
-    symbols = universe["symbol"].dropna().astype(str).str.upper().str.strip()
+    # The convenience universe retains both a yfinance-friendly `symbol`
+    # (for example BRK-B) and the exchange/Alpaca `source_symbol` (BRK.B).
+    # Prefer the latter whenever it exists so a full S&P request does not
+    # fail on share-class tickers.
+    symbol_column = "source_symbol" if "source_symbol" in universe.columns else "symbol"
+    symbols = universe[symbol_column].dropna().astype(str).str.upper().str.strip()
     symbols = symbols[symbols.ne("")].drop_duplicates().to_list()
     if not symbols:
         raise ValueError("the requested universe has no symbols")

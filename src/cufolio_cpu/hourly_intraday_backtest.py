@@ -44,6 +44,14 @@ class HourlyBacktestResult:
     status: dict[str, object]
 
 
+@dataclass(frozen=True)
+class HourlyCandidateResult:
+    """A causal, research-only allocation for one selected hourly window."""
+
+    weights: pd.DataFrame
+    status: dict[str, object]
+
+
 def _regular_session_minute_closes(bars: pd.DataFrame) -> pd.DataFrame:
     required = {"timestamp", "symbol", "close"}
     if missing := required.difference(bars.columns):
@@ -203,6 +211,81 @@ def _target_weights(
         }
     )
     return weights, diagnostic
+
+
+def generate_hourly_one_hour_candidate(
+    minute_bars: pd.DataFrame,
+    *,
+    decision_at: str | pd.Timestamp,
+    top_n: int = 20,
+    lookback_scenarios: int = 120,
+    min_training_scenarios: int = 20,
+    max_weight: float = 0.10,
+    risk_aversion: float = 10.0,
+) -> HourlyCandidateResult:
+    """Create a research candidate at an exact hourly decision timestamp.
+
+    Unlike the backtest runner, this function does not require future
+    fifteen-minute execution prices.  It can therefore produce the 10:30
+    candidate after the 10:30 one-minute close is known, while retaining the
+    same strict completed-label rule used by the backtest.
+    """
+    if top_n < 2:
+        raise ValueError("top_n must be at least two")
+    if lookback_scenarios < min_training_scenarios:
+        raise ValueError("lookback_scenarios must be at least min_training_scenarios")
+    if min_training_scenarios < 5:
+        raise ValueError("min_training_scenarios must be at least five")
+    if not 0 < max_weight <= 1:
+        raise ValueError("max_weight must be in (0, 1]")
+
+    decision = pd.Timestamp(decision_at)
+    if decision.tzinfo is None:
+        raise ValueError("decision_at must include a UTC offset")
+    decision = decision.tz_convert("UTC")
+    hourly_returns, target_ends, closes = build_one_hour_return_panel(minute_bars)
+    if decision not in target_ends.index:
+        raise ValueError(
+            "decision_at must be an exact 09:30, 10:30, ..., 14:30 New York selection timestamp "
+            "present in the supplied regular-session data"
+        )
+    weights, diagnostic = _target_weights(
+        hourly_returns,
+        target_ends,
+        closes,
+        decision_at=decision,
+        top_n=top_n,
+        lookback_scenarios=lookback_scenarios,
+        min_training_scenarios=min_training_scenarios,
+        max_weight=max_weight,
+        risk_aversion=risk_aversion,
+    )
+    status: dict[str, object] = {
+        "research_only": True,
+        "bar_interval": "1m",
+        "decision_timestamp": decision.isoformat(),
+        "target_end": target_ends.loc[decision].isoformat(),
+        "target_horizon_minutes": HOLDING_MINUTES,
+        "execution_rebalance_frequency_minutes": REBALANCE_MINUTES,
+        "weights_generated": weights is not None,
+        "causality_rule": "each training target_end is strictly earlier than its decision timestamp",
+        "data_quality_rule": "the decision-minute close and completed target labels must exist; no forward fill or zero-return substitution",
+        **diagnostic,
+    }
+    if weights is None:
+        return HourlyCandidateResult(
+            pd.DataFrame(columns=["decision_timestamp", "target_end", "symbol", "target_weight"]),
+            status,
+        )
+    candidate = pd.DataFrame(
+        {
+            "decision_timestamp": decision,
+            "target_end": target_ends.loc[decision],
+            "symbol": weights.index,
+            "target_weight": weights.to_numpy(dtype=float),
+        }
+    )
+    return HourlyCandidateResult(candidate, status)
 
 
 def run_hourly_one_hour_backtest(
@@ -372,9 +455,35 @@ def main() -> None:
     parser.add_argument("--max-weight", type=float, default=0.10)
     parser.add_argument("--risk-aversion", type=float, default=10.0)
     parser.add_argument("--transaction-cost-bps", type=float, default=5.0)
+    parser.add_argument(
+        "--decision-at",
+        help="UTC-offset timestamp for a causal candidate-only output (for example 2026-07-28T14:30:00Z)",
+    )
     args = parser.parse_args()
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    bars = pd.read_csv(args.input)
+    if args.decision_at:
+        candidate = generate_hourly_one_hour_candidate(
+            bars,
+            decision_at=args.decision_at,
+            top_n=args.top_n,
+            lookback_scenarios=args.lookback_scenarios,
+            min_training_scenarios=args.min_training_scenarios,
+            max_weight=args.max_weight,
+            risk_aversion=args.risk_aversion,
+        )
+        candidate.weights.to_csv(output_dir / "hourly_one_hour_candidate.csv", index=False)
+        (output_dir / "hourly_one_hour_candidate_status.json").write_text(
+            json.dumps(candidate.status, indent=2, default=str) + "\n", encoding="utf-8"
+        )
+        print(
+            f"Wrote {len(candidate.weights)} candidate weights for "
+            f"{candidate.status['decision_timestamp']}"
+        )
+        return
     result = run_hourly_one_hour_backtest(
-        pd.read_csv(args.input),
+        bars,
         top_n=args.top_n,
         lookback_scenarios=args.lookback_scenarios,
         min_training_scenarios=args.min_training_scenarios,
@@ -382,8 +491,6 @@ def main() -> None:
         risk_aversion=args.risk_aversion,
         transaction_cost_bps=args.transaction_cost_bps,
     )
-    output_dir = Path(args.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
     result.performance.to_csv(output_dir / "quarter_hour_rebalances.csv", index=False)
     result.selections.to_csv(output_dir / "hourly_one_hour_portfolios.csv", index=False)
     (output_dir / "hourly_one_hour_backtest_status.json").write_text(
