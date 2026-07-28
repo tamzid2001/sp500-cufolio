@@ -1,17 +1,22 @@
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, timedelta
 
 import pandas as pd
 import pytest
 
 from cufolio_cpu.five_minute_paper_daemon import rolling_history_start
 from cufolio_cpu.five_minute_paper_session import (
+    _forecast_horizon_for_decision,
+    _handoff_must_wait_for_flatten,
+    _load_checkpoint,
+    _merge_current_minutes,
     _completed_bar_at,
     _regular_minute_cache_projection,
     five_minute_events,
     run_five_minute_paper_session,
 )
+from cufolio_cpu.hourly_paper_session import MinuteCacheHealth
 
 
 def test_five_minute_schedule_has_one_order_boundary_per_horizon_and_no_rebalance_events() -> None:
@@ -23,7 +28,12 @@ def test_five_minute_schedule_has_one_order_boundary_per_horizon_and_no_rebalanc
     assert [kind for kind, _ in events].count("forecast_and_order") == 77
     assert "rebalance" not in {kind for kind, _ in events}
     assert events[-1][0] == "flatten"
-    assert events[-1][1].tz_convert("America/New_York").strftime("%H:%M") == "16:00"
+    assert events[-1][1].tz_convert("America/New_York").strftime("%H:%M") == "15:59"
+    assert _forecast_horizon_for_decision(targets[0], date(2026, 7, 28)) == 5
+    assert _forecast_horizon_for_decision(targets[-1], date(2026, 7, 28)) == 4
+    assert targets[-1] + timedelta(minutes=4) == events[-1][1]
+    assert _handoff_must_wait_for_flatten("flatten", events[-1][1], events[-1][1] - timedelta(minutes=1))
+    assert not _handoff_must_wait_for_flatten("forecast_and_order", targets[-1], targets[-1] - timedelta(minutes=1))
 
 
 def test_five_minute_cache_keeps_full_minutes_for_recent_sessions() -> None:
@@ -57,8 +67,57 @@ def test_five_minute_session_rejects_live_mode_without_explicit_acknowledgement(
         )
 
 
+def test_new_session_discards_old_completed_events_but_not_the_separate_minute_cache(tmp_path) -> None:
+    checkpoint = tmp_path / "state.json"
+    checkpoint.write_text(
+        '{"format_version": 1, "session_date": "2026-07-28", '
+        '"completed_events": ["forecast_and_order:old"], "ledger": [{"event": "old"}]}',
+        encoding="utf-8",
+    )
+
+    fresh = _load_checkpoint(checkpoint, date(2026, 7, 29))
+
+    assert fresh == {
+        "format_version": 1,
+        "session_date": "2026-07-29",
+        "completed_events": [],
+        "ledger": [],
+    }
+
+
 def test_five_minute_rolling_history_start_has_model_warmup() -> None:
     reference = pd.Timestamp("2026-07-28T13:35:00Z")
     assert rolling_history_start(reference, calendar_days=28) == "2026-06-30T13:30:00+00:00"
     with pytest.raises(ValueError, match="at least 28"):
         rolling_history_start(reference, calendar_days=27)
+
+
+def test_websocket_precompute_does_not_issue_redundant_rest_repair(monkeypatch) -> None:
+    class Stream:
+        available = True
+
+        def completed_bars_through(self, _completed):
+            return pd.DataFrame(
+                {"timestamp": ["2026-07-28T14:33:00Z"], "symbol": ["AAA"], "close": [101.0]}
+            )
+
+    def unexpected_rest(*_args, **_kwargs):
+        raise AssertionError("websocket-backed precompute should not perform an IEX REST repair")
+
+    monkeypatch.setattr("cufolio_cpu.five_minute_paper_session.download_minute_bars", unexpected_rest)
+    update = _merge_current_minutes(
+        pd.DataFrame(
+            {"timestamp": ["2026-07-28T14:32:00Z"], "symbol": ["AAA"], "close": [100.0]}
+        ),
+        ["AAA"],
+        session_day=date(2026, 7, 28),
+        observed_at=pd.Timestamp("2026-07-28T14:34:00Z"),
+        cache_path=None,
+        minute_stream=Stream(),
+        health=MinuteCacheHealth(),
+        repair_from_rest=False,
+        persist=False,
+    )
+
+    assert list(update.new_rows["timestamp"]) == [pd.Timestamp("2026-07-28T14:33:00Z")]
+    assert list(update.bars["close"]) == [100.0, 101.0]

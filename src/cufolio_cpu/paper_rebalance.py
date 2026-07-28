@@ -174,6 +174,16 @@ class AlpacaTradingClient:
     def close_position(self, symbol: str) -> dict[str, Any]:
         return self._request("DELETE", f"/positions/{symbol}")
 
+    def close_all_positions(self, *, cancel_orders: bool) -> list[dict[str, Any]]:
+        """Liquidate the account, optionally cancelling all open orders first."""
+        response = self._request(
+            "DELETE",
+            f"/positions?{urlencode({'cancel_orders': str(cancel_orders).lower()})}",
+        )
+        if not isinstance(response, list):
+            raise TradingError("Alpaca close-all-positions response was not a list")
+        return response
+
 
 class PaperAlpacaClient(AlpacaTradingClient):
     """Compatibility wrapper permanently selecting the paper endpoint."""
@@ -439,7 +449,7 @@ def run_rebalance(
 def run_end_of_day_flatten(
     client: AlpacaTradingClient, *, execute: bool = False
 ) -> dict[str, Any]:
-    """Close every long equity position in a dedicated daily-strategy account."""
+    """Close the account and cancel any open orders at the session boundary."""
     account = client.get_account()
     if account.get("account_blocked") or account.get("trading_blocked"):
         raise TradingError(f"{client.mode} account is blocked from trading")
@@ -456,17 +466,16 @@ def run_end_of_day_flatten(
         report["status"] = "market_closed"
         return report
     outstanding = client.get_open_orders()
-    if outstanding:
+    if outstanding and not execute:
         report["status"] = "waiting_for_open_orders_before_flatten"
         report["open_order_ids"] = [order.get("id") for order in outstanding]
         return report
+    report["open_order_ids"] = [order.get("id") for order in outstanding]
     positions = client.get_positions()
     for position in positions:
         symbol = str(position.get("symbol", "")).upper()
         if not symbol:
             continue
-        if str(position.get("side", "long")).lower() != "long":
-            raise TradingError(f"{symbol} is a short position; refusing a long-only flatten")
         report["orders"].append(
             {
                 "symbol": symbol,
@@ -474,19 +483,14 @@ def run_end_of_day_flatten(
                 "qty": _as_number(_decimal(position.get("qty", "0"), field=f"{symbol} quantity"), SHARE_INCREMENT),
             }
         )
-    if not report["orders"]:
+    if not report["orders"] and not outstanding:
         report["status"] = "already_flat"
         return report
     if not execute:
         report["status"] = "end_of_day_flatten_planned"
         return report
-    report["submitted_orders"] = [
-        {
-            "symbol": order["symbol"],
-            "id": client.close_position(order["symbol"]).get("id"),
-        }
-        for order in report["orders"]
-    ]
+    report["submitted_orders"] = client.close_all_positions(cancel_orders=True)
+    report["cancelled_open_orders_before_flatten"] = bool(outstanding)
     report["status"] = "end_of_day_flatten_submitted"
     return report
 

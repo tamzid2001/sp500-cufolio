@@ -50,6 +50,16 @@ class IntradayForecastCandidate:
     status: dict[str, object]
 
 
+@dataclass(frozen=True)
+class _PreparedIntradayTraining:
+    """The data-only portion of one real-time decision, built before its bar closes."""
+
+    decision_at: pd.Timestamp
+    prepared_at: pd.Timestamp
+    training: pd.DataFrame
+    training_ends: pd.Series
+
+
 def _regular_session_minute_closes(bars: pd.DataFrame) -> pd.DataFrame:
     required = {"timestamp", "symbol", "close"}
     if missing := required.difference(bars.columns):
@@ -86,6 +96,16 @@ def _decision_grid(session_day: date, *, interval_minutes: int) -> pd.DatetimeIn
     return pd.date_range(start, final_decision, freq=f"{interval_minutes}min")
 
 
+def _resolve_forecast_horizon_minutes(
+    interval_minutes: int, forecast_horizon_minutes: int | None
+) -> int:
+    """Allow a causal horizon no longer than the decision cadence."""
+    horizon = interval_minutes if forecast_horizon_minutes is None else forecast_horizon_minutes
+    if not 1 <= horizon <= interval_minutes:
+        raise ValueError("forecast_horizon_minutes must be between one and interval_minutes")
+    return horizon
+
+
 def _close_timestamp_known_at(boundary: pd.Timestamp) -> pd.Timestamp:
     """Return the left-labeled bar whose close is known at ``boundary``."""
     return boundary - MINUTE_BAR_WIDTH
@@ -97,14 +117,19 @@ def _as_utc_timestamp(value: object) -> pd.Timestamp:
 
 
 def _non_overlapping_label_panel(
-    closes: pd.DataFrame, session_days: list[date], *, interval_minutes: int
+    closes: pd.DataFrame,
+    session_days: list[date],
+    *,
+    interval_minutes: int,
+    forecast_horizon_minutes: int | None = None,
 ) -> tuple[pd.DataFrame, pd.Series]:
     """Return non-overlapping intraday log-return labels and their ends."""
+    horizon = _resolve_forecast_horizon_minutes(interval_minutes, forecast_horizon_minutes)
     rows: list[pd.Series] = []
     ends: dict[pd.Timestamp, pd.Timestamp] = {}
     for session_day in session_days:
         for decision_at in _decision_grid(session_day, interval_minutes=interval_minutes):
-            target_end = decision_at + timedelta(minutes=interval_minutes)
+            target_end = decision_at + timedelta(minutes=horizon)
             start_prices = closes.reindex([_close_timestamp_known_at(decision_at)]).iloc[0]
             end_prices = closes.reindex([_close_timestamp_known_at(target_end)]).iloc[0]
             row = np.log(end_prices / start_prices)
@@ -179,6 +204,39 @@ def _select_portfolio(
     """Select one causal five-minute portfolio and disclose all quality gates."""
     training = labels.loc[target_ends.reindex(labels.index) < decision_at].tail(lookback_observations)
     training_ends = target_ends.reindex(training.index)
+    return _select_portfolio_from_training(
+        training,
+        training_ends,
+        closes,
+        decision_at=decision_at,
+        top_n=top_n,
+        max_weight=max_weight,
+        risk_aversion=risk_aversion,
+        min_training_sessions=min_training_sessions,
+        min_covariance_scenarios=min_covariance_scenarios,
+        seasonality_prior_observations=seasonality_prior_observations,
+    )
+
+
+def _select_portfolio_from_training(
+    training: pd.DataFrame,
+    training_ends: pd.Series,
+    closes: pd.DataFrame,
+    *,
+    decision_at: pd.Timestamp,
+    top_n: int,
+    max_weight: float,
+    risk_aversion: float,
+    min_training_sessions: int,
+    min_covariance_scenarios: int,
+    seasonality_prior_observations: int,
+) -> tuple[pd.Series | None, pd.Series | None, dict[str, object]]:
+    """Select from a previously prepared causal training matrix.
+
+    The live engine prepares ``training`` one minute before the decision. The
+    final current-price eligibility check remains here because a left-labelled
+    decision-minute bar has not closed until the exact decision boundary.
+    """
     # A left-labelled 09:35 bar completes at 09:36, so a 09:35 decision can
     # only use the prior bar's close.  This must match the realized start
     # endpoint and the live runner's completed-minute cache.
@@ -257,11 +315,206 @@ def _select_portfolio(
     return weights, expected.reindex(weights.index), diagnostic
 
 
+def _candidate_from_selection(
+    weights: pd.Series | None,
+    expected_by_asset: pd.Series | None,
+    diagnostic: dict[str, object],
+    *,
+    decision: pd.Timestamp,
+    interval_minutes: int,
+    forecast_horizon_minutes: int | None = None,
+    prepared_at: pd.Timestamp | None = None,
+) -> IntradayForecastCandidate:
+    horizon = _resolve_forecast_horizon_minutes(interval_minutes, forecast_horizon_minutes)
+    status: dict[str, object] = {
+        **diagnostic,
+        "weights_generated": weights is not None and expected_by_asset is not None,
+        "decision_timestamp": decision.isoformat(),
+        "decision_price_timestamp": _close_timestamp_known_at(decision).isoformat(),
+        "target_end": (decision + timedelta(minutes=horizon)).isoformat(),
+        "forecast_interval_minutes": interval_minutes,
+        "forecast_horizon_minutes": horizon,
+        "causality_rule": (
+            "training target_end is strictly earlier than the decision and the decision price is "
+            "the preceding completed one-minute close"
+        ),
+    }
+    if prepared_at is not None:
+        status["training_prepared_at"] = prepared_at.isoformat()
+    if weights is None or expected_by_asset is None:
+        return IntradayForecastCandidate(
+            pd.DataFrame(columns=["symbol", "target_weight", "predicted_asset_log_return"]),
+            status,
+        )
+    candidates = pd.DataFrame(
+        {
+            "symbol": weights.index,
+            "target_weight": weights.to_numpy(dtype=float),
+            "predicted_asset_log_return": expected_by_asset.reindex(weights.index).to_numpy(dtype=float),
+        }
+    )
+    return IntradayForecastCandidate(candidates, status)
+
+
+class RealtimeIntradayForecastEngine:
+    """Incremental causal candidate generator with a fixed cadence and horizon.
+
+    Expensive regular-session cleaning, pivoting, and historical labels are
+    constructed exactly once per handoff slice. ``update_minute_bars`` only
+    writes new completed bars into that panel and refreshes the affected
+    session's 77 label rows. The engine never uses a decision's in-progress
+    minute bar; callers provide it only after it has completed.
+    """
+
+    def __init__(
+        self,
+        minute_bars: pd.DataFrame,
+        *,
+        interval_minutes: int = FORECAST_INTERVAL_MINUTES,
+        forecast_horizon_minutes: int | None = None,
+        top_n: int = 20,
+        max_weight: float = 0.10,
+        risk_aversion: float = 10.0,
+        lookback_observations: int = 780,
+        min_training_sessions: int = 10,
+        min_covariance_scenarios: int = 500,
+        seasonality_prior_observations: int = 20,
+    ) -> None:
+        _validate_intraday_backtest_parameters(
+            interval_minutes=interval_minutes,
+            top_n=top_n,
+            max_weight=max_weight,
+            lookback_observations=lookback_observations,
+            min_training_sessions=min_training_sessions,
+            min_covariance_scenarios=min_covariance_scenarios,
+            seasonality_prior_observations=seasonality_prior_observations,
+        )
+        clean = _regular_session_minute_closes(minute_bars)
+        self._interval_minutes = interval_minutes
+        self._forecast_horizon_minutes = _resolve_forecast_horizon_minutes(
+            interval_minutes, forecast_horizon_minutes
+        )
+        self._top_n = top_n
+        self._max_weight = max_weight
+        self._risk_aversion = risk_aversion
+        self._lookback_observations = lookback_observations
+        self._min_training_sessions = min_training_sessions
+        self._min_covariance_scenarios = min_covariance_scenarios
+        self._seasonality_prior_observations = seasonality_prior_observations
+        self._closes = clean.pivot(index="timestamp", columns="symbol", values="close").sort_index()
+        self._available_days = sorted(set(clean["session_date"]))
+        self._labels, self._target_ends = _non_overlapping_label_panel(
+            self._closes,
+            self._available_days,
+            interval_minutes=self._interval_minutes,
+            forecast_horizon_minutes=self._forecast_horizon_minutes,
+        )
+        self._prepared: dict[pd.Timestamp, _PreparedIntradayTraining] = {}
+
+    @property
+    def interval_minutes(self) -> int:
+        return self._interval_minutes
+
+    @property
+    def forecast_horizon_minutes(self) -> int:
+        return self._forecast_horizon_minutes
+
+    def _validate_decision(self, decision: pd.Timestamp) -> date:
+        session_day = decision.tz_convert(NEW_YORK).date()
+        if session_day not in self._available_days:
+            raise ValueError("decision_at session is not present in the supplied regular-session bars")
+        if decision not in _decision_grid(session_day, interval_minutes=self._interval_minutes):
+            raise ValueError(
+                f"decision_at must be one of the causal {self._interval_minutes}-minute session boundaries"
+            )
+        return session_day
+
+    def _refresh_session_labels(self, session_day: date) -> None:
+        decisions = _decision_grid(session_day, interval_minutes=self._interval_minutes)
+        starts = self._closes.reindex(index=decisions - MINUTE_BAR_WIDTH)
+        ends = self._closes.reindex(
+            index=decisions + timedelta(minutes=self._forecast_horizon_minutes) - MINUTE_BAR_WIDTH
+        )
+        refreshed = np.log(ends.to_numpy(dtype=float) / starts.to_numpy(dtype=float))
+        rows = pd.DataFrame(refreshed, index=decisions, columns=self._closes.columns)
+        rows.index.name = "decision_timestamp"
+        keep = self._labels.index.tz_convert(NEW_YORK).date != session_day
+        self._labels = pd.concat([self._labels.loc[keep], rows]).sort_index()
+        ends_by_decision = pd.Series(
+            decisions + timedelta(minutes=self._forecast_horizon_minutes), index=decisions, name="target_end"
+        )
+        self._target_ends = pd.concat([self._target_ends.loc[keep], ends_by_decision]).sort_index()
+
+    def update_minute_bars(self, minute_bars: pd.DataFrame) -> None:
+        """Incorporate completed bars without rebuilding the historical panel."""
+        if minute_bars.empty:
+            return
+        incoming = _regular_session_minute_closes(minute_bars)
+        incoming_days = sorted(set(incoming["session_date"]))
+        incoming_closes = incoming.pivot(index="timestamp", columns="symbol", values="close")
+        self._closes = self._closes.reindex(
+            index=self._closes.index.union(incoming_closes.index).sort_values(),
+            columns=self._closes.columns.union(incoming_closes.columns).sort_values(),
+        )
+        self._closes.update(incoming_closes)
+        self._available_days = sorted(set(self._available_days).union(incoming_days))
+        for session_day in incoming_days:
+            self._refresh_session_labels(session_day)
+
+    def prepare_for_decision(self, decision_at: str | pd.Timestamp, *, prepared_at: str | pd.Timestamp | None = None) -> None:
+        """Precompute immutable training inputs before the decision's final bar is known."""
+        decision = _as_utc_timestamp(decision_at)
+        self._validate_decision(decision)
+        training = self._labels.loc[
+            self._target_ends.reindex(self._labels.index) < decision
+        ].tail(self._lookback_observations).copy()
+        training_ends = self._target_ends.reindex(training.index).copy()
+        timestamp = _as_utc_timestamp(prepared_at) if prepared_at is not None else decision
+        self._prepared[decision] = _PreparedIntradayTraining(decision, timestamp, training, training_ends)
+        # Preparing more than one old decision is never useful in the live
+        # session and can retain large copies across a handoff.
+        self._prepared = {key: value for key, value in self._prepared.items() if key >= decision}
+
+    def generate_candidate(self, decision_at: str | pd.Timestamp) -> IntradayForecastCandidate:
+        """Finalize one prepared forecast using the now-completed decision price."""
+        decision = _as_utc_timestamp(decision_at)
+        self._validate_decision(decision)
+        prepared = self._prepared.get(decision)
+        if prepared is None:
+            self.prepare_for_decision(decision)
+            prepared = self._prepared[decision]
+            prepared_at: pd.Timestamp | None = None
+        else:
+            prepared_at = prepared.prepared_at
+        weights, expected_by_asset, diagnostic = _select_portfolio_from_training(
+            prepared.training,
+            prepared.training_ends,
+            self._closes,
+            decision_at=decision,
+            top_n=self._top_n,
+            max_weight=self._max_weight,
+            risk_aversion=self._risk_aversion,
+            min_training_sessions=self._min_training_sessions,
+            min_covariance_scenarios=self._min_covariance_scenarios,
+            seasonality_prior_observations=self._seasonality_prior_observations,
+        )
+        return _candidate_from_selection(
+            weights,
+            expected_by_asset,
+            diagnostic,
+            decision=decision,
+            interval_minutes=self._interval_minutes,
+            forecast_horizon_minutes=self._forecast_horizon_minutes,
+            prepared_at=prepared_at,
+        )
+
+
 def generate_intraday_forecast_candidate(
     minute_bars: pd.DataFrame,
     *,
     decision_at: str | pd.Timestamp,
     interval_minutes: int = FORECAST_INTERVAL_MINUTES,
+    forecast_horizon_minutes: int | None = None,
     top_n: int = 20,
     max_weight: float = 0.10,
     risk_aversion: float = 10.0,
@@ -278,28 +531,10 @@ def generate_intraday_forecast_candidate(
     The supplied frame may include later rows (as it does in a historical
     test); they cannot influence this candidate.
     """
-    if interval_minutes not in {5, 15}:
-        raise ValueError("interval_minutes must be 5 or 15")
-    decision = _as_utc_timestamp(decision_at)
-    clean = _regular_session_minute_closes(minute_bars)
-    closes = clean.pivot(index="timestamp", columns="symbol", values="close").sort_index()
-    session_day = decision.tz_convert(NEW_YORK).date()
-    if session_day not in set(clean["session_date"]):
-        raise ValueError("decision_at session is not present in the supplied regular-session bars")
-    valid_decisions = _decision_grid(session_day, interval_minutes=interval_minutes)
-    if decision not in valid_decisions:
-        raise ValueError(
-            f"decision_at must be one of the causal {interval_minutes}-minute session boundaries"
-        )
-    available_days = sorted(set(clean["session_date"]))
-    labels, target_ends = _non_overlapping_label_panel(
-        closes, available_days, interval_minutes=interval_minutes,
-    )
-    weights, expected_by_asset, diagnostic = _select_portfolio(
-        labels,
-        target_ends,
-        closes,
-        decision_at=decision,
+    engine = RealtimeIntradayForecastEngine(
+        minute_bars,
+        interval_minutes=interval_minutes,
+        forecast_horizon_minutes=forecast_horizon_minutes,
         top_n=top_n,
         max_weight=max_weight,
         risk_aversion=risk_aversion,
@@ -308,32 +543,7 @@ def generate_intraday_forecast_candidate(
         min_covariance_scenarios=min_covariance_scenarios,
         seasonality_prior_observations=seasonality_prior_observations,
     )
-    status: dict[str, object] = {
-        **diagnostic,
-        "weights_generated": weights is not None and expected_by_asset is not None,
-        "decision_timestamp": decision.isoformat(),
-        "decision_price_timestamp": _close_timestamp_known_at(decision).isoformat(),
-        "target_end": (decision + timedelta(minutes=interval_minutes)).isoformat(),
-        "forecast_interval_minutes": interval_minutes,
-        "forecast_horizon_minutes": interval_minutes,
-        "causality_rule": (
-            "training target_end is strictly earlier than the decision and the decision price is "
-            "the preceding completed one-minute close"
-        ),
-    }
-    if weights is None or expected_by_asset is None:
-        return IntradayForecastCandidate(
-            pd.DataFrame(columns=["symbol", "target_weight", "predicted_asset_log_return"]),
-            status,
-        )
-    candidates = pd.DataFrame(
-        {
-            "symbol": weights.index,
-            "target_weight": weights.to_numpy(dtype=float),
-            "predicted_asset_log_return": expected_by_asset.reindex(weights.index).to_numpy(dtype=float),
-        }
-    )
-    return IntradayForecastCandidate(candidates, status)
+    return engine.generate_candidate(decision_at)
 
 
 def _empty_holdings() -> pd.DataFrame:

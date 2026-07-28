@@ -8,6 +8,7 @@ import pandas as pd
 from cufolio_cpu.fifteen_minute_intraday_backtest import run_fifteen_minute_forecast_backtest
 from cufolio_cpu.five_minute_intraday_backtest import (
     NEW_YORK,
+    RealtimeIntradayForecastEngine,
     generate_intraday_forecast_candidate,
     _render_markdown_report,
     reconcile_intraday_forecast_outcomes,
@@ -132,6 +133,102 @@ def test_five_minute_candidate_uses_the_prior_completed_decision_bar() -> None:
     assert causal.status["weights_generated"]
     assert baseline.status["decision_price_timestamp"] == "2026-01-19T14:34:00+00:00"
     pd.testing.assert_frame_equal(baseline.weights, causal.weights)
+
+
+def test_realtime_engine_prepares_training_before_the_final_decision_bar_and_matches_full_rebuild() -> None:
+    bars = _minute_bars()
+    decision = pd.Timestamp("2026-01-19T14:35:00Z")
+    # At 09:34:00 the 09:33 bar is the latest completed minute. The model's
+    # training labels are already fixed, but the 09:34 close needed for the
+    # final current-price eligibility screen is not available yet.
+    timestamps = pd.to_datetime(bars["timestamp"], utc=True)
+    before_final_bar = bars.loc[
+        timestamps.lt(pd.Timestamp("2026-01-19T14:34:00Z")) | timestamps.dt.date.ne(decision.date())
+    ].copy()
+    final_bar = bars.loc[timestamps.eq(pd.Timestamp("2026-01-19T14:34:00Z"))].copy()
+    engine = RealtimeIntradayForecastEngine(
+        before_final_bar,
+        top_n=3,
+        max_weight=0.50,
+        lookback_observations=780,
+        min_training_sessions=10,
+        min_covariance_scenarios=500,
+    )
+    engine.prepare_for_decision(decision, prepared_at="2026-01-19T14:34:00Z")
+    engine.update_minute_bars(final_bar)
+    prepared_candidate = engine.generate_candidate(decision)
+    full_rebuild = generate_intraday_forecast_candidate(
+        bars,
+        decision_at=decision,
+        top_n=3,
+        max_weight=0.50,
+        lookback_observations=780,
+        min_training_sessions=10,
+        min_covariance_scenarios=500,
+    )
+
+    assert prepared_candidate.status["training_prepared_at"] == "2026-01-19T14:34:00+00:00"
+    assert prepared_candidate.status["decision_price_timestamp"] == "2026-01-19T14:34:00+00:00"
+    pd.testing.assert_frame_equal(prepared_candidate.weights, full_rebuild.weights)
+    assert prepared_candidate.status["expected_portfolio_log_return"] == full_rebuild.status[
+        "expected_portfolio_log_return"
+    ]
+
+
+def test_closing_four_minute_engine_uses_four_minute_labels_and_ends_at_1559() -> None:
+    bars = _minute_bars()
+    decision = pd.Timestamp("2026-01-19T20:55:00Z")  # 15:55 New York
+    timestamps = pd.to_datetime(bars["timestamp"], utc=True)
+    # At 15:54 the 15:53 bar is complete.  Its 15:50 -> 15:54 training
+    # return is known, while the 15:54 decision-price bar is not yet usable.
+    before_final_bar = bars.loc[
+        timestamps.lt(pd.Timestamp("2026-01-19T20:54:00Z")) | timestamps.dt.date.ne(decision.date())
+    ].copy()
+    final_bar = bars.loc[timestamps.eq(pd.Timestamp("2026-01-19T20:54:00Z"))].copy()
+    options = {
+        "interval_minutes": 5,
+        "forecast_horizon_minutes": 4,
+        "top_n": 3,
+        "max_weight": 0.50,
+        "lookback_observations": 780,
+        "min_training_sessions": 10,
+        "min_covariance_scenarios": 500,
+    }
+    engine = RealtimeIntradayForecastEngine(before_final_bar, **options)
+    engine.prepare_for_decision(decision, prepared_at="2026-01-19T20:54:00Z")
+    engine.update_minute_bars(final_bar)
+    prepared = engine.generate_candidate(decision)
+    full = generate_intraday_forecast_candidate(bars, decision_at=decision, **options)
+
+    assert prepared.status["forecast_interval_minutes"] == 5
+    assert prepared.status["forecast_horizon_minutes"] == 4
+    assert prepared.status["target_end"] == "2026-01-19T20:59:00+00:00"
+    assert prepared.status["training_prepared_at"] == "2026-01-19T20:54:00+00:00"
+    pd.testing.assert_frame_equal(prepared.weights, full.weights)
+    assert prepared.status["expected_portfolio_log_return"] == full.status[
+        "expected_portfolio_log_return"
+    ]
+
+
+def test_trailing_sixteen_session_cache_preserves_the_780_label_target() -> None:
+    bars = _minute_bars(sessions=20)
+    final_day = pd.to_datetime(bars["timestamp"], utc=True).dt.tz_convert(NEW_YORK).dt.date.max()
+    decision = pd.Timestamp.combine(final_day, pd.Timestamp("09:35").time()).tz_localize(NEW_YORK).tz_convert("UTC")
+    local_days = pd.to_datetime(bars["timestamp"], utc=True).dt.tz_convert(NEW_YORK).dt.date
+    retained_days = sorted(local_days.unique())[-16:]
+    compact = bars.loc[local_days.isin(retained_days)].copy()
+    options = {
+        "top_n": 3,
+        "max_weight": 0.50,
+        "lookback_observations": 780,
+        "min_training_sessions": 10,
+        "min_covariance_scenarios": 500,
+    }
+    full = RealtimeIntradayForecastEngine(bars, **options).generate_candidate(decision)
+    cached = RealtimeIntradayForecastEngine(compact, **options).generate_candidate(decision)
+
+    pd.testing.assert_frame_equal(full.weights, cached.weights)
+    assert full.status["expected_portfolio_log_return"] == cached.status["expected_portfolio_log_return"]
 
 
 def test_multi_session_five_minute_audit_keeps_each_session_and_causal_boundaries() -> None:
