@@ -47,6 +47,18 @@ jobs:
           restore-keys: |
             hourly-paper-minute-endpoints-
 
+      - name: Report paper-runner handoff configuration
+        env:
+          CACHE_HIT: ${{ steps.minute_cache_restore.outputs.cache-hit }}
+        run: |
+          cache_status=miss
+          if test "$CACHE_HIT" = "true"; then
+            cache_status=exact-hit
+          elif test -f var/hourly_paper_24x7_minute_endpoints.csv.gz; then
+            cache_status=rolling-hit
+          fi
+          echo "HOURLY PAPER HANDOFF STARTED | run=${GITHUB_RUN_ID} sha=${GITHUB_SHA} mode=paper slice=${RUN_SECONDS}s cache=${cache_status}"
+
       - name: Install hourly paper-runner dependencies
         run: pip install -r requirements.txt
 
@@ -73,11 +85,13 @@ jobs:
           set -euo pipefail
           test ! -f var/hourly_paper_24x7_state.json || git add -f var/hourly_paper_24x7_state.json
           if git diff --cached --quiet; then
+            echo "HOURLY PAPER STATE UNCHANGED | no handoff checkpoint commit required."
             exit 0
           fi
           git config user.name "cufolio hourly paper runner"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git commit -m "chore: checkpoint hourly paper session [skip ci]"
+          echo "HOURLY PAPER STATE COMMITTED | checkpoint changes are being published to main."
           for attempt in 1 2 3; do
             if git pull --rebase --autostash origin main && git push origin HEAD:main; then
               exit 0
@@ -94,8 +108,10 @@ jobs:
         run: |
           if test -f var/hourly_paper_24x7_minute_endpoints.csv.gz; then
             echo "save=true" >> "$GITHUB_OUTPUT"
+            echo "HOURLY PAPER CACHE HANDOFF READY | bytes=$(wc -c < var/hourly_paper_24x7_minute_endpoints.csv.gz)"
           else
             echo "save=false" >> "$GITHUB_OUTPUT"
+            echo "HOURLY PAPER CACHE HANDOFF EMPTY | no cache was created in this slice."
           fi
 
       - name: Save rolling minute-endpoint cache

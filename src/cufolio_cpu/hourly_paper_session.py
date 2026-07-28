@@ -40,6 +40,7 @@ TARGET_FORECAST_LEADS = (
     (14, FINAL_TARGET_REFRESH_LEAD),
 )
 MAX_START_LAG = timedelta(minutes=10)
+WAIT_HEARTBEAT_INTERVAL = timedelta(minutes=5)
 # A 120-scenario fit needs about 20 full sessions (six one-hour outcomes per
 # session). Keep a buffer for holidays, sparse symbols, and the strict
 # complete-case covariance step without retaining every one-minute row.
@@ -98,6 +99,29 @@ def _utc_timestamp(value: datetime | pd.Timestamp | None = None) -> pd.Timestamp
     if timestamp.tzinfo is None:
         raise ValueError("timestamps must include a UTC offset")
     return timestamp.tz_convert("UTC")
+
+
+def _cache_summary(bars: pd.DataFrame | None) -> str:
+    if bars is None or bars.empty:
+        return "rows=0 latest=none"
+    latest = pd.to_datetime(bars["timestamp"], utc=True).max().isoformat()
+    return f"rows={len(bars):,} symbols={bars['symbol'].nunique()} latest={latest}"
+
+
+def _execution_summary(report: dict[str, object]) -> str:
+    """Return a compact, secret-free paper-order status line."""
+    planned = len(report.get("orders", [])) if isinstance(report.get("orders"), list) else 0
+    submitted = len(report.get("submitted_orders", [])) if isinstance(report.get("submitted_orders"), list) else 0
+    details = [
+        f"status={report.get('status', 'unknown')}",
+        f"market_open={report.get('market_open', 'unknown')}",
+        f"planned={planned}",
+        f"submitted={submitted}",
+    ]
+    for field in ("equity", "cash"):
+        if field in report:
+            details.append(f"{field}=${report[field]}")
+    return " ".join(details)
 
 
 def _history_through(
@@ -170,9 +194,12 @@ def _minute_cache_projection(bars: pd.DataFrame) -> pd.DataFrame:
 
 def _read_minute_cache(path: Path) -> pd.DataFrame:
     if not path.exists():
+        print(f"MINUTE CACHE MISS | path={path}", flush=True)
         return pd.DataFrame(columns=["timestamp", "symbol", "close"])
     try:
-        return _minute_cache_projection(pd.read_csv(path, compression="gzip"))
+        restored = _minute_cache_projection(pd.read_csv(path, compression="gzip"))
+        print(f"MINUTE CACHE RESTORED | path={path} {_cache_summary(restored)}", flush=True)
+        return restored
     except (EOFError, OSError, UnicodeDecodeError, ValueError, pd.errors.EmptyDataError, pd.errors.ParserError) as error:
         # A cache is an optimization only. A malformed or partial cache must
         # never become model input; the next selection will refetch safely.
@@ -321,6 +348,13 @@ def run_hourly_paper_session(
         if isinstance(details, dict)
     }
     ledger: list[dict[str, object]] = [dict(item) for item in checkpoint["ledger"] if isinstance(item, dict)]
+    print(
+        "HOURLY PAPER SESSION STARTED | "
+        f"mode={client.mode} session={session_day.isoformat()} symbols={len(symbols)} "
+        f"resume={resume} completed_events={len(completed_events)} checkpoint={checkpoint_file or 'none'} "
+        f"cache={minute_cache_file or 'none'} {_cache_summary(bars)}",
+        flush=True,
+    )
 
     def persist() -> None:
         _persist_checkpoint(
@@ -344,6 +378,11 @@ def run_hourly_paper_session(
             "reason": reason,
         })
         persist()
+        print(
+            "HOURLY PAPER EVENT SKIPPED | "
+            f"kind={event.kind} scheduled={event.due_at.isoformat()} observed={observed_at.isoformat()} reason={reason}",
+            flush=True,
+        )
     # The full S&P one-minute history is the expensive operation.  Start it
     # before the first 09:20 forecast, then fetch only the new minutes at each
     # later forecast.  This keeps the 10:30 paper entry timely without looking
@@ -360,12 +399,23 @@ def run_hourly_paper_session(
         # The first ever run must build the trailing history.  Later 5h45m
         # handoffs restore the compact cache and deliberately do no overnight
         # re-download before the 09:20 selection minute is available.
+        print(
+            "HOURLY HISTORY BOOTSTRAP STARTED | "
+            f"start={history_start} through={prefetch_now.isoformat()} symbols={len(symbols)}",
+            flush=True,
+        )
+        bootstrap_started = time.monotonic()
         bars = _history_through(
             bars,
             symbols,
             start=history_start,
             decision_at=prefetch_now,
             cache_path=minute_cache_file,
+        )
+        print(
+            "HOURLY HISTORY BOOTSTRAP READY | "
+            f"elapsed={time.monotonic() - bootstrap_started:.1f}s {_cache_summary(bars)}",
+            flush=True,
         )
 
     for event in events:
@@ -374,8 +424,19 @@ def run_hourly_paper_session(
             continue
         if stop_at is not None and now() < event.due_at and event.due_at > stop_at:
             break
+        last_wait_heartbeat: pd.Timestamp | None = None
         while now() < event.due_at:
-            sleep(min(30.0, float((event.due_at - now()).total_seconds())))
+            current = now()
+            if last_wait_heartbeat is None or current - last_wait_heartbeat >= WAIT_HEARTBEAT_INTERVAL:
+                remaining = max(0, int((event.due_at - current).total_seconds()))
+                print(
+                    "HOURLY PAPER WAIT | "
+                    f"next={event.kind} due={event.due_at.isoformat()} now={current.isoformat()} "
+                    f"remaining={remaining}s {_cache_summary(bars)}",
+                    flush=True,
+                )
+                last_wait_heartbeat = current
+            sleep(min(30.0, float((event.due_at - current).total_seconds())))
         observed_at = now()
         if stop_at is not None and observed_at > stop_at:
             break
@@ -389,6 +450,12 @@ def run_hourly_paper_session(
         if event.kind == "select":
             assert event.selection_at is not None
             assert event.target_start is not None
+            print(
+                "HOURLY FORECAST STARTED | "
+                f"selection={event.selection_at.isoformat()} target={event.target_start.isoformat()} {_cache_summary(bars)}",
+                flush=True,
+            )
+            forecast_started = time.monotonic()
             bars = _history_through(
                 bars,
                 symbols,
@@ -425,6 +492,18 @@ def run_hourly_paper_session(
                 )
             targets_by_start[event.target_start] = load_target_weights(candidate_path, max_weight=max_weight)
             expected_log = float(candidate.status["expected_one_hour_log_return"])
+            top_weights = candidate.weights.nlargest(5, "target_weight")
+            top_weight_text = ",".join(
+                f"{row.symbol}:{float(row.target_weight):.2%}" for row in top_weights.itertuples(index=False)
+            )
+            print(
+                "HOURLY FORECAST READY | "
+                f"target={event.target_start.isoformat()} weights={len(candidate.weights)} "
+                f"training_rows={candidate.status.get('training_rows', 0)} "
+                f"expected_one_hour_return={np.expm1(expected_log):+.4%} "
+                f"elapsed={time.monotonic() - forecast_started:.1f}s top={top_weight_text}",
+                flush=True,
+            )
             forecast_details[event.target_start] = {
                 "selection_timestamp": event.selection_at.isoformat(),
                 "target_start": event.target_start.isoformat(),
@@ -451,6 +530,12 @@ def run_hourly_paper_session(
                     skip(event, "selected_target_was_not_available_after_handoff", observed_at)
                     continue
                 raise RuntimeError(f"missing active target for {event.due_at.isoformat()}")
+            print(
+                "HOURLY PAPER REBALANCE STARTED | "
+                f"scheduled={event.due_at.isoformat()} target={event.target_start.isoformat()} "
+                f"weights={len(targets_by_start[event.target_start])}",
+                flush=True,
+            )
             report = run_rebalance(
                 client,
                 targets_by_start[event.target_start],
@@ -458,6 +543,11 @@ def run_hourly_paper_session(
                 min_weight_drift=min_weight_drift,
                 liquidate_non_target_positions=True,
                 execute=True,
+            )
+            print(
+                "HOURLY PAPER REBALANCE RESULT | "
+                f"scheduled={event.due_at.isoformat()} {_execution_summary(report)}",
+                flush=True,
             )
             ledger.append(
                 {
@@ -470,6 +560,7 @@ def run_hourly_paper_session(
             )
             completed_events.add(event_id)
         else:
+            print(f"HOURLY PAPER FLATTEN STARTED | scheduled={event.due_at.isoformat()}", flush=True)
             report = run_end_of_day_flatten(client, execute=True)
             # Capture the final 14:30 and 15:30 label endpoints after the
             # close.  They are never used by an earlier forecast, but make
@@ -481,6 +572,11 @@ def run_hourly_paper_session(
                 decision_at=event.due_at,
                 cache_path=minute_cache_file,
             )
+            print(
+                "HOURLY PAPER FLATTEN RESULT | "
+                f"scheduled={event.due_at.isoformat()} {_execution_summary(report)} {_cache_summary(bars)}",
+                flush=True,
+            )
             ledger.append(
                 {
                     "event": "final_paper_flatten",
@@ -491,6 +587,16 @@ def run_hourly_paper_session(
             )
             completed_events.add(event_id)
         persist()
+        print(
+            "HOURLY PAPER CHECKPOINTED | "
+            f"completed_events={len(completed_events)} ledger_events={len(ledger)} checkpoint={checkpoint_file or 'none'}",
+            flush=True,
+        )
+    print(
+        "HOURLY PAPER SESSION RETURNED | "
+        f"session={session_day.isoformat()} completed_events={len(completed_events)} ledger_events={len(ledger)}",
+        flush=True,
+    )
     return ledger
 
 
