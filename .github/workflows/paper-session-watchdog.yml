@@ -23,33 +23,58 @@ jobs:
           REPOSITORY: ${{ github.repository }}
         run: |
           set -euo pipefail
-          runs="$(gh run list --repo "$REPOSITORY" --workflow 'hourly-paper-24x7.yml' --limit 20 --json status,conclusion,updatedAt)"
-          decision="$(RUNS="$runs" python - <<'PY'
+          runs="$(gh run list --repo "$REPOSITORY" --workflow 'hourly-paper-24x7.yml' --limit 20 --json databaseId,status,conclusion,createdAt,updatedAt,headSha,url)"
+          assessment="$(RUNS="$runs" python - <<'PY'
           import json, os
           from datetime import datetime, timezone
 
           runs = json.loads(os.environ["RUNS"])
           active = {"queued", "in_progress", "pending", "requested", "waiting"}
-          if any(run["status"] in active for run in runs):
-              print("ok")
+          now = datetime.now(timezone.utc)
+
+          def age_seconds(timestamp):
+              return max(0, int((now - datetime.fromisoformat(timestamp.replace("Z", "+00:00"))).total_seconds()))
+
+          def emit(decision, run, age):
+              print("|".join((
+                  decision,
+                  str(run.get("databaseId", "none")),
+                  str(run.get("status", "none")),
+                  str(run.get("conclusion") or "none"),
+                  str(run.get("updatedAt", "none")),
+                  str(age),
+                  str(run.get("headSha", "none"))[:12],
+                  str(run.get("url", "none")),
+              )))
+
+          active_runs = [run for run in runs if run["status"] in active]
+          if active_runs:
+              latest = max(active_runs, key=lambda run: run["createdAt"])
+              emit("ok", latest, age_seconds(latest["createdAt"]))
           elif runs:
               latest = max(runs, key=lambda run: run["updatedAt"])
               if latest["conclusion"] == "success":
-                  completed = datetime.fromisoformat(latest["updatedAt"].replace("Z", "+00:00"))
-                  age = (datetime.now(timezone.utc) - completed).total_seconds()
+                  age = age_seconds(latest["updatedAt"])
                   if age < 600:
-                      print("wait")
+                      emit("wait", latest, age)
                   else:
-                      print("recover")
+                      emit("recover", latest, age)
               else:
-                  print("recover")
+                  emit("recover", latest, age_seconds(latest["updatedAt"]))
           else:
-              print("recover")
+              emit("recover", {}, 0)
           PY
           )"
+          IFS='|' read -r decision run_id run_status conclusion updated_at age_seconds head_sha run_url <<< "$assessment"
+          echo "WATCHDOG STATUS | runner=${run_id} status=${run_status} conclusion=${conclusion} age=${age_seconds}s updated=${updated_at} sha=${head_sha} url=${run_url}"
+          {
+            echo "### 24/7 hourly paper watchdog"
+            echo "- Decision: \`${decision}\`"
+            echo "- Runner: [${run_id}](${run_url}) — status \`${run_status}\`, age ${age_seconds}s, SHA \`${head_sha}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
           case "$decision" in
             ok)
-              echo "WATCHDOG OK | 24/7 hourly paper runner is active or queued."
+              echo "WATCHDOG OK | 24/7 hourly paper runner is active or queued; no duplicate dispatch."
               exit 0
               ;;
             wait)

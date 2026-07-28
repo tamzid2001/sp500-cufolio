@@ -57,6 +57,14 @@ def run_hourly_paper_daemon(
     deadline = time.monotonic() + run_seconds
     state = Path(state_path)
     output = Path(output_dir)
+    history_description = history_start or f"rolling_{history_calendar_days}_calendar_days"
+    print(
+        "HOURLY PAPER DAEMON STARTED | "
+        f"mode=paper slice={run_seconds}s state={state} minute_cache={minute_cache_path} "
+        f"history_start={history_description} output={output}",
+        flush=True,
+    )
+    last_idle_heartbeat: pd.Timestamp | None = None
     while time.monotonic() < deadline:
         now = utc_now()
         new_york = now.tz_convert(NEW_YORK)
@@ -67,7 +75,12 @@ def run_hourly_paper_daemon(
                 session_history_start = history_start or rolling_history_start(
                     now, calendar_days=history_calendar_days,
                 )
-                run_hourly_paper_session(
+                print(
+                    "HOURLY PAPER DAEMON ENTERING SESSION | "
+                    f"utc={now.isoformat()} new_york={new_york.isoformat()} history_start={session_history_start}",
+                    flush=True,
+                )
+                ledger = run_hourly_paper_session(
                     session_day=new_york.date(),
                     history_start=session_history_start,
                     output_dir=output,
@@ -78,11 +91,25 @@ def run_hourly_paper_daemon(
                     stop_at=now + timedelta(seconds=max(0, deadline - time.monotonic() - 30)),
                     resume=True,
                 )
+                print(
+                    "HOURLY PAPER DAEMON SESSION RETURNED | "
+                    f"utc={utc_now().isoformat()} ledger_events={len(ledger)}",
+                    flush=True,
+                )
             except Exception as error:  # preserve the durable checkpoint and retry within this slice
                 print(f"HOURLY PAPER DAEMON RETRY | {error}", flush=True)
                 time.sleep(min(60, max(1, deadline - time.monotonic())))
                 continue
+        if last_idle_heartbeat is None or now - last_idle_heartbeat >= timedelta(minutes=5):
+            remaining = max(0, int(deadline - time.monotonic()))
+            print(
+                "HOURLY PAPER DAEMON IDLE | "
+                f"utc={now.isoformat()} new_york={new_york.isoformat()} remaining={remaining}s",
+                flush=True,
+            )
+            last_idle_heartbeat = now
         time.sleep(min(300, max(1, deadline - time.monotonic())))
+    print("HOURLY PAPER DAEMON HANDOFF READY | slice deadline reached", flush=True)
 
 
 def main() -> None:
