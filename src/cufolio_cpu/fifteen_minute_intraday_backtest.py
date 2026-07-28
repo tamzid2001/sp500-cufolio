@@ -11,6 +11,7 @@ import pandas as pd
 from .five_minute_intraday_backtest import (
     FiveMinuteForecastBacktestResult,
     _write_markdown_report,
+    reconcile_intraday_forecast_outcomes,
     run_intraday_forecast_backtest,
 )
 
@@ -49,6 +50,10 @@ def main() -> None:
     parser.add_argument("--min-training-sessions", type=int, default=10)
     parser.add_argument("--min-covariance-scenarios", type=int, default=FIFTEEN_MINUTE_MIN_COVARIANCE_SCENARIOS)
     parser.add_argument("--seasonality-prior-observations", type=int, default=20)
+    parser.add_argument(
+        "--fallback-input",
+        help="Optional one-minute fallback bars used only to repair otherwise-missing realized endpoints",
+    )
     args = parser.parse_args()
     result = run_fifteen_minute_forecast_backtest(
         pd.read_csv(args.input),
@@ -61,6 +66,11 @@ def main() -> None:
         min_covariance_scenarios=args.min_covariance_scenarios,
         seasonality_prior_observations=args.seasonality_prior_observations,
     )
+    if args.fallback_input:
+        result = reconcile_intraday_forecast_outcomes(
+            result,
+            pd.read_csv(args.fallback_input),
+        )
     output = Path(args.output_dir)
     output.mkdir(parents=True, exist_ok=True)
     result.ledger.to_csv(output / "fifteen_minute_forecast_ledger.csv", index=False)

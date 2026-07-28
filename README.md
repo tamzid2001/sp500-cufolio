@@ -268,11 +268,21 @@ The manual **Five-minute intraday forecast audit** and **Fifteen-minute
 intraday forecast audit** Actions both download read-only Alpaca IEX one-minute
 history for a completed session. Each creates a fresh long-only, capped
 portfolio at every non-overlapping interval and records the exact next-interval
-return without forward-filling a missing endpoint.
+return without forward-filling a missing endpoint. Because a one-minute bar is
+left-labeled, decisions use the preceding completed close: a completed regular
+session therefore has 77 causal five-minute decisions (09:35–15:55) or 25
+causal fifteen-minute decisions (09:45–15:45), rather than inventing a 16:00
+minute bar.
 
 The reports include the complete decision ledger, per-holding prediction and
-realization rows, arithmetic sums of expected versus actual interval returns,
-and the correct compounded session comparison. The forecasts use a pooled
+realization rows, all-forecast expected totals, and an expected-versus-actual
+comparison restricted to the exact same realized windows. A compounded actual
+return is called a session result only at 100% exact realization coverage;
+otherwise it is explicitly a partial diagnostic. When IEX lacks an endpoint
+for a selected holding, the Action fetches a one-minute yfinance fallback only
+for those missing holdings and only replaces an outcome when both endpoints
+are present. It never changes the original forecast, weights, or an existing
+IEX realization. The forecasts use a pooled
 non-overlapping intraday return estimate with a same-clock-time component
 shrunk toward the pooled mean; they are not trading instructions or a claim of
 future performance.

@@ -8,7 +8,7 @@ on:
         type: string
         default: ""
       history_calendar_days:
-        description: "Calendar days of prior 1-minute IEX history to download"
+        description: "Calendar days of prior 1-minute IEX training history to download"
         type: string
         default: "45"
       top_n:
@@ -77,10 +77,62 @@ jobs:
             --start "$HISTORY_START" \
             --end "$HISTORY_END" \
             --output artifacts/one_minute_iex_history.csv.gz
-      - name: Audit every causal five-minute portfolio forecast
+      - name: Build every causal five-minute portfolio forecast from primary IEX data
         run: |
           python -m cufolio_cpu.five_minute_intraday_backtest \
             --input artifacts/one_minute_iex_history.csv.gz \
+            --output-dir artifacts/five_minute_forecast_audit \
+            --session-date "$SESSION_DATE" \
+            --top-n "$TOP_N" \
+            --max-weight "$MAX_WEIGHT" \
+            --lookback-observations 780 \
+            --min-training-sessions 10 \
+            --min-covariance-scenarios 500
+      - name: Select only missing realized endpoints for yfinance repair
+        run: |
+          python - <<'PY'
+          import pandas as pd
+
+          holdings = pd.read_csv("artifacts/five_minute_forecast_audit/five_minute_forecast_holdings.csv")
+          symbols = (
+              holdings.loc[holdings["realized_asset_simple_return"].isna(), ["symbol"]]
+              .drop_duplicates()
+              .sort_values("symbol")
+          )
+          symbols.to_csv("artifacts/yfinance_missing_endpoint_symbols.csv", index=False)
+          print(f"Requesting yfinance endpoint repair for {len(symbols)} symbols")
+          PY
+      - name: Download yfinance one-minute endpoint fallback
+        run: |
+          python - <<'PY'
+          import os
+          import pandas as pd
+
+          from cufolio_cpu.alpaca import download_yfinance_minute_bars
+
+          symbols = pd.read_csv("artifacts/yfinance_missing_endpoint_symbols.csv")["symbol"].dropna().astype(str).tolist()
+          output = "artifacts/yfinance_endpoint_fallback_1m.csv.gz"
+          if not symbols:
+              pd.DataFrame(columns=["timestamp", "symbol", "close"]).to_csv(output, index=False)
+              print("No yfinance endpoint repair was needed")
+          else:
+              start = pd.Timestamp(f"{os.environ['SESSION_DATE']} 09:30", tz="America/New_York")
+              end = pd.Timestamp(f"{os.environ['SESSION_DATE']} 16:00", tz="America/New_York")
+              try:
+                  bars = download_yfinance_minute_bars(symbols, start, end)
+              except Exception as error:
+                  # The audit stays valid and reports incomplete coverage if
+                  # a credential-free fallback provider is unavailable.
+                  print(f"yfinance endpoint fallback unavailable: {error}")
+                  bars = pd.DataFrame(columns=["timestamp", "symbol", "close"])
+              bars.to_csv(output, index=False)
+              print(f"Wrote {len(bars):,} fallback bars for {bars['symbol'].nunique() if not bars.empty else 0} symbols")
+          PY
+      - name: Reconcile five-minute outcomes with yfinance fallback
+        run: |
+          python -m cufolio_cpu.five_minute_intraday_backtest \
+            --input artifacts/one_minute_iex_history.csv.gz \
+            --fallback-input artifacts/yfinance_endpoint_fallback_1m.csv.gz \
             --output-dir artifacts/five_minute_forecast_audit \
             --session-date "$SESSION_DATE" \
             --top-n "$TOP_N" \

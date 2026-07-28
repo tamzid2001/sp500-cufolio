@@ -27,6 +27,7 @@ SESSION_OPEN = clock_time(9, 30)
 SESSION_CLOSE = clock_time(16, 0)
 FORECAST_INTERVAL_MINUTES = 5
 FORECAST_HORIZON_MINUTES = 5
+MINUTE_BAR_WIDTH = timedelta(minutes=1)
 # The paper target loader rejects non-positive weights.  This removes solver
 # dust before an audit portfolio is recorded or consumed elsewhere.
 MIN_EMITTABLE_TARGET_WEIGHT = 1e-6
@@ -53,7 +54,10 @@ def _regular_session_minute_closes(bars: pd.DataFrame) -> pd.DataFrame:
     clean = clean[(clean["symbol"] != "") & (clean["close"] > 0)]
     clean = clean.drop_duplicates(["timestamp", "symbol"], keep="last")
     local = clean["timestamp"].dt.tz_convert(NEW_YORK)
-    regular = (local.dt.time >= SESSION_OPEN) & (local.dt.time <= SESSION_CLOSE)
+    # Alpaca labels a minute bar with the *left* side of the interval.  The
+    # regular session therefore contains 09:30 through 15:59, not a synthetic
+    # 16:00 bar.  See the Market Data FAQ linked in the README.
+    regular = (local.dt.time >= SESSION_OPEN) & (local.dt.time < SESSION_CLOSE)
     clean = clean.loc[regular].copy()
     if clean.empty:
         raise ValueError("no positive one-minute closes fall in the US regular session")
@@ -66,9 +70,22 @@ def _timestamp(session_day: date, at: clock_time) -> pd.Timestamp:
 
 
 def _decision_grid(session_day: date, *, interval_minutes: int) -> pd.DatetimeIndex:
-    start = _timestamp(session_day, SESSION_OPEN)
+    # A decision at 09:30 cannot causally use the 09:30 one-minute close: that
+    # close is only known just after 09:31.  Start after the first complete
+    # interval, and use the prior bar's close for every decision below.
+    start = _timestamp(session_day, SESSION_OPEN) + timedelta(minutes=interval_minutes)
     final_decision = _timestamp(session_day, SESSION_CLOSE) - timedelta(minutes=interval_minutes)
     return pd.date_range(start, final_decision, freq=f"{interval_minutes}min")
+
+
+def _close_timestamp_known_at(boundary: pd.Timestamp) -> pd.Timestamp:
+    """Return the left-labeled bar whose close is known at ``boundary``."""
+    return boundary - MINUTE_BAR_WIDTH
+
+
+def _as_utc_timestamp(value: object) -> pd.Timestamp:
+    timestamp = pd.Timestamp(value)
+    return timestamp.tz_localize("UTC") if timestamp.tzinfo is None else timestamp.tz_convert("UTC")
 
 
 def _non_overlapping_label_panel(
@@ -80,8 +97,8 @@ def _non_overlapping_label_panel(
     for session_day in session_days:
         for decision_at in _decision_grid(session_day, interval_minutes=interval_minutes):
             target_end = decision_at + timedelta(minutes=interval_minutes)
-            start_prices = closes.reindex([decision_at]).iloc[0]
-            end_prices = closes.reindex([target_end]).iloc[0]
+            start_prices = closes.reindex([_close_timestamp_known_at(decision_at)]).iloc[0]
+            end_prices = closes.reindex([_close_timestamp_known_at(target_end)]).iloc[0]
             row = np.log(end_prices / start_prices)
             row.name = decision_at
             rows.append(row)
@@ -239,6 +256,7 @@ def _empty_holdings() -> pd.DataFrame:
             "predicted_asset_log_return",
             "realized_asset_log_return",
             "realized_asset_simple_return",
+            "realized_price_source",
         ]
     )
 
@@ -252,6 +270,8 @@ def _summary(
 ) -> dict[str, object]:
     forecasted = ledger[ledger["forecast_status"].eq("ok")].copy()
     realized = forecasted[forecasted["realized_status"].eq("ok")].copy()
+    all_expected = forecasted["expected_portfolio_simple_return"].astype(float)
+    all_expected_log = forecasted["expected_portfolio_log_return"].astype(float)
     expected = realized["expected_portfolio_simple_return"].astype(float)
     actual = realized["actual_portfolio_simple_return"].astype(float)
     errors = actual - expected
@@ -268,6 +288,29 @@ def _summary(
         "forecast_windows": int(len(forecasted)),
         "realized_windows": int(len(realized)),
         "unrealized_or_incomplete_windows": int(len(forecasted) - len(realized)),
+        "exact_realized_coverage": float(len(realized) / len(forecasted)) if len(forecasted) else None,
+        "full_session_exact_realization_available": bool(len(realized) == len(forecasted) and len(forecasted) > 0),
+        "all_forecast_sum_expected_simple_return": float(all_expected.sum()) if not all_expected.empty else None,
+        "all_forecast_sum_expected_log_return": float(all_expected_log.sum()) if not all_expected_log.empty else None,
+        "all_forecast_compounded_expected_return": (
+            float(np.expm1(all_expected_log.sum())) if not all_expected_log.empty else None
+        ),
+        "matched_sum_expected_simple_return": float(expected.sum()) if not expected.empty else None,
+        "matched_sum_actual_simple_return": float(actual.sum()) if not actual.empty else None,
+        "matched_sum_expected_log_return": float(expected_log.sum()) if not expected_log.empty else None,
+        "matched_sum_actual_log_return": float(actual_log.sum()) if not actual_log.empty else None,
+        "matched_compounded_expected_return": (
+            float(np.expm1(expected_log.sum())) if not expected_log.empty else None
+        ),
+        "matched_compounded_actual_return": (
+            float(np.expm1(actual_log.sum())) if not actual_log.empty else None
+        ),
+        "matched_arithmetic_sum_forecast_error": float(errors.sum()) if not errors.empty else None,
+        "matched_compounded_forecast_error": (
+            float(np.expm1(actual_log.sum()) - np.expm1(expected_log.sum())) if not actual_log.empty else None
+        ),
+        # Retained for compatibility.  These legacy names now deliberately
+        # refer to the same matched windows as the actual-return field.
         "sum_expected_simple_return": float(expected.sum()) if not expected.empty else None,
         "sum_actual_simple_return": float(actual.sum()) if not actual.empty else None,
         "sum_expected_log_return": float(expected_log.sum()) if not expected_log.empty else None,
@@ -284,14 +327,127 @@ def _summary(
             float((np.sign(expected) == np.sign(actual)).mean()) if not expected.empty else None
         ),
         "reconciliation_rule": (
-            "Five-minute simple returns are shown as arithmetic sums for the requested comparison; "
-            "the economically correct session total compounds each realized portfolio return, equivalently sums log returns."
+            "Expected and actual returns are compared only across the same windows with exact realized endpoints. "
+            "All-forecast expected return is reported separately. A compounded actual return is a full-session "
+            "wealth result only when every forecast window has an exact realization."
         ),
         "causality_rule": (
-            "Every forecast uses only five-minute labels whose target endpoint is strictly before its decision timestamp; "
-            "a missing realized endpoint marks that forecast incomplete rather than changing the historical weights."
+            "Alpaca minute bars are left-labeled. Each decision uses the prior minute's completed close, and every "
+            "forecast uses only labels whose interval endpoint is strictly before its decision timestamp. A missing "
+            "realized endpoint marks that forecast incomplete rather than changing historical weights."
         ),
     }
+
+
+def _recompute_realized_portfolios(ledger: pd.DataFrame, holdings: pd.DataFrame) -> pd.DataFrame:
+    """Rebuild realized portfolio returns from the recorded, fixed holdings."""
+    refreshed = ledger.copy()
+    if "realized_price_source" not in holdings.columns:
+        holdings = holdings.copy()
+        holdings["realized_price_source"] = np.where(
+            holdings["realized_asset_simple_return"].notna(), "primary_input", "missing"
+        )
+    for index, row in refreshed.iterrows():
+        if row["forecast_status"] != "ok":
+            continue
+        decision_at = _as_utc_timestamp(row["decision_timestamp"])
+        selected = holdings[pd.to_datetime(holdings["decision_timestamp"], utc=True) == decision_at]
+        returns = pd.to_numeric(selected["realized_asset_simple_return"], errors="coerce")
+        if len(selected) != int(row["holding_count"]) or returns.isna().any() or not np.isfinite(returns).all():
+            refreshed.at[index, "realized_status"] = "missing_exact_realized_endpoint"
+            refreshed.at[index, "actual_portfolio_simple_return"] = np.nan
+            refreshed.at[index, "actual_portfolio_log_return"] = np.nan
+            refreshed.at[index, "realized_data_source"] = "incomplete"
+            continue
+        weights = pd.to_numeric(selected["target_weight"], errors="coerce")
+        portfolio_simple = float(weights.dot(returns))
+        source_names = sorted(set(selected["realized_price_source"].dropna()) - {"missing"})
+        refreshed.at[index, "realized_status"] = "ok"
+        refreshed.at[index, "actual_portfolio_simple_return"] = portfolio_simple
+        refreshed.at[index, "actual_portfolio_log_return"] = float(np.log1p(portfolio_simple))
+        refreshed.at[index, "realized_data_source"] = "+".join(source_names) if source_names else "primary_input"
+    return refreshed
+
+
+def reconcile_intraday_forecast_outcomes(
+    result: FiveMinuteForecastBacktestResult,
+    fallback_minute_bars: pd.DataFrame,
+    *,
+    fallback_source: str = "yfinance_1m_fallback",
+) -> FiveMinuteForecastBacktestResult:
+    """Fill only missing realized asset endpoints without changing a forecast.
+
+    The forecasted symbols, weights, expected returns, and primary-input
+    realizations remain fixed.  A fallback is used only when both endpoint
+    closes for a previously missing holding are available from that fallback.
+    That preserves the original causal decision and makes every repaired price
+    source explicit in the holdings artifact.
+    """
+    holdings = result.holdings.copy()
+    if holdings.empty or fallback_minute_bars.empty:
+        refreshed_ledger = _recompute_realized_portfolios(result.ledger, holdings)
+        refreshed_summary = _summary(
+            refreshed_ledger,
+            requested_session_date=result.summary.get("requested_session_date"),
+            evaluated_session_date=date.fromisoformat(str(result.summary["evaluated_session_date"])),
+            interval_minutes=int(result.summary["forecast_interval_minutes"]),
+        )
+        refreshed_summary.update({key: value for key, value in result.summary.items() if key not in refreshed_summary})
+        refreshed_summary.update(
+            {
+                "outcome_fallback_source": fallback_source,
+                "fallback_repaired_asset_endpoints": 0,
+                "fallback_available": False,
+            }
+        )
+        return FiveMinuteForecastBacktestResult(refreshed_ledger, holdings, refreshed_summary)
+
+    if "realized_price_source" not in holdings.columns:
+        holdings["realized_price_source"] = np.where(
+            holdings["realized_asset_simple_return"].notna(), "primary_input", "missing"
+        )
+    try:
+        fallback_clean = _regular_session_minute_closes(fallback_minute_bars)
+    except ValueError:
+        return reconcile_intraday_forecast_outcomes(
+            result,
+            pd.DataFrame(columns=["timestamp", "symbol", "close"]),
+            fallback_source=fallback_source,
+        )
+    fallback_closes = fallback_clean.pivot(index="timestamp", columns="symbol", values="close").sort_index()
+    repaired = 0
+    for index, holding in holdings[holdings["realized_asset_simple_return"].isna()].iterrows():
+        decision_at = _as_utc_timestamp(holding["decision_timestamp"])
+        target_end = _as_utc_timestamp(holding["target_end"])
+        symbol = str(holding["symbol"])
+        if symbol not in fallback_closes.columns:
+            continue
+        start = fallback_closes.at[_close_timestamp_known_at(decision_at), symbol] if _close_timestamp_known_at(decision_at) in fallback_closes.index else np.nan
+        end = fallback_closes.at[_close_timestamp_known_at(target_end), symbol] if _close_timestamp_known_at(target_end) in fallback_closes.index else np.nan
+        if pd.isna(start) or pd.isna(end) or not np.isfinite(start) or not np.isfinite(end) or start <= 0 or end <= 0:
+            continue
+        simple_return = float(end / start - 1)
+        holdings.at[index, "realized_asset_simple_return"] = simple_return
+        holdings.at[index, "realized_asset_log_return"] = float(np.log1p(simple_return))
+        holdings.at[index, "realized_price_source"] = fallback_source
+        repaired += 1
+    refreshed_ledger = _recompute_realized_portfolios(result.ledger, holdings)
+    refreshed_summary = _summary(
+        refreshed_ledger,
+        requested_session_date=result.summary.get("requested_session_date"),
+        evaluated_session_date=date.fromisoformat(str(result.summary["evaluated_session_date"])),
+        interval_minutes=int(result.summary["forecast_interval_minutes"]),
+    )
+    refreshed_summary.update({key: value for key, value in result.summary.items() if key not in refreshed_summary})
+    refreshed_summary.update(
+        {
+            "outcome_fallback_source": fallback_source,
+            "fallback_repaired_asset_endpoints": repaired,
+            "fallback_available": True,
+            "realized_price_source_counts": holdings["realized_price_source"].value_counts(dropna=False).to_dict(),
+        }
+    )
+    return FiveMinuteForecastBacktestResult(refreshed_ledger, holdings, refreshed_summary)
 
 
 def _render_markdown_report(result: FiveMinuteForecastBacktestResult) -> str:
@@ -312,15 +468,19 @@ def _render_markdown_report(result: FiveMinuteForecastBacktestResult) -> str:
         "",
         "| Metric | Value |",
         "| --- | ---: |",
-        f"| Arithmetic sum of expected {interval_minutes}-minute returns | {percent(summary['sum_expected_simple_return'])} |",
-        f"| Arithmetic sum of actual {interval_minutes}-minute returns | {percent(summary['sum_actual_simple_return'])} |",
-        f"| Compounded expected return | {percent(summary['compounded_expected_return'])} |",
-        f"| Compounded actual return | {percent(summary['compounded_actual_return'])} |",
-        f"| Compounded forecast error | {percent(summary['compounded_forecast_error'])} |",
+        f"| Exact realized coverage | {percent(summary['exact_realized_coverage'])} ({summary['realized_windows']}/{summary['forecast_windows']} windows) |",
+        f"| All-forecast arithmetic expected return | {percent(summary['all_forecast_sum_expected_simple_return'])} |",
+        f"| All-forecast compounded expected return | {percent(summary['all_forecast_compounded_expected_return'])} |",
+        f"| Matched-window arithmetic expected return | {percent(summary['matched_sum_expected_simple_return'])} |",
+        f"| Matched-window arithmetic actual return | {percent(summary['matched_sum_actual_simple_return'])} |",
+        f"| Matched-window compounded expected return | {percent(summary['matched_compounded_expected_return'])} |",
+        f"| Matched-window compounded actual return | {percent(summary['matched_compounded_actual_return'])} |",
+        f"| Matched-window compounded forecast error | {percent(summary['matched_compounded_forecast_error'])} |",
         f"| Mean absolute forecast error | {summary['mean_absolute_error_bps']:.2f} bps" if summary["mean_absolute_error_bps"] is not None else "| Mean absolute forecast error | n/a |",
         f"| Directional accuracy | {percent(summary['directional_accuracy'])} |",
         "",
-        f"The arithmetic sums answer the requested sum comparison. Compounded returns are the correct session-level wealth comparison because the {interval_minutes}-minute windows are sequential.",
+        "The requested expected-versus-actual arithmetic comparison uses only the exact realized windows shown above. "
+        f"The compounded matched result is a full-session wealth return only if all {summary['forecast_windows']} windows are realized; otherwise it is explicitly a partial, non-contiguous diagnostic.",
         "",
         f"## Every {interval_minutes}-minute decision",
         "",
@@ -338,6 +498,17 @@ def _render_markdown_report(result: FiveMinuteForecastBacktestResult) -> str:
         )
         lines.append(
             f"| {decision} | {row.forecast_status} | {row.realized_status} | {expected} | {actual} | {error} | {row.holding_count} | {row.reason} |"
+        )
+    if summary.get("fallback_available"):
+        lines.extend(
+            [
+                "",
+                "## Outcome data repair",
+                "",
+                f"- Fallback source: `{summary['outcome_fallback_source']}`",
+                f"- Repaired missing asset endpoint pairs: {summary['fallback_repaired_asset_endpoints']}",
+                "- The repair does not alter forecasts, selected symbols, target weights, or primary-input realized prices.",
+            ]
         )
     return "\n".join(lines) + "\n"
 
@@ -414,24 +585,29 @@ def run_intraday_forecast_backtest(
         row: dict[str, object] = {
             "decision_timestamp": decision_at,
             "target_end": target_end,
+            "decision_price_timestamp": _close_timestamp_known_at(decision_at),
+            "realized_price_timestamp": _close_timestamp_known_at(target_end),
             **diagnostic,
             "holding_count": 0,
             "realized_status": "not_forecast",
             "actual_portfolio_log_return": np.nan,
             "actual_portfolio_simple_return": np.nan,
+            "realized_data_source": "not_forecast",
         }
         if weights is not None and expected_by_asset is not None:
             row["holding_count"] = int(len(weights))
-            start_prices = closes.reindex([decision_at], columns=weights.index).iloc[0]
-            end_prices = closes.reindex([target_end], columns=weights.index).iloc[0]
+            start_prices = closes.reindex([_close_timestamp_known_at(decision_at)], columns=weights.index).iloc[0]
+            end_prices = closes.reindex([_close_timestamp_known_at(target_end)], columns=weights.index).iloc[0]
             realized_simple = end_prices / start_prices - 1
             if realized_simple.isna().any() or not np.isfinite(realized_simple.to_numpy(dtype=float)).all():
                 row["realized_status"] = "missing_exact_realized_endpoint"
+                row["realized_data_source"] = "incomplete"
             else:
                 portfolio_simple = float(weights.dot(realized_simple))
                 row["realized_status"] = "ok"
                 row["actual_portfolio_simple_return"] = portfolio_simple
                 row["actual_portfolio_log_return"] = float(np.log1p(portfolio_simple))
+                row["realized_data_source"] = "primary_input"
             realized_log = np.log1p(realized_simple)
             for symbol, weight in weights.items():
                 holdings_rows.append(
@@ -443,6 +619,7 @@ def run_intraday_forecast_backtest(
                         "predicted_asset_log_return": float(expected_by_asset[symbol]),
                         "realized_asset_log_return": float(realized_log[symbol]) if pd.notna(realized_log[symbol]) else np.nan,
                         "realized_asset_simple_return": float(realized_simple[symbol]) if pd.notna(realized_simple[symbol]) else np.nan,
+                        "realized_price_source": "primary_input" if pd.notna(realized_simple[symbol]) else "missing",
                     }
                 )
         ledger_rows.append(row)
@@ -492,6 +669,10 @@ def main() -> None:
     parser.add_argument("--min-training-sessions", type=int, default=10)
     parser.add_argument("--min-covariance-scenarios", type=int, default=500)
     parser.add_argument("--seasonality-prior-observations", type=int, default=20)
+    parser.add_argument(
+        "--fallback-input",
+        help="Optional one-minute fallback bars used only to repair otherwise-missing realized endpoints",
+    )
     args = parser.parse_args()
     result = run_intraday_forecast_backtest(
         pd.read_csv(args.input),
@@ -505,6 +686,11 @@ def main() -> None:
         min_covariance_scenarios=args.min_covariance_scenarios,
         seasonality_prior_observations=args.seasonality_prior_observations,
     )
+    if args.fallback_input:
+        result = reconcile_intraday_forecast_outcomes(
+            result,
+            pd.read_csv(args.fallback_input),
+        )
     output = Path(args.output_dir)
     output.mkdir(parents=True, exist_ok=True)
     result.ledger.to_csv(output / "five_minute_forecast_ledger.csv", index=False)
