@@ -7,11 +7,13 @@ import pytest
 
 from cufolio_cpu.five_minute_paper_daemon import rolling_history_start
 from cufolio_cpu.five_minute_paper_session import (
+    _merge_current_minutes,
     _completed_bar_at,
     _regular_minute_cache_projection,
     five_minute_events,
     run_five_minute_paper_session,
 )
+from cufolio_cpu.hourly_paper_session import MinuteCacheHealth
 
 
 def test_five_minute_schedule_has_one_order_boundary_per_horizon_and_no_rebalance_events() -> None:
@@ -62,3 +64,34 @@ def test_five_minute_rolling_history_start_has_model_warmup() -> None:
     assert rolling_history_start(reference, calendar_days=28) == "2026-06-30T13:30:00+00:00"
     with pytest.raises(ValueError, match="at least 28"):
         rolling_history_start(reference, calendar_days=27)
+
+
+def test_websocket_precompute_does_not_issue_redundant_rest_repair(monkeypatch) -> None:
+    class Stream:
+        available = True
+
+        def completed_bars_through(self, _completed):
+            return pd.DataFrame(
+                {"timestamp": ["2026-07-28T14:33:00Z"], "symbol": ["AAA"], "close": [101.0]}
+            )
+
+    def unexpected_rest(*_args, **_kwargs):
+        raise AssertionError("websocket-backed precompute should not perform an IEX REST repair")
+
+    monkeypatch.setattr("cufolio_cpu.five_minute_paper_session.download_minute_bars", unexpected_rest)
+    update = _merge_current_minutes(
+        pd.DataFrame(
+            {"timestamp": ["2026-07-28T14:32:00Z"], "symbol": ["AAA"], "close": [100.0]}
+        ),
+        ["AAA"],
+        session_day=date(2026, 7, 28),
+        observed_at=pd.Timestamp("2026-07-28T14:34:00Z"),
+        cache_path=None,
+        minute_stream=Stream(),
+        health=MinuteCacheHealth(),
+        repair_from_rest=False,
+        persist=False,
+    )
+
+    assert list(update.new_rows["timestamp"]) == [pd.Timestamp("2026-07-28T14:33:00Z")]
+    assert list(update.bars["close"]) == [100.0, 101.0]
