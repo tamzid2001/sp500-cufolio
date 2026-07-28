@@ -25,7 +25,7 @@ def test_five_minute_schedule_has_one_order_boundary_per_horizon_and_no_rebalanc
     assert [kind for kind, _ in events].count("forecast_and_order") == 77
     assert "rebalance" not in {kind for kind, _ in events}
     assert events[-1][0] == "flatten"
-    assert events[-1][1].tz_convert("America/New_York").strftime("%H:%M") == "16:00"
+    assert events[-1][1].tz_convert("America/New_York").strftime("%H:%M") == "15:59"
 
 
 def test_five_minute_cache_keeps_full_minutes_for_recent_sessions() -> None:

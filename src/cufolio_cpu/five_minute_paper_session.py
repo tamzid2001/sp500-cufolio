@@ -59,9 +59,15 @@ def _utc_timestamp(value: datetime | pd.Timestamp | None = None) -> pd.Timestamp
 
 
 def five_minute_events(session_day: date) -> list[tuple[str, pd.Timestamp]]:
-    """Return one target order per causal five-minute decision plus 16:00 flatten."""
+    """Return one target order per causal five-minute decision plus 15:59 flatten."""
     return [("forecast_and_order", at) for at in _decision_grid(session_day, interval_minutes=5)] + [
-        ("flatten", pd.Timestamp.combine(session_day, SESSION_CLOSE).tz_localize(NEW_YORK).tz_convert("UTC"))
+        (
+            "flatten",
+            (
+                pd.Timestamp.combine(session_day, SESSION_CLOSE).tz_localize(NEW_YORK)
+                - timedelta(minutes=1)
+            ).tz_convert("UTC"),
+        )
     ]
 
 
