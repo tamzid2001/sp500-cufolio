@@ -5,7 +5,13 @@ on:
     paths:
       - ".github/workflows/hourly-one-hour-backtest.yml"
       - "src/cufolio_cpu/hourly_intraday_backtest.py"
+      - "src/cufolio_cpu/hourly_paper_session.py"
+      - "src/cufolio_cpu/alpaca.py"
+      - ".github/workflows/july-28-hourly-paper-session.yml"
+      - ".github/workflows/paper-session-runner.yml"
       - "tests/test_hourly_intraday_backtest.py"
+      - "tests/test_hourly_paper_session.py"
+      - "tests/test_alpaca.py"
       - "README.md"
   workflow_dispatch:
     inputs:
@@ -64,7 +70,7 @@ jobs:
       - name: Install research dependencies
         run: pip install -r requirements.txt
       - name: Verify causal hourly backtest engine
-        run: pytest -q tests/test_hourly_intraday_backtest.py
+        run: pytest -q tests/test_alpaca.py tests/test_hourly_intraday_backtest.py tests/test_hourly_paper_session.py
       - name: Select historical universe
         if: inputs.data_source == 'alpaca'
         run: |
