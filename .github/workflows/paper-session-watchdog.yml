@@ -1,53 +1,47 @@
-name: Paper session watchdog
+name: 24/7 hourly paper runner watchdog
 
 on:
   schedule:
-    - cron: "*/15 * * * *"
+    - cron: "*/5 * * * *"
   workflow_dispatch:
 
 permissions:
-  actions: read
+  actions: write
   contents: read
 
 concurrency:
-  group: cufolio-paper-session-watchdog
+  group: cufolio-hourly-paper-24x7-watchdog
   cancel-in-progress: false
 
 jobs:
   monitor:
     runs-on: ubuntu-latest
     steps:
-      - name: Monitor the actual bounded hourly paper session
+      - name: Monitor the actual 24/7 hourly paper runner
         env:
           GH_TOKEN: ${{ github.token }}
           REPOSITORY: ${{ github.repository }}
         run: |
           set -euo pipefail
-          runs="$(gh run list --repo "$REPOSITORY" --workflow 'july-28-hourly-paper-session.yml' --limit 20 --json status,conclusion,updatedAt)"
+          runs="$(gh run list --repo "$REPOSITORY" --workflow 'hourly-paper-24x7.yml' --limit 20 --json status,conclusion,updatedAt)"
           RUNS="$runs" python - <<'PY'
           import json, os, sys
-          from datetime import datetime, time
-          from zoneinfo import ZoneInfo
-
-          new_york = ZoneInfo("America/New_York")
-          now = datetime.now(new_york)
-          session_date = datetime(2026, 7, 28, tzinfo=new_york).date()
-          session_open = time(9, 20)
-          session_done = time(15, 45)
-          if now.date() != session_date or not session_open <= now.time() < session_done:
-              print("Outside the July 28 09:20--15:45 ET monitoring window.")
-              raise SystemExit(0)
+          from datetime import datetime, timezone
 
           runs = json.loads(os.environ["RUNS"])
           active = {"queued", "in_progress", "pending", "requested", "waiting"}
           if any(run["status"] in active for run in runs):
-              print("Hourly paper session is active.")
+              print("WATCHDOG OK | 24/7 hourly paper runner is active or queued.")
               raise SystemExit(0)
-          if not runs:
-              sys.exit("No hourly paper-session run was found during its expected window.")
-          latest = max(runs, key=lambda run: run["updatedAt"])
-          sys.exit(
-              "Hourly paper session is not active during its expected window; "
-              f"latest conclusion={latest['conclusion']!r}, updatedAt={latest['updatedAt']}."
-          )
+          if runs:
+              latest = max(runs, key=lambda run: run["updatedAt"])
+              if latest["conclusion"] == "success":
+                  completed = datetime.fromisoformat(latest["updatedAt"].replace("Z", "+00:00"))
+                  age = (datetime.now(timezone.utc) - completed).total_seconds()
+                  if age < 600:
+                      print(f"WATCHDOG WAIT | last runner succeeded {age:.0f}s ago; allowing normal handoff.")
+                      raise SystemExit(0)
+          print("WATCHDOG RECOVERY REQUIRED | no active 24/7 hourly paper runner.")
           PY
+          gh workflow run hourly-paper-24x7.yml --repo "$REPOSITORY" --ref main -f run_seconds=20700
+          echo "WATCHDOG DISPATCHED | 24/7 hourly paper runner recovery queued."
