@@ -16,7 +16,7 @@ from dataclasses import dataclass
 from datetime import date, datetime, time as clock_time, timedelta
 from decimal import Decimal
 from pathlib import Path
-from typing import Callable, Literal
+from typing import Any, Callable, Literal
 
 import numpy as np
 import pandas as pd
@@ -109,7 +109,81 @@ def _history_through(
 
 
 def _write_json(path: Path, value: object) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(value, indent=2, default=str) + "\n", encoding="utf-8")
+
+
+def _event_key(event: SessionEvent) -> str:
+    return f"{event.kind}:{event.due_at.isoformat()}"
+
+
+def _target_key(target_start: pd.Timestamp) -> str:
+    return _utc_timestamp(target_start).isoformat()
+
+
+def _default_checkpoint(session_day: date) -> dict[str, Any]:
+    return {
+        "format_version": 1,
+        "session_date": session_day.isoformat(),
+        "completed_events": [],
+        "targets_by_start": {},
+        "forecast_details": {},
+        "ledger": [],
+    }
+
+
+def _load_checkpoint(path: Path, session_day: date) -> dict[str, Any]:
+    if not path.exists():
+        return _default_checkpoint(session_day)
+    try:
+        state = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise RuntimeError(f"cannot restore hourly paper checkpoint {path}: {error}") from error
+    if not isinstance(state, dict) or state.get("session_date") != session_day.isoformat():
+        return _default_checkpoint(session_day)
+    defaults = _default_checkpoint(session_day)
+    for key, value in defaults.items():
+        state.setdefault(key, value)
+    if not all(isinstance(state[key], expected) for key, expected in (
+        ("completed_events", list), ("targets_by_start", dict),
+        ("forecast_details", dict), ("ledger", list),
+    )):
+        raise RuntimeError(f"hourly paper checkpoint {path} has an invalid shape")
+    return state
+
+
+def _restore_targets(checkpoint: dict[str, Any]) -> dict[pd.Timestamp, dict[str, Decimal]]:
+    restored: dict[pd.Timestamp, dict[str, Decimal]] = {}
+    for target_start, raw_weights in checkpoint["targets_by_start"].items():
+        if not isinstance(raw_weights, dict):
+            raise RuntimeError("hourly paper checkpoint has invalid target weights")
+        restored[_utc_timestamp(pd.Timestamp(target_start))] = {
+            str(symbol): Decimal(str(weight)) for symbol, weight in raw_weights.items()
+        }
+    return restored
+
+
+def _persist_checkpoint(
+    path: Path | None,
+    checkpoint: dict[str, Any],
+    *,
+    completed_events: set[str],
+    targets_by_start: dict[pd.Timestamp, dict[str, Decimal]],
+    forecast_details: dict[pd.Timestamp, dict[str, object]],
+    ledger: list[dict[str, object]],
+) -> None:
+    if path is None:
+        return
+    checkpoint.update({
+        "completed_events": sorted(completed_events),
+        "targets_by_start": {
+            _target_key(target_start): {symbol: format(weight, "f") for symbol, weight in weights.items()}
+            for target_start, weights in targets_by_start.items()
+        },
+        "forecast_details": {_target_key(target_start): details for target_start, details in forecast_details.items()},
+        "ledger": ledger,
+    })
+    _write_json(path, checkpoint)
 
 
 def run_hourly_paper_session(
@@ -126,14 +200,20 @@ def run_hourly_paper_session(
     min_weight_drift: Decimal = Decimal("0.0025"),
     mode: Literal["paper", "live"] = "paper",
     allow_live_trading: bool = False,
+    checkpoint_path: str | Path | None = None,
+    stop_at: pd.Timestamp | None = None,
+    resume: bool = False,
     now: Callable[[], pd.Timestamp] = _utc_timestamp,
     sleep: Callable[[float], None] = time.sleep,
 ) -> list[dict[str, object]]:
     """Run the bounded selection/rebalance/flatten session.
 
     A delayed GitHub Actions start of more than ten minutes after a planned
-    selection fails closed before submitting any stale order. ``live`` is
-    deliberately unavailable unless ``allow_live_trading`` is explicit.
+    selection fails closed before submitting any stale order. ``resume`` is
+    the 24/7 handoff mode: completed events and selected weights are restored
+    from ``checkpoint_path``, while missed events are recorded as skipped
+    rather than submitted late. ``live`` is deliberately unavailable unless
+    ``allow_live_trading`` is explicit.
     """
     if mode == "live" and not allow_live_trading:
         raise ValueError("live mode requires allow_live_trading=True")
@@ -144,10 +224,40 @@ def run_hourly_paper_session(
     symbols = universe[symbol_column].dropna().astype(str).str.upper().drop_duplicates().to_list()
     universe.to_csv(output / "current_sp500_universe.csv", index=False)
     client = AlpacaTradingClient.from_environment(mode=mode)
+    checkpoint_file = Path(checkpoint_path) if checkpoint_path is not None else None
+    checkpoint = _load_checkpoint(checkpoint_file, session_day) if checkpoint_file is not None else _default_checkpoint(session_day)
+    completed_events = set(str(item) for item in checkpoint["completed_events"])
     bars: pd.DataFrame | None = None
-    targets_by_start: dict[pd.Timestamp, dict[str, Decimal]] = {}
-    forecast_details: dict[pd.Timestamp, dict[str, object]] = {}
-    ledger: list[dict[str, object]] = []
+    targets_by_start = _restore_targets(checkpoint)
+    forecast_details = {
+        _utc_timestamp(pd.Timestamp(target_start)): dict(details)
+        for target_start, details in checkpoint["forecast_details"].items()
+        if isinstance(details, dict)
+    }
+    ledger: list[dict[str, object]] = [dict(item) for item in checkpoint["ledger"] if isinstance(item, dict)]
+
+    def persist() -> None:
+        _persist_checkpoint(
+            checkpoint_file,
+            checkpoint,
+            completed_events=completed_events,
+            targets_by_start=targets_by_start,
+            forecast_details=forecast_details,
+            ledger=ledger,
+        )
+        _write_json(output / "hourly_paper_session_ledger.json", ledger)
+
+    def skip(event: SessionEvent, reason: str, observed_at: pd.Timestamp) -> None:
+        completed_events.add(_event_key(event))
+        ledger.append({
+            "event": "skipped_stale_hourly_event",
+            "scheduled_at": event.due_at.isoformat(),
+            "observed_at": observed_at.isoformat(),
+            "kind": event.kind,
+            "target_start": event.target_start.isoformat() if event.target_start is not None else None,
+            "reason": reason,
+        })
+        persist()
     # The full S&P one-minute history is the expensive operation.  Start it
     # before the first 09:20 forecast, then fetch only the new minutes at each
     # later forecast.  This keeps the 10:30 paper entry timely without looking
@@ -156,23 +266,35 @@ def run_hourly_paper_session(
     first_selection = events[0].selection_at
     assert first_selection is not None
     prefetch_now = now()
-    if prefetch_now < first_selection:
+    if prefetch_now < first_selection and (stop_at is None or first_selection <= stop_at):
         bars = download_minute_bars(symbols, history_start, prefetch_now + timedelta(minutes=1))
 
     for event in events:
+        event_id = _event_key(event)
+        if event_id in completed_events:
+            continue
+        if stop_at is not None and now() < event.due_at and event.due_at > stop_at:
+            break
         while now() < event.due_at:
             sleep(min(30.0, float((event.due_at - now()).total_seconds())))
         observed_at = now()
+        if stop_at is not None and observed_at > stop_at:
+            break
+        if event.kind != "flatten" and observed_at > event.due_at + MAX_START_LAG:
+            if resume:
+                skip(event, "runner_reached_event_after_maximum_start_lag", observed_at)
+                continue
+            raise RuntimeError(
+                f"{event.kind} at {event.due_at.isoformat()} is too late: runner reached it at {observed_at.isoformat()}"
+            )
         if event.kind == "select":
             assert event.selection_at is not None
             assert event.target_start is not None
-            if observed_at > event.due_at + MAX_START_LAG:
-                raise RuntimeError(
-                    f"forecast selection at {event.selection_at.isoformat()} is too late for the planned entry: "
-                    f"runner reached it at {observed_at.isoformat()}"
-                )
             bars = _history_through(bars, symbols, start=history_start, decision_at=event.selection_at)
             if now() > event.due_at + MAX_START_LAG:
+                if resume:
+                    skip(event, "history_was_not_available_before_maximum_start_lag", now())
+                    continue
                 raise RuntimeError(
                     f"history for {event.selection_at.isoformat()} was not available in time; "
                     "refusing a stale forecast"
@@ -215,15 +337,14 @@ def run_hourly_paper_session(
                     **forecast_details[event.target_start],
                 }
             )
+            completed_events.add(event_id)
         elif event.kind == "rebalance":
             assert event.selection_at is not None
             assert event.target_start is not None
-            if observed_at > event.due_at + MAX_START_LAG:
-                raise RuntimeError(
-                    f"portfolio rebalance for {event.target_start.isoformat()} is too late: "
-                    f"runner reached it at {observed_at.isoformat()}"
-                )
             if event.target_start not in targets_by_start:
+                if resume:
+                    skip(event, "selected_target_was_not_available_after_handoff", observed_at)
+                    continue
                 raise RuntimeError(f"missing active target for {event.due_at.isoformat()}")
             report = run_rebalance(
                 client,
@@ -242,6 +363,7 @@ def run_hourly_paper_session(
                     "paper_rebalance": report,
                 }
             )
+            completed_events.add(event_id)
         else:
             report = run_end_of_day_flatten(client, execute=True)
             ledger.append(
@@ -252,7 +374,8 @@ def run_hourly_paper_session(
                     "paper_rebalance": report,
                 }
             )
-        _write_json(output / "hourly_paper_session_ledger.json", ledger)
+            completed_events.add(event_id)
+        persist()
     return ledger
 
 

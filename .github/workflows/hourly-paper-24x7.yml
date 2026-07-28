@@ -1,0 +1,97 @@
+name: 24/7 hourly paper runner
+
+# A paper-only, self-handing runner. Each invocation stays below GitHub's
+# six-hour ceiling, persists the resumable hourly state, then queues its
+# successor. The watchdog is only a recovery safety net.
+on:
+  workflow_dispatch:
+    inputs:
+      run_seconds:
+        description: "Continuous paper-runner slice; 20700 seconds is 5h45m."
+        type: string
+        default: "20700"
+
+permissions:
+  contents: write
+  actions: write
+
+concurrency:
+  group: cufolio-hourly-paper-24x7-singleton
+  cancel-in-progress: false
+
+jobs:
+  paper-runner:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    env:
+      PYTHONPATH: ${{ github.workspace }}/src
+      ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
+      ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
+      RUN_SECONDS: ${{ inputs.run_seconds || '20700' }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install hourly paper-runner dependencies
+        run: pip install -r requirements.txt
+
+      - name: Verify resumable one-hour paper cadence
+        run: pytest -q tests/test_hourly_paper_session.py tests/test_hourly_intraday_backtest.py
+
+      - name: Run paper-only hourly session handoff slice
+        run: |
+          set -euo pipefail
+          test -n "$ALPACA_API_KEY"
+          test -n "$ALPACA_SECRET_KEY"
+          python -m cufolio_cpu.hourly_paper_daemon \
+            --run-seconds "$RUN_SECONDS" \
+            --state var/hourly_paper_24x7_state.json \
+            --history-start 2026-06-01T13:30:00Z \
+            --output-dir artifacts/hourly_paper_24x7 \
+            --top-n 20 \
+            --max-weight 0.10
+
+      - name: Persist hourly paper handoff state
+        if: always()
+        run: |
+          set -euo pipefail
+          test ! -f var/hourly_paper_24x7_state.json || git add -f var/hourly_paper_24x7_state.json
+          if git diff --cached --quiet; then
+            exit 0
+          fi
+          git config user.name "cufolio hourly paper runner"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "chore: checkpoint hourly paper session [skip ci]"
+          for attempt in 1 2 3; do
+            if git pull --rebase --autostash origin main && git push origin HEAD:main; then
+              exit 0
+            fi
+            git rebase --abort 2>/dev/null || true
+            sleep "$attempt"
+          done
+          echo "::error::Unable to publish hourly paper handoff state."
+          exit 1
+
+      - name: Queue the next 5h45m paper handoff
+        if: success()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh workflow run hourly-paper-24x7.yml --repo "$GITHUB_REPOSITORY" --ref main -f run_seconds=20700
+          echo "HOURLY PAPER HANDOFF QUEUED | paper-only next 5h45m slice."
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: hourly-paper-24x7-${{ github.run_id }}
+          path: |
+            var/hourly_paper_24x7_state.json
+            artifacts/hourly_paper_24x7/
+          if-no-files-found: warn
+          retention-days: 30
