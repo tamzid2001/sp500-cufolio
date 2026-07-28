@@ -1,0 +1,67 @@
+name: Manual hourly live session
+
+on:
+  workflow_dispatch:
+    inputs:
+      session_date:
+        description: "New York market session date, YYYY-MM-DD"
+        required: true
+        type: string
+      history_start:
+        description: "UTC start for completed one-hour training outcomes"
+        required: true
+        type: string
+      live_confirmation:
+        description: "Type SUBMIT_LIVE_ORDERS to allow live Alpaca orders"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cufolio-live-session-singleton
+  cancel-in-progress: false
+
+jobs:
+  live-session:
+    if: ${{ inputs.live_confirmation == 'SUBMIT_LIVE_ORDERS' }}
+    # Configure this environment in GitHub with required reviewers and the two
+    # ALPACA_LIVE_* secrets. It is intentionally manual-only: no cron trigger.
+    environment: live-trading
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    env:
+      PYTHONPATH: ${{ github.workspace }}/src
+      ALPACA_LIVE_API_KEY: ${{ secrets.ALPACA_LIVE_API_KEY }}
+      ALPACA_LIVE_SECRET_KEY: ${{ secrets.ALPACA_LIVE_SECRET_KEY }}
+      # Historical minute bars use the same separately scoped live account key.
+      ALPACA_API_KEY: ${{ secrets.ALPACA_LIVE_API_KEY }}
+      ALPACA_SECRET_KEY: ${{ secrets.ALPACA_LIVE_SECRET_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Verify explicit live authorization and credentials
+        run: |
+          test "${{ inputs.live_confirmation }}" = "SUBMIT_LIVE_ORDERS"
+          test -n "$ALPACA_LIVE_API_KEY"
+          test -n "$ALPACA_LIVE_SECRET_KEY"
+      - name: Run live hourly session
+        run: |
+          python -m cufolio_cpu.hourly_paper_session \
+            --session-date "${{ inputs.session_date }}" \
+            --history-start "${{ inputs.history_start }}" \
+            --output-dir artifacts/manual_hourly_live_session \
+            --mode live \
+            --allow-live-trading
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: manual-hourly-live-session-ledger
+          path: artifacts/manual_hourly_live_session
+          if-no-files-found: warn
