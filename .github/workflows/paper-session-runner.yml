@@ -1,4 +1,4 @@
-name: Paper market-session runner
+name: Disabled legacy daily paper-session runner
 
 on:
   workflow_dispatch:
@@ -19,6 +19,10 @@ concurrency:
 
 jobs:
   trade:
+    # Replaced by the bounded hourly causal paper session.  Keeping this
+    # workflow inert prevents an accidental second strategy from trading the
+    # same paper account.
+    if: ${{ false }}
     runs-on: ubuntu-latest
     timeout-minutes: 360
     env:
