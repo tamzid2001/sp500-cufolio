@@ -9,6 +9,7 @@ from cufolio_cpu.hourly_intraday_backtest import (
     NEW_YORK,
     _quarter_hour_returns,
     build_one_hour_return_panel,
+    generate_to_close_candidate,
     generate_hourly_one_hour_candidate,
     run_hourly_one_hour_backtest,
 )
@@ -98,9 +99,34 @@ def test_candidate_uses_only_completed_labels_and_needs_no_future_execution_pric
 
     assert candidate.status["weights_generated"] is True
     assert candidate.status["target_end"] == "2026-01-16T16:30:00+00:00"
+    assert candidate.status["required_candidates_for_weight_cap"] == 2
     assert pd.Timestamp(candidate.status["training_end"]) < decision
     assert np.isclose(candidate.weights["target_weight"].sum(), 1.0)
+    assert (candidate.weights["target_weight"] > 0).all()
     assert (candidate.weights["target_weight"] <= 0.50 + 1e-12).all()
+
+
+def test_same_clock_time_candidate_can_target_a_shortened_session_close_window() -> None:
+    bars = _minute_bars()
+    decision = pd.Timestamp("2026-01-16T19:40:00Z")  # 14:40 New York
+    target_end = pd.Timestamp("2026-01-16T20:30:00Z")  # 15:30 New York
+    observed = bars[pd.to_datetime(bars["timestamp"], utc=True) <= decision].copy()
+
+    candidate = generate_to_close_candidate(
+        observed,
+        decision_at=decision,
+        target_end_at=target_end,
+        top_n=3,
+        lookback_scenarios=30,
+        min_training_scenarios=5,
+        max_weight=0.50,
+    )
+
+    assert candidate.status["weights_generated"] is True
+    assert candidate.status["target_horizon_minutes"] == 50
+    assert pd.Timestamp(candidate.status["training_end"]) < decision
+    assert np.isclose(candidate.weights["target_weight"].sum(), 1.0)
+    assert (candidate.weights["target_weight"] > 0).all()
 
 
 def test_candidate_can_forecast_a_one_hour_window_seventy_minutes_before_its_start() -> None:

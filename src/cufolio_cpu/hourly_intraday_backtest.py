@@ -17,7 +17,7 @@ from __future__ import annotations
 import argparse
 import json
 from dataclasses import dataclass
-from datetime import timedelta
+from datetime import time as clock_time, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -34,6 +34,9 @@ REBALANCE_MINUTES = 15
 HOLDING_DELTA = timedelta(minutes=60)
 REBALANCE_DELTA = timedelta(minutes=15)
 HOURLY_SELECTION_STEPS = range(6)
+# Paper-target files reject zero weights. Optimizer tolerance can otherwise
+# leave an economically empty numerical remainder in a selected position.
+MIN_EMITTABLE_TARGET_WEIGHT = 1e-6
 
 
 @dataclass(frozen=True)
@@ -174,6 +177,7 @@ def _target_weights(
     """Select an allocation using only labels completed strictly before a decision."""
     training = hourly_returns.loc[target_ends.reindex(hourly_returns.index) < decision_at]
     training = training.tail(lookback_scenarios)
+    required_candidates = int(np.ceil((1 - 1e-12) / max_weight))
     eligible = training.columns[
         (training.notna().sum(axis=0) >= min_training_scenarios)
         & training.columns.isin(current_prices.index)
@@ -181,7 +185,10 @@ def _target_weights(
     diagnostic: dict[str, object] = {
         "decision_timestamp": decision_at.isoformat(),
         "training_rows_before_complete_case": int(len(training)),
+        "input_assets": int(len(training.columns)),
+        "assets_with_decision_price": int(len(current_prices)),
         "eligible_assets": int(len(eligible)),
+        "required_candidates_for_weight_cap": required_candidates,
     }
     if len(eligible) < 2:
         diagnostic.update(
@@ -214,6 +221,7 @@ def _target_weights(
             "training_rows": int(len(scenarios)),
             "training_end": target_ends.loc[scenarios.index].max().isoformat() if not scenarios.empty else None,
             "candidate_count": int(len(candidates)),
+            "candidate_weight_capacity": float(max_weight * len(candidates)),
         }
     )
     if len(scenarios) < min_training_scenarios or scenarios.shape[1] < 2:
@@ -229,6 +237,7 @@ def _target_weights(
     # hard bound.  Restore feasibility without changing the optimizer's
     # ranking: clip, then distribute the residual only to available capacity.
     weights = allocation.weights.clip(lower=0.0, upper=max_weight)
+    weights.loc[weights < MIN_EMITTABLE_TARGET_WEIGHT] = 0.0
     residual = float(1 - weights.sum())
     while abs(residual) > 1e-12:
         if residual > 0:
@@ -245,6 +254,7 @@ def _target_weights(
             reduction = min((-residual) / len(donors), float(donors.min()))
             weights.loc[donors.index] -= reduction
         residual = float(1 - weights.sum())
+    weights = weights.loc[weights > 0].copy()
     diagnostic.update(
         {
             "reason": "ok",
@@ -349,6 +359,102 @@ def generate_hourly_one_hour_candidate(
         }
     )
     return HourlyCandidateResult(candidate, status)
+
+
+def generate_to_close_candidate(
+    minute_bars: pd.DataFrame,
+    *,
+    decision_at: str | pd.Timestamp,
+    target_end_at: str | pd.Timestamp,
+    top_n: int = 20,
+    lookback_scenarios: int = 120,
+    min_training_scenarios: int = 20,
+    max_weight: float = 0.10,
+    risk_aversion: float = 10.0,
+) -> HourlyCandidateResult:
+    """Generate a causal same-time-of-day portfolio held through ``target_end_at``.
+
+    This is used for an explicitly requested one-time shortened session-close
+    paper run.  Each historical label begins at the same New York clock minute
+    as ``decision_at`` and ends at the same clock minute as ``target_end_at``;
+    neither current-session target prices nor filled-in prices may enter the
+    allocation.
+    """
+    if top_n < 2:
+        raise ValueError("top_n must be at least two")
+    if lookback_scenarios < min_training_scenarios:
+        raise ValueError("lookback_scenarios must be at least min_training_scenarios")
+    if min_training_scenarios < 5:
+        raise ValueError("min_training_scenarios must be at least five")
+    if not 0 < max_weight <= 1:
+        raise ValueError("max_weight must be in (0, 1]")
+
+    decision = pd.Timestamp(decision_at)
+    target_end = pd.Timestamp(target_end_at)
+    if decision.tzinfo is None or target_end.tzinfo is None:
+        raise ValueError("decision_at and target_end_at must include UTC offsets")
+    decision, target_end = decision.tz_convert("UTC"), target_end.tz_convert("UTC")
+    if target_end <= decision:
+        raise ValueError("target_end_at must be later than decision_at")
+    decision_local, target_local = decision.tz_convert(NEW_YORK), target_end.tz_convert(NEW_YORK)
+    if decision_local.date() != target_local.date() or target_local.time() > clock_time(16):
+        raise ValueError("decision and target end must be in the same New York regular session")
+
+    clean = _regular_session_minute_closes(minute_bars)
+    closes = clean.pivot(index="timestamp", columns="symbol", values="close").sort_index()
+    rows: list[pd.Series] = []
+    ends: dict[pd.Timestamp, pd.Timestamp] = {}
+    for session_date in pd.DatetimeIndex(sorted(clean["session_date"].unique())):
+        local_day = pd.Timestamp(session_date).date()
+        start = pd.Timestamp.combine(local_day, decision_local.time()).tz_localize(NEW_YORK).tz_convert("UTC")
+        end = pd.Timestamp.combine(local_day, target_local.time()).tz_localize(NEW_YORK).tz_convert("UTC")
+        if end <= start:
+            continue
+        row = np.log(closes.reindex([end]).iloc[0] / closes.reindex([start]).iloc[0])
+        row.name = start
+        rows.append(row)
+        ends[start] = end
+    if not rows:
+        raise ValueError("no same-session decision-to-close windows are available")
+    returns = pd.DataFrame(rows).sort_index()
+    target_ends = pd.Series(ends, name="target_end")
+    current_prices = _exact_minute_prices(minute_bars, decision)
+    weights, diagnostic = _target_weights(
+        returns,
+        target_ends,
+        decision_at=decision,
+        current_prices=current_prices,
+        top_n=top_n,
+        lookback_scenarios=lookback_scenarios,
+        min_training_scenarios=min_training_scenarios,
+        max_weight=max_weight,
+        risk_aversion=risk_aversion,
+    )
+    horizon_minutes = int((target_end - decision).total_seconds() // 60)
+    status: dict[str, object] = {
+        "research_only": True,
+        "bar_interval": "1m",
+        "decision_timestamp": decision.isoformat(),
+        "target_end": target_end.isoformat(),
+        "target_horizon_minutes": horizon_minutes,
+        "weights_generated": weights is not None,
+        "causality_rule": "each same-clock-time training target_end is strictly earlier than its decision timestamp",
+        "data_quality_rule": "the exact decision and target endpoint closes must exist; no forward fill or zero-return substitution",
+        **diagnostic,
+    }
+    if weights is None:
+        return HourlyCandidateResult(pd.DataFrame(columns=["decision_timestamp", "target_end", "symbol", "target_weight"]), status)
+    return HourlyCandidateResult(
+        pd.DataFrame(
+            {
+                "decision_timestamp": decision,
+                "target_end": target_end,
+                "symbol": weights.index,
+                "target_weight": weights.to_numpy(dtype=float),
+            }
+        ),
+        status,
+    )
 
 
 def run_hourly_one_hour_backtest(
