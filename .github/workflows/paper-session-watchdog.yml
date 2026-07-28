@@ -24,24 +24,45 @@ jobs:
         run: |
           set -euo pipefail
           runs="$(gh run list --repo "$REPOSITORY" --workflow 'hourly-paper-24x7.yml' --limit 20 --json status,conclusion,updatedAt)"
-          RUNS="$runs" python - <<'PY'
-          import json, os, sys
+          decision="$(RUNS="$runs" python - <<'PY'
+          import json, os
           from datetime import datetime, timezone
 
           runs = json.loads(os.environ["RUNS"])
           active = {"queued", "in_progress", "pending", "requested", "waiting"}
           if any(run["status"] in active for run in runs):
-              print("WATCHDOG OK | 24/7 hourly paper runner is active or queued.")
-              raise SystemExit(0)
-          if runs:
+              print("ok")
+          elif runs:
               latest = max(runs, key=lambda run: run["updatedAt"])
               if latest["conclusion"] == "success":
                   completed = datetime.fromisoformat(latest["updatedAt"].replace("Z", "+00:00"))
                   age = (datetime.now(timezone.utc) - completed).total_seconds()
                   if age < 600:
-                      print(f"WATCHDOG WAIT | last runner succeeded {age:.0f}s ago; allowing normal handoff.")
-                      raise SystemExit(0)
-          print("WATCHDOG RECOVERY REQUIRED | no active 24/7 hourly paper runner.")
+                      print("wait")
+                  else:
+                      print("recover")
+              else:
+                  print("recover")
+          else:
+              print("recover")
           PY
+          )"
+          case "$decision" in
+            ok)
+              echo "WATCHDOG OK | 24/7 hourly paper runner is active or queued."
+              exit 0
+              ;;
+            wait)
+              echo "WATCHDOG WAIT | last runner succeeded recently; allowing normal handoff."
+              exit 0
+              ;;
+            recover)
+              echo "WATCHDOG RECOVERY REQUIRED | no active 24/7 hourly paper runner."
+              ;;
+            *)
+              echo "::error::Watchdog produced an invalid decision: $decision"
+              exit 1
+              ;;
+          esac
           gh workflow run hourly-paper-24x7.yml --repo "$REPOSITORY" --ref main -f run_seconds=20700
           echo "WATCHDOG DISPATCHED | 24/7 hourly paper runner recovery queued."
