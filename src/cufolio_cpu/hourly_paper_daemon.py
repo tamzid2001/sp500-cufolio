@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import argparse
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, time as clock_time, timedelta
 from decimal import Decimal
 from pathlib import Path
 
@@ -19,19 +19,36 @@ import pandas as pd
 from .hourly_intraday_backtest import NEW_YORK
 from .hourly_paper_session import run_hourly_paper_session
 
+DEFAULT_HISTORY_CALENDAR_DAYS = 45
+
 
 def utc_now() -> pd.Timestamp:
     return pd.Timestamp(datetime.now(tz=NEW_YORK)).tz_convert("UTC")
+
+
+def rolling_history_start(reference: pd.Timestamp, *, calendar_days: int) -> str:
+    """Return a compact pre-market start with enough one-hour scenarios.
+
+    Each complete session supplies six labels, so 45 calendar days normally
+    gives about 30 sessions: materially more than the 20 sessions needed for
+    the 120-observation trailing fit, with room for holidays and sparse names.
+    """
+    if calendar_days < 35:
+        raise ValueError("history_calendar_days must be at least 35")
+    local_day = reference.tz_convert(NEW_YORK).date() - timedelta(days=calendar_days)
+    return pd.Timestamp.combine(local_day, clock_time(9, 20)).tz_localize(NEW_YORK).tz_convert("UTC").isoformat()
 
 
 def run_hourly_paper_daemon(
     *,
     run_seconds: int,
     state_path: str | Path,
-    history_start: str,
     output_dir: str | Path,
     top_n: int,
     max_weight: str,
+    history_start: str | None = None,
+    history_calendar_days: int = DEFAULT_HISTORY_CALENDAR_DAYS,
+    minute_cache_path: str | Path = "var/hourly_paper_24x7_minute_endpoints.csv.gz",
 ) -> None:
     """Keep an hourly paper session alive until this handoff slice expires."""
 
@@ -47,13 +64,17 @@ def run_hourly_paper_daemon(
         # before the first forecast.  After 15:30 or on weekends we only idle.
         if new_york.weekday() < 5 and new_york.time().isoformat() < "15:30:00":
             try:
+                session_history_start = history_start or rolling_history_start(
+                    now, calendar_days=history_calendar_days,
+                )
                 run_hourly_paper_session(
                     session_day=new_york.date(),
-                    history_start=history_start,
+                    history_start=session_history_start,
                     output_dir=output,
                     top_n=top_n,
                     max_weight=Decimal(max_weight),
                     checkpoint_path=state,
+                    minute_cache_path=minute_cache_path,
                     stop_at=now + timedelta(seconds=max(0, deadline - time.monotonic() - 30)),
                     resume=True,
                 )
@@ -68,7 +89,12 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Run a 24/7 handoff slice of the hourly paper portfolio session.")
     parser.add_argument("--run-seconds", type=int, default=20700)
     parser.add_argument("--state", default="var/hourly_paper_24x7_state.json")
-    parser.add_argument("--history-start", default="2026-06-01T13:30:00Z")
+    parser.add_argument("--minute-cache", default="var/hourly_paper_24x7_minute_endpoints.csv.gz")
+    parser.add_argument(
+        "--history-start",
+        help="optional fixed UTC bootstrap start; the default is a rolling 45-calendar-day window",
+    )
+    parser.add_argument("--history-calendar-days", type=int, default=DEFAULT_HISTORY_CALENDAR_DAYS)
     parser.add_argument("--output-dir", default="artifacts/hourly_paper_24x7")
     parser.add_argument("--top-n", type=int, default=20)
     parser.add_argument("--max-weight", default="0.10")
@@ -76,10 +102,12 @@ def main() -> None:
     run_hourly_paper_daemon(
         run_seconds=args.run_seconds,
         state_path=args.state,
-        history_start=args.history_start,
+        minute_cache_path=args.minute_cache,
         output_dir=args.output_dir,
         top_n=args.top_n,
         max_weight=args.max_weight,
+        history_start=args.history_start,
+        history_calendar_days=args.history_calendar_days,
     )
 
 

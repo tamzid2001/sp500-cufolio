@@ -38,6 +38,15 @@ jobs:
           python-version: "3.12"
           cache: pip
 
+      - name: Restore rolling minute-endpoint cache
+        id: minute_cache_restore
+        uses: actions/cache/restore@v4
+        with:
+          path: var/hourly_paper_24x7_minute_endpoints.csv.gz
+          key: hourly-paper-minute-endpoints-${{ github.run_id }}
+          restore-keys: |
+            hourly-paper-minute-endpoints-
+
       - name: Install hourly paper-runner dependencies
         run: pip install -r requirements.txt
 
@@ -52,7 +61,8 @@ jobs:
           python -m cufolio_cpu.hourly_paper_daemon \
             --run-seconds "$RUN_SECONDS" \
             --state var/hourly_paper_24x7_state.json \
-            --history-start 2026-06-01T13:30:00Z \
+            --minute-cache var/hourly_paper_24x7_minute_endpoints.csv.gz \
+            --history-calendar-days 45 \
             --output-dir artifacts/hourly_paper_24x7 \
             --top-n 20 \
             --max-weight 0.10
@@ -78,6 +88,23 @@ jobs:
           echo "::error::Unable to publish hourly paper handoff state."
           exit 1
 
+      - name: Check minute cache for handoff
+        if: always()
+        id: minute_cache_present
+        run: |
+          if test -f var/hourly_paper_24x7_minute_endpoints.csv.gz; then
+            echo "save=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "save=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Save rolling minute-endpoint cache
+        if: always() && steps.minute_cache_present.outputs.save == 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: var/hourly_paper_24x7_minute_endpoints.csv.gz
+          key: hourly-paper-minute-endpoints-${{ github.run_id }}
+
       - name: Queue the next 5h45m paper handoff
         if: success()
         env:
@@ -92,6 +119,7 @@ jobs:
           name: hourly-paper-24x7-${{ github.run_id }}
           path: |
             var/hourly_paper_24x7_state.json
+            var/hourly_paper_24x7_minute_endpoints.csv.gz
             artifacts/hourly_paper_24x7/
           if-no-files-found: warn
           retention-days: 30
