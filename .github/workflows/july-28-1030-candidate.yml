@@ -86,6 +86,7 @@ jobs:
         run: |
           python -c 'import json; from pathlib import Path; status = json.loads(Path("artifacts/hourly_1030_candidate/hourly_one_hour_candidate_status.json").read_text()); assert status["weights_generated"], status; assert status["training_end"] < status["decision_timestamp"], status'
       - uses: actions/upload-artifact@v4
+        if: always()
         with:
           name: july-28-1030-hourly-research-candidate
           path: |

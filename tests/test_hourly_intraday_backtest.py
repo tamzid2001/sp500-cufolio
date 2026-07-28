@@ -101,3 +101,27 @@ def test_candidate_uses_only_completed_labels_and_needs_no_future_execution_pric
     assert pd.Timestamp(candidate.status["training_end"]) < decision
     assert np.isclose(candidate.weights["target_weight"].sum(), 1.0)
     assert (candidate.weights["target_weight"] <= 0.50 + 1e-12).all()
+
+
+def test_candidate_keeps_a_complete_top_ranked_subset_when_other_assets_are_sparse() -> None:
+    bars = _minute_bars()
+    # Remove one endpoint for CCC from each historical hourly target.  AAA and
+    # BBB still have a complete sample, so a full-universe complete-case filter
+    # would be too strict while the candidate remains estimable.
+    ccc_hourly_endpoints = pd.to_datetime(bars["timestamp"], utc=True).dt.strftime("%H:%M").eq("15:30")
+    sparse = bars.loc[~((bars["symbol"] == "CCC") & ccc_hourly_endpoints)].copy()
+    decision = pd.Timestamp("2026-01-16 15:30:00+00:00")
+    observed = sparse[pd.to_datetime(sparse["timestamp"], utc=True) <= decision]
+
+    candidate = generate_hourly_one_hour_candidate(
+        observed,
+        decision_at=decision,
+        top_n=3,
+        lookback_scenarios=30,
+        min_training_scenarios=5,
+        max_weight=0.50,
+    )
+
+    assert candidate.status["weights_generated"] is True
+    assert candidate.status["training_rows"] >= 5
+    assert set(candidate.weights["symbol"]).issubset({"AAA", "BBB"})

@@ -156,27 +156,49 @@ def _target_weights(
         (training.notna().sum(axis=0) >= min_training_scenarios)
         & training.columns.isin(current_prices.index)
     ]
-    complete = training.reindex(columns=eligible).dropna(axis=0, how="any")
     diagnostic: dict[str, object] = {
         "decision_timestamp": decision_at.isoformat(),
         "training_rows_before_complete_case": int(len(training)),
-        "training_rows": int(len(complete)),
-        "training_end": (
-            target_ends.loc[complete.index].max().isoformat() if not complete.empty else None
-        ),
         "eligible_assets": int(len(eligible)),
     }
-    if len(complete) < min_training_scenarios or complete.shape[1] < 2:
-        diagnostic["reason"] = "insufficient_completed_one_hour_training_returns"
+    if len(eligible) < 2:
+        diagnostic.update(
+            {
+                "training_rows": 0,
+                "training_end": None,
+                "reason": "insufficient_assets_with_completed_one_hour_training_returns",
+            }
+        )
         return None, diagnostic
-    expected = complete.mean().sort_values(ascending=False)
-    candidates = expected.head(top_n)
+    # A current S&P 500 convenience universe includes changing constituents,
+    # occasional halts, and incomplete data coverage.  Requiring every one of
+    # hundreds of names to share every observation creates an empty sample.
+    # Rank eligible assets on their own completed labels, then greedily retain
+    # only high-ranked names that preserve a complete covariance sample.
+    expected = training.reindex(columns=eligible).mean(skipna=True).sort_values(ascending=False)
+    candidates: list[str] = []
+    common_rows = pd.Series(True, index=training.index)
+    for symbol in expected.index:
+        with_symbol = common_rows & training[symbol].notna()
+        if int(with_symbol.sum()) < min_training_scenarios:
+            continue
+        candidates.append(symbol)
+        common_rows = with_symbol
+        if len(candidates) == top_n:
+            break
+    scenarios = training.loc[common_rows, candidates]
+    diagnostic.update(
+        {
+            "training_rows": int(len(scenarios)),
+            "training_end": target_ends.loc[scenarios.index].max().isoformat() if not scenarios.empty else None,
+            "candidate_count": int(len(candidates)),
+        }
+    )
+    if len(scenarios) < min_training_scenarios or scenarios.shape[1] < 2:
+        diagnostic["reason"] = "insufficient_complete_candidate_scenarios"
+        return None, diagnostic
     if len(candidates) < 2 or max_weight * len(candidates) < 1 - 1e-12:
         diagnostic["reason"] = "insufficient_candidates_for_weight_cap"
-        return None, diagnostic
-    scenarios = complete.reindex(columns=candidates.index).dropna(axis=0, how="any")
-    if len(scenarios) < min_training_scenarios:
-        diagnostic["reason"] = "insufficient_complete_candidate_scenarios"
         return None, diagnostic
     allocation = mean_variance_weights(
         scenarios, risk_aversion=risk_aversion, max_weight=max_weight,
@@ -206,7 +228,6 @@ def _target_weights(
             "reason": "ok",
             "optimizer_status": allocation.status,
             "expected_one_hour_log_return": allocation.expected_return,
-            "candidate_count": int(len(candidates)),
             "training_end": target_ends.loc[scenarios.index].max().isoformat(),
         }
     )
