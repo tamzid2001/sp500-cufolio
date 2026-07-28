@@ -262,6 +262,29 @@ or run the exact same engine against deterministic synthetic data. It uploads
 the hourly selections, 15-minute rebalance ledger, and data-quality status as
 an artifact; it never submits an order.
 
+### Five- and fifteen-minute forecast audits
+
+The manual **Five-minute intraday forecast audit** and **Fifteen-minute
+intraday forecast audit** Actions both download read-only Alpaca IEX one-minute
+history for a completed session. Each creates a fresh long-only, capped
+portfolio at every non-overlapping interval and records the exact next-interval
+return without forward-filling a missing endpoint.
+
+The reports include the complete decision ledger, per-holding prediction and
+realization rows, arithmetic sums of expected versus actual interval returns,
+and the correct compounded session comparison. The forecasts use a pooled
+non-overlapping intraday return estimate with a same-clock-time component
+shrunk toward the pooled mean; they are not trading instructions or a claim of
+future performance.
+
+The hourly runner's 20-session history guard should not be read as a generic
+one-minute-data rule. It is sized for that runner's 120 hourly labels. The
+five-minute audit instead requires at least 10 prior sessions and 500 complete
+non-overlapping interval scenarios; the 15-minute audit requires at least 10
+prior sessions and 200 scenarios. This retains a meaningful covariance sample
+while avoiding the error of treating overlapping one-minute-derived returns as
+independent observations.
+
 ## GitHub Actions
 
 `CPU notebooks` runs on ordinary Ubuntu GitHub-hosted runners. It runs tests,
