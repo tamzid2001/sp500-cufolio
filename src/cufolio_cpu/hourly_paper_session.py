@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import time
 from dataclasses import dataclass
 from datetime import date, datetime, time as clock_time, timedelta
@@ -39,6 +40,20 @@ TARGET_FORECAST_LEADS = (
     (14, FINAL_TARGET_REFRESH_LEAD),
 )
 MAX_START_LAG = timedelta(minutes=10)
+# A 120-scenario fit needs about 20 full sessions (six one-hour outcomes per
+# session). Keep a buffer for holidays, sparse symbols, and the strict
+# complete-case covariance step without retaining every one-minute row.
+MINUTE_CACHE_SESSION_LIMIT = 35
+CACHE_ENDPOINT_TIMES = frozenset(
+    {
+        # Exact decision minutes for the five live forecasts.
+        clock_time(9, 20), clock_time(10, 20), clock_time(11, 20),
+        clock_time(12, 20), clock_time(14, 20),
+        # Exact regular-session endpoints needed for the historical one-hour
+        # label panel: 09:30--10:30 through 14:30--15:30.
+        *(clock_time(hour, 30) for hour in range(9, 16)),
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -91,21 +106,90 @@ def _history_through(
     *,
     start: str,
     decision_at: pd.Timestamp,
+    cache_path: Path | None = None,
 ) -> pd.DataFrame:
-    """Fetch only missing minute bars, through and including decision minute."""
+    """Fetch only missing minute bars, then retain model-required endpoints.
+
+    The Alpaca request must cover a minute range, but the hourly model uses
+    only exact selection and hourly-return endpoints. Persisting this compact
+    projection lets the next five-hour Actions handoff append the newest range
+    instead of re-downloading the complete training history.
+    """
     end = decision_at + timedelta(minutes=1)
+    requested_symbols = {symbol.upper().strip() for symbol in symbols}
     if bars is None or bars.empty:
-        return download_minute_bars(symbols, start, end)
-    existing = bars.copy()
-    existing["timestamp"] = pd.to_datetime(existing["timestamp"], utc=True)
-    latest = existing["timestamp"].max()
-    if latest >= decision_at:
-        return existing
-    incremental = download_minute_bars(symbols, latest + timedelta(minutes=1), end)
-    if incremental.empty:
-        return existing
-    combined = pd.concat([existing, incremental], ignore_index=True)
-    return combined.drop_duplicates(["symbol", "timestamp"], keep="last").sort_values(["symbol", "timestamp"])
+        combined = download_minute_bars(symbols, start, end)
+    else:
+        existing = _minute_cache_projection(bars)
+        # A constituent can change between sessions.  Never allow a cached
+        # former constituent to enter today's optimizer or order target.
+        existing = existing.loc[existing["symbol"].isin(requested_symbols)].copy()
+        if existing.empty:
+            combined = download_minute_bars(symbols, start, end)
+        else:
+            latest = existing["timestamp"].max()
+            if latest >= decision_at:
+                combined = existing
+            else:
+                latest_local_day = latest.tz_convert(NEW_YORK).date()
+                decision_local_day = decision_at.tz_convert(NEW_YORK).date()
+                # Do not refill the overnight gap on a new session: historical
+                # labels are already cached and this decision needs only today's
+                # exact observation.  Within a session, overlap the final minute
+                # so a partial response is repaired and deduplication retains the
+                # newest authoritative close.
+                fetch_start = decision_at if latest_local_day < decision_local_day else latest
+                incremental = download_minute_bars(symbols, fetch_start, end)
+                combined = pd.concat([existing, incremental], ignore_index=True) if not incremental.empty else existing
+    compact = _minute_cache_projection(combined)
+    if cache_path is not None:
+        _write_minute_cache(cache_path, compact)
+    return compact
+
+
+def _minute_cache_projection(bars: pd.DataFrame) -> pd.DataFrame:
+    """Normalize, endpoint-filter, deduplicate, and bound a minute cache."""
+    required = {"timestamp", "symbol", "close"}
+    if missing := required.difference(bars.columns):
+        raise ValueError(f"minute-bar cache is missing columns: {sorted(missing)}")
+    compact = bars.loc[:, ["timestamp", "symbol", "close"]].copy()
+    compact["timestamp"] = pd.to_datetime(compact["timestamp"], utc=True, errors="coerce")
+    compact["symbol"] = compact["symbol"].astype(str).str.upper().str.strip()
+    compact["close"] = pd.to_numeric(compact["close"], errors="coerce")
+    compact = compact.dropna(subset=["timestamp", "close"])
+    compact = compact[(compact["symbol"] != "") & (compact["close"] > 0)]
+    local = compact["timestamp"].dt.tz_convert(NEW_YORK)
+    compact = compact.loc[local.dt.time.isin(CACHE_ENDPOINT_TIMES)].copy()
+    if compact.empty:
+        return pd.DataFrame(columns=["timestamp", "symbol", "close"])
+    local_dates = local.loc[compact.index].dt.tz_localize(None).dt.normalize()
+    retained_dates = sorted(local_dates.unique())[-MINUTE_CACHE_SESSION_LIMIT:]
+    compact = compact.loc[local_dates.isin(retained_dates)]
+    return compact.drop_duplicates(["symbol", "timestamp"], keep="last").sort_values(["symbol", "timestamp"]).reset_index(drop=True)
+
+
+def _read_minute_cache(path: Path) -> pd.DataFrame:
+    if not path.exists():
+        return pd.DataFrame(columns=["timestamp", "symbol", "close"])
+    try:
+        return _minute_cache_projection(pd.read_csv(path, compression="gzip"))
+    except (EOFError, OSError, UnicodeDecodeError, ValueError, pd.errors.EmptyDataError, pd.errors.ParserError) as error:
+        # A cache is an optimization only. A malformed or partial cache must
+        # never become model input; the next selection will refetch safely.
+        print(f"MINUTE CACHE IGNORED | path={path} reason={error}", flush=True)
+        return pd.DataFrame(columns=["timestamp", "symbol", "close"])
+
+
+def _write_minute_cache(path: Path, bars: pd.DataFrame) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.tmp")
+    _minute_cache_projection(bars).to_csv(temporary, index=False, compression="gzip")
+    os.replace(temporary, path)
+    print(
+        f"MINUTE CACHE SAVED | path={path} rows={len(bars):,} "
+        f"latest={bars['timestamp'].max().isoformat() if not bars.empty else 'none'}",
+        flush=True,
+    )
 
 
 def _write_json(path: Path, value: object) -> None:
@@ -201,6 +285,7 @@ def run_hourly_paper_session(
     mode: Literal["paper", "live"] = "paper",
     allow_live_trading: bool = False,
     checkpoint_path: str | Path | None = None,
+    minute_cache_path: str | Path | None = None,
     stop_at: pd.Timestamp | None = None,
     resume: bool = False,
     now: Callable[[], pd.Timestamp] = _utc_timestamp,
@@ -227,7 +312,8 @@ def run_hourly_paper_session(
     checkpoint_file = Path(checkpoint_path) if checkpoint_path is not None else None
     checkpoint = _load_checkpoint(checkpoint_file, session_day) if checkpoint_file is not None else _default_checkpoint(session_day)
     completed_events = set(str(item) for item in checkpoint["completed_events"])
-    bars: pd.DataFrame | None = None
+    minute_cache_file = Path(minute_cache_path) if minute_cache_path is not None else None
+    bars: pd.DataFrame | None = _read_minute_cache(minute_cache_file) if minute_cache_file is not None else None
     targets_by_start = _restore_targets(checkpoint)
     forecast_details = {
         _utc_timestamp(pd.Timestamp(target_start)): dict(details)
@@ -266,8 +352,21 @@ def run_hourly_paper_session(
     first_selection = events[0].selection_at
     assert first_selection is not None
     prefetch_now = now()
-    if prefetch_now < first_selection and (stop_at is None or first_selection <= stop_at):
-        bars = download_minute_bars(symbols, history_start, prefetch_now + timedelta(minutes=1))
+    if (
+        (bars is None or bars.empty)
+        and prefetch_now < first_selection
+        and (stop_at is None or first_selection <= stop_at)
+    ):
+        # The first ever run must build the trailing history.  Later 5h45m
+        # handoffs restore the compact cache and deliberately do no overnight
+        # re-download before the 09:20 selection minute is available.
+        bars = _history_through(
+            bars,
+            symbols,
+            start=history_start,
+            decision_at=prefetch_now,
+            cache_path=minute_cache_file,
+        )
 
     for event in events:
         event_id = _event_key(event)
@@ -290,7 +389,13 @@ def run_hourly_paper_session(
         if event.kind == "select":
             assert event.selection_at is not None
             assert event.target_start is not None
-            bars = _history_through(bars, symbols, start=history_start, decision_at=event.selection_at)
+            bars = _history_through(
+                bars,
+                symbols,
+                start=history_start,
+                decision_at=event.selection_at,
+                cache_path=minute_cache_file,
+            )
             if now() > event.due_at + MAX_START_LAG:
                 if resume:
                     skip(event, "history_was_not_available_before_maximum_start_lag", now())
@@ -366,6 +471,16 @@ def run_hourly_paper_session(
             completed_events.add(event_id)
         else:
             report = run_end_of_day_flatten(client, execute=True)
+            # Capture the final 14:30 and 15:30 label endpoints after the
+            # close.  They are never used by an earlier forecast, but make
+            # tomorrow's trailing one-hour panel as current as possible.
+            bars = _history_through(
+                bars,
+                symbols,
+                start=history_start,
+                decision_at=event.due_at,
+                cache_path=minute_cache_file,
+            )
             ledger.append(
                 {
                     "event": "final_paper_flatten",
