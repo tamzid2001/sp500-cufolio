@@ -41,6 +41,9 @@ TARGET_FORECAST_LEADS = (
 )
 MAX_START_LAG = timedelta(minutes=10)
 WAIT_HEARTBEAT_INTERVAL = timedelta(minutes=5)
+EVENT_PRIORITY_GUARD = timedelta(seconds=90)
+LIVE_MINUTE_CACHE_START = clock_time(9, 20)
+LIVE_MINUTE_CACHE_END = clock_time(15, 30)
 # A 120-scenario fit needs about 20 full sessions (six one-hour outcomes per
 # session). Keep a buffer for holidays, sparse symbols, and the strict
 # complete-case covariance step without retaining every one-minute row.
@@ -132,12 +135,11 @@ def _history_through(
     decision_at: pd.Timestamp,
     cache_path: Path | None = None,
 ) -> pd.DataFrame:
-    """Fetch only missing minute bars, then retain model-required endpoints.
+    """Fetch only missing minute bars and merge them into the durable cache.
 
-    The Alpaca request must cover a minute range, but the hourly model uses
-    only exact selection and hourly-return endpoints. Persisting this compact
-    projection lets the next five-hour Actions handoff append the newest range
-    instead of re-downloading the complete training history.
+    Older sessions retain only model-required endpoints.  The current session
+    retains all completed minutes so the next forecast has current data ready
+    without a multi-week re-download.
     """
     end = decision_at + timedelta(minutes=1)
     requested_symbols = {symbol.upper().strip() for symbol in symbols}
@@ -172,7 +174,13 @@ def _history_through(
 
 
 def _minute_cache_projection(bars: pd.DataFrame) -> pd.DataFrame:
-    """Normalize, endpoint-filter, deduplicate, and bound a minute cache."""
+    """Normalize, deduplicate, and bound the cross-handoff minute cache.
+
+    Completed prior sessions are compacted to exact optimizer endpoints.
+    The newest session preserves every 09:20--15:30 minute, allowing a
+    once-per-minute updater to make current data available before later
+    forecast/rebalance events without allowing the cache to grow unbounded.
+    """
     required = {"timestamp", "symbol", "close"}
     if missing := required.difference(bars.columns):
         raise ValueError(f"minute-bar cache is missing columns: {sorted(missing)}")
@@ -183,13 +191,84 @@ def _minute_cache_projection(bars: pd.DataFrame) -> pd.DataFrame:
     compact = compact.dropna(subset=["timestamp", "close"])
     compact = compact[(compact["symbol"] != "") & (compact["close"] > 0)]
     local = compact["timestamp"].dt.tz_convert(NEW_YORK)
-    compact = compact.loc[local.dt.time.isin(CACHE_ENDPOINT_TIMES)].copy()
     if compact.empty:
         return pd.DataFrame(columns=["timestamp", "symbol", "close"])
-    local_dates = local.loc[compact.index].dt.tz_localize(None).dt.normalize()
+    local_dates = local.dt.tz_localize(None).dt.normalize()
     retained_dates = sorted(local_dates.unique())[-MINUTE_CACHE_SESSION_LIMIT:]
     compact = compact.loc[local_dates.isin(retained_dates)]
+    local = local.loc[compact.index]
+    local_dates = local_dates.loc[compact.index]
+    newest_session = max(retained_dates)
+    is_endpoint = local.dt.time.isin(CACHE_ENDPOINT_TIMES)
+    is_current_session_minute = (
+        (local_dates == newest_session)
+        & (local.dt.time >= LIVE_MINUTE_CACHE_START)
+        & (local.dt.time <= LIVE_MINUTE_CACHE_END)
+    )
+    compact = compact.loc[is_endpoint | is_current_session_minute]
     return compact.drop_duplicates(["symbol", "timestamp"], keep="last").sort_values(["symbol", "timestamp"]).reset_index(drop=True)
+
+
+def _last_completed_session_minute(observed_at: pd.Timestamp, session_day: date) -> pd.Timestamp | None:
+    """Return the latest fully closed 09:20--15:30 New York minute."""
+    observed = _utc_timestamp(observed_at)
+    session_open = pd.Timestamp.combine(session_day, LIVE_MINUTE_CACHE_START).tz_localize(NEW_YORK).tz_convert("UTC")
+    session_close = pd.Timestamp.combine(session_day, LIVE_MINUTE_CACHE_END).tz_localize(NEW_YORK).tz_convert("UTC")
+    completed = observed.floor("min") - timedelta(minutes=1)
+    if completed < session_open:
+        return None
+    return min(completed, session_close)
+
+
+def _refresh_current_session_minutes(
+    bars: pd.DataFrame | None,
+    symbols: list[str],
+    *,
+    session_day: date,
+    observed_at: pd.Timestamp,
+    cache_path: Path | None,
+) -> pd.DataFrame:
+    """Append one completed current-session minute range without look-ahead."""
+    completed = _last_completed_session_minute(observed_at, session_day)
+    if completed is None:
+        return bars if bars is not None else pd.DataFrame(columns=["timestamp", "symbol", "close"])
+    session_open = pd.Timestamp.combine(session_day, LIVE_MINUTE_CACHE_START).tz_localize(NEW_YORK).tz_convert("UTC")
+    existing = _minute_cache_projection(bars) if bars is not None and not bars.empty else pd.DataFrame(
+        columns=["timestamp", "symbol", "close"]
+    )
+    requested_symbols = {symbol.upper().strip() for symbol in symbols}
+    existing = existing.loc[existing["symbol"].isin(requested_symbols)].copy()
+    if existing.empty:
+        fetch_start = session_open
+    else:
+        local = existing["timestamp"].dt.tz_convert(NEW_YORK)
+        today = local.dt.date == session_day
+        current_session = existing.loc[
+            today & (local.dt.time >= LIVE_MINUTE_CACHE_START) & (local.dt.time <= LIVE_MINUTE_CACHE_END)
+        ]
+        fetch_start = session_open if current_session.empty else current_session["timestamp"].max() + timedelta(minutes=1)
+    if fetch_start > completed:
+        return existing
+    refresh_started = time.monotonic()
+    incremental = download_minute_bars(symbols, fetch_start, completed + timedelta(minutes=1))
+    # Treat provider end-boundary semantics conservatively: even if a response
+    # happens to include the next in-progress timestamp, it cannot enter this
+    # causal cache until that minute has closed on a later poll.
+    if not incremental.empty:
+        incremental = incremental.loc[
+            pd.to_datetime(incremental["timestamp"], utc=True, errors="coerce") <= completed
+        ].copy()
+    combined = pd.concat([existing, incremental], ignore_index=True) if not incremental.empty else existing
+    merged = _minute_cache_projection(combined)
+    if cache_path is not None:
+        _write_minute_cache(cache_path, merged)
+    print(
+        "MINUTE CACHE REFRESHED | "
+        f"from={fetch_start.isoformat()} through={completed.isoformat()} downloaded={len(incremental):,} "
+        f"elapsed={time.monotonic() - refresh_started:.1f}s {_cache_summary(merged)}",
+        flush=True,
+    )
+    return merged
 
 
 def _read_minute_cache(path: Path) -> pd.DataFrame:
@@ -313,6 +392,7 @@ def run_hourly_paper_session(
     allow_live_trading: bool = False,
     checkpoint_path: str | Path | None = None,
     minute_cache_path: str | Path | None = None,
+    minute_cache_polling: bool = True,
     stop_at: pd.Timestamp | None = None,
     resume: bool = False,
     now: Callable[[], pd.Timestamp] = _utc_timestamp,
@@ -352,7 +432,7 @@ def run_hourly_paper_session(
         "HOURLY PAPER SESSION STARTED | "
         f"mode={client.mode} session={session_day.isoformat()} symbols={len(symbols)} "
         f"resume={resume} completed_events={len(completed_events)} checkpoint={checkpoint_file or 'none'} "
-        f"cache={minute_cache_file or 'none'} {_cache_summary(bars)}",
+        f"cache={minute_cache_file or 'none'} minute_polling={minute_cache_polling} {_cache_summary(bars)}",
         flush=True,
     )
 
@@ -425,8 +505,38 @@ def run_hourly_paper_session(
         if stop_at is not None and now() < event.due_at and event.due_at > stop_at:
             break
         last_wait_heartbeat: pd.Timestamp | None = None
+        last_minute_refresh: pd.Timestamp | None = None
         while now() < event.due_at:
             current = now()
+            # The updater requests only completed current-session minutes and
+            # yields the final 90 seconds before every selection, rebalance,
+            # or flatten.  The scheduled trading event therefore always has
+            # priority over data I/O.
+            completed_minute = _last_completed_session_minute(current, session_day) if minute_cache_polling else None
+            if (
+                completed_minute is not None
+                and completed_minute != last_minute_refresh
+                and event.due_at - current > EVENT_PRIORITY_GUARD
+            ):
+                last_minute_refresh = completed_minute
+                try:
+                    bars = _refresh_current_session_minutes(
+                        bars,
+                        symbols,
+                        session_day=session_day,
+                        observed_at=current,
+                        cache_path=minute_cache_file,
+                    )
+                except Exception as error:
+                    # This background cache is an acceleration only.  A
+                    # failed minute refresh must never delay or suppress the
+                    # next paper order; the scheduled forecast fetch remains
+                    # the authoritative fail-closed data path.
+                    print(
+                        "MINUTE CACHE REFRESH FAILED | "
+                        f"completed={completed_minute.isoformat()} error={error}",
+                        flush=True,
+                    )
             if last_wait_heartbeat is None or current - last_wait_heartbeat >= WAIT_HEARTBEAT_INTERVAL:
                 remaining = max(0, int((event.due_at - current).total_seconds()))
                 print(

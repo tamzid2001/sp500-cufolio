@@ -150,7 +150,9 @@ def test_minute_endpoint_cache_appends_fresh_rows_and_skips_overnight_gap(tmp_pa
     # minute since the prior 10:20 endpoint.
     assert calls[1] == (second_decision, second_decision + pd.Timedelta(minutes=1))
     assert first.loc[first["timestamp"] == pd.Timestamp("2026-07-28T13:20:00Z"), "close"].item() == 101
-    assert pd.Timestamp("2026-07-28T13:21:00Z") not in set(first["timestamp"])
+    # The newest session keeps each completed minute; older sessions compact
+    # back to model endpoints at the next day's handoff.
+    assert pd.Timestamp("2026-07-28T13:21:00Z") in set(first["timestamp"])
     assert list(second["timestamp"]) == [
         pd.Timestamp("2026-07-28T13:20:00Z"),
         pd.Timestamp("2026-07-28T13:30:00Z"),
@@ -158,6 +160,56 @@ def test_minute_endpoint_cache_appends_fresh_rows_and_skips_overnight_gap(tmp_pa
         pd.Timestamp("2026-07-29T13:20:00Z"),
     ]
     pd.testing.assert_frame_equal(hourly_paper_session._read_minute_cache(cache_path), second)
+
+
+def test_current_session_minute_refresh_merges_only_completed_minutes(tmp_path, monkeypatch) -> None:
+    cache_path = tmp_path / "minute-endpoints.csv.gz"
+    calls: list[tuple[pd.Timestamp, pd.Timestamp]] = []
+
+    def fake_download(symbols, start, end):
+        calls.append((pd.Timestamp(start), pd.Timestamp(end)))
+        return pd.DataFrame(
+            {
+                "timestamp": ["2026-07-28T14:20:00Z", "2026-07-28T14:21:00Z", "2026-07-28T14:22:00Z"],
+                "symbol": ["AAA", "AAA", "AAA"],
+                "close": [101, 102, 999],
+            }
+        )
+
+    monkeypatch.setattr(hourly_paper_session, "download_minute_bars", fake_download)
+    existing = pd.DataFrame(
+        {
+            "timestamp": ["2026-07-28T14:19:00Z"],
+            "symbol": ["AAA"],
+            "close": [100],
+        }
+    )
+    refreshed = hourly_paper_session._refresh_current_session_minutes(
+        existing,
+        ["AAA"],
+        session_day=date(2026, 7, 28),
+        observed_at=pd.Timestamp("2026-07-28T14:22:15Z"),
+        cache_path=cache_path,
+    )
+
+    # 10:21 New York is the last fully closed minute at 10:22:15. Even if
+    # the provider returns a 10:22 boundary row, it is discarded as partial.
+    assert calls == [(pd.Timestamp("2026-07-28T14:20:00Z"), pd.Timestamp("2026-07-28T14:22:00Z"))]
+    assert list(refreshed["timestamp"]) == [
+        pd.Timestamp("2026-07-28T14:19:00Z"),
+        pd.Timestamp("2026-07-28T14:20:00Z"),
+        pd.Timestamp("2026-07-28T14:21:00Z"),
+    ]
+    pd.testing.assert_frame_equal(hourly_paper_session._read_minute_cache(cache_path), refreshed)
+
+
+def test_last_completed_session_minute_never_uses_partial_or_pre_session_bar() -> None:
+    assert hourly_paper_session._last_completed_session_minute(
+        pd.Timestamp("2026-07-28T13:20:59Z"), date(2026, 7, 28)
+    ) is None
+    assert hourly_paper_session._last_completed_session_minute(
+        pd.Timestamp("2026-07-28T13:21:00Z"), date(2026, 7, 28)
+    ) == pd.Timestamp("2026-07-28T13:20:00Z")
 
 
 def test_rolling_history_start_uses_compact_window_and_rejects_too_little_history() -> None:
