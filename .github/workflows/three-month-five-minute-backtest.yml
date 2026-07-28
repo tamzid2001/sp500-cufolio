@@ -1,0 +1,166 @@
+name: Three-month causal five-minute forecast backtest
+
+on:
+  workflow_dispatch:
+    inputs:
+      evaluation_end:
+        description: "Last completed New York session date (YYYY-MM-DD); default chooses the latest completed session."
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cufolio-three-month-five-minute-backtest
+  cancel-in-progress: false
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      PYTHONPATH: ${{ github.workspace }}/src
+      ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
+      ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
+      REQUESTED_EVALUATION_END: ${{ inputs.evaluation_end }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install audit dependencies
+        run: pip install -r requirements.txt
+
+      - name: Verify causal multi-session audit implementation
+        run: pytest -q tests/test_intraday_forecast_audits.py tests/test_optimization.py
+
+      - name: Extend retained IEX history only where it is missing
+        run: |
+          set -euo pipefail
+          test -n "$ALPACA_API_KEY"
+          test -n "$ALPACA_SECRET_KEY"
+          python - <<'PY'
+          import os
+          from datetime import timedelta
+          from pathlib import Path
+
+          import pandas as pd
+
+          from cufolio_cpu.alpaca import download_minute_bars
+          from cufolio_cpu.five_minute_intraday_backtest import NEW_YORK
+
+          seed_path = Path("var/iex_one_minute_history.csv.gz")
+          if not seed_path.exists():
+              raise RuntimeError("retained IEX seed is absent; refusing to substitute a different provider")
+          seed = pd.read_csv(seed_path)
+          seed["timestamp"] = pd.to_datetime(seed["timestamp"], utc=True)
+          seed = seed.loc[:, ["timestamp", "symbol", "close"]]
+          if seed.empty:
+              raise RuntimeError("retained IEX seed is empty")
+          # The retained IEX cache ends on its last completed market session.
+          # It is a safer default than calendar arithmetic around weekends,
+          # holidays, or a manually triggered run before the close.
+          latest_local = seed["timestamp"].max().tz_convert(NEW_YORK).date()
+          requested = os.environ.get("REQUESTED_EVALUATION_END", "").strip()
+          evaluation_end = pd.Timestamp(requested).date() if requested else latest_local
+          # Exactly three calendar months of evaluation, plus a conservative
+          # 28-day warm-up so the first session has at least ten prior sessions.
+          evaluation_start = (pd.Timestamp(evaluation_end) - pd.DateOffset(months=3)).date()
+          data_start_local = pd.Timestamp(evaluation_start, tz=NEW_YORK) - pd.Timedelta(days=28) + pd.Timedelta(hours=9, minutes=30)
+          data_end_local = pd.Timestamp(evaluation_end, tz=NEW_YORK) + pd.Timedelta(days=1)
+          data_start = data_start_local.tz_convert("UTC")
+          data_end = data_end_local.tz_convert("UTC")
+          seed_start = seed["timestamp"].min()
+          seed_end = seed["timestamp"].max() + pd.Timedelta(minutes=1)
+          symbols = sorted(seed["symbol"].astype(str).str.upper().unique())
+          frames = [seed]
+          downloaded = []
+          if data_start < seed_start:
+              prefix_end = min(seed_start, data_end)
+              older = download_minute_bars(symbols, data_start, prefix_end)
+              frames.append(older)
+              downloaded.append((data_start, prefix_end, len(older)))
+          if data_end > seed_end:
+              newer = download_minute_bars(symbols, max(seed_end, data_start), data_end)
+              frames.append(newer)
+              downloaded.append((max(seed_end, data_start), data_end, len(newer)))
+          combined = pd.concat(frames, ignore_index=True)
+          combined["timestamp"] = pd.to_datetime(combined["timestamp"], utc=True)
+          combined["symbol"] = combined["symbol"].astype(str).str.upper()
+          combined["close"] = pd.to_numeric(combined["close"], errors="coerce")
+          combined = combined.dropna(subset=["timestamp", "symbol", "close"])
+          combined = combined.loc[(combined["close"] > 0) & (combined["timestamp"] >= data_start) & (combined["timestamp"] < data_end)]
+          combined = combined.drop_duplicates(["timestamp", "symbol"], keep="last").sort_values(["symbol", "timestamp"])
+          output = Path("artifacts/three_month_five_minute")
+          output.mkdir(parents=True, exist_ok=True)
+          combined.to_csv(output / "iex_three_month_minute_input.csv.gz", index=False, compression="gzip")
+          (output / "data_window.env").write_text(
+              "\n".join((
+                  f"EVALUATION_START={evaluation_start.isoformat()}",
+                  f"EVALUATION_END={evaluation_end.isoformat()}",
+                  f"DATA_START={data_start.isoformat()}",
+                  f"DATA_END={data_end.isoformat()}",
+              )) + "\n",
+              encoding="utf-8",
+          )
+          with Path(os.environ["GITHUB_ENV"]).open("a", encoding="utf-8") as handle:
+              handle.write(f"EVALUATION_START={evaluation_start.isoformat()}\n")
+              handle.write(f"EVALUATION_END={evaluation_end.isoformat()}\n")
+          print(
+              "IEX HISTORY READY | "
+              f"evaluation={evaluation_start}..{evaluation_end} input_rows={len(combined):,} "
+              f"symbols={combined['symbol'].nunique()} extensions={downloaded or 'none'}"
+          )
+          PY
+
+      - name: Run causal three-month five-minute audit
+        run: |
+          set -euo pipefail
+          python -m cufolio_cpu.five_minute_intraday_backtest \
+            --input artifacts/three_month_five_minute/iex_three_month_minute_input.csv.gz \
+            --output-dir artifacts/three_month_five_minute \
+            --evaluation-start "$EVALUATION_START" \
+            --evaluation-end "$EVALUATION_END" \
+            --top-n 20 \
+            --max-weight 0.10 \
+            --lookback-observations 780 \
+            --min-training-sessions 10 \
+            --min-covariance-scenarios 500
+
+      - name: Publish truthful audit summary
+        run: |
+          python - <<'PY'
+          import json
+          from pathlib import Path
+
+          summary = json.loads(Path("artifacts/three_month_five_minute/five_minute_forecast_summary.json").read_text())
+          def pct(value):
+              return "n/a" if value is None else f"{float(value):+.4%}"
+          lines = [
+              "## Three-month causal five-minute backtest",
+              "",
+              f"- Evaluation: `{summary['evaluation_start']}` through `{summary['evaluation_end']}` ({summary['evaluation_sessions']} sessions with input bars)",
+              f"- Forecasts: {summary['forecast_windows']}; exact IEX realized windows: {summary['realized_windows']} ({pct(summary['exact_realized_coverage'])})",
+              f"- All-forecast compounded expected return: {pct(summary['all_forecast_compounded_expected_return'])}",
+              f"- Matched exact-window compounded expected return: {pct(summary['matched_compounded_expected_return'])}",
+              f"- Matched exact-window compounded actual return: {pct(summary['matched_compounded_actual_return'])}",
+              f"- Matched exact-window MAE: {summary['mean_absolute_error_bps']:.2f} bps" if summary['mean_absolute_error_bps'] is not None else "- Matched exact-window MAE: n/a",
+              "- No Yahoo outcome repair is used in this three-month report: older Yahoo one-minute data is not reliably available. Actuals are reported only where exact IEX endpoints exist.",
+          ]
+          print("\n".join(lines))
+          Path("artifacts/three_month_five_minute/github_summary.md").write_text("\n".join(lines) + "\n")
+          with Path(__import__("os").environ["GITHUB_STEP_SUMMARY"]).open("a") as handle:
+              handle.write("\n".join(lines) + "\n")
+          PY
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: three-month-causal-five-minute-${{ github.run_id }}
+          path: artifacts/three_month_five_minute/
+          if-no-files-found: warn
+          retention-days: 30

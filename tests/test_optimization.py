@@ -24,6 +24,27 @@ def test_cpu_optimizers_respect_full_investment_and_max_weight() -> None:
         assert (result.weights <= 0.35 + 1e-8).all()
 
 
+def test_mean_variance_drops_non_finite_return_scenarios() -> None:
+    data = sample_returns()
+    data.loc[data.index[0], "AAPL"] = np.inf
+
+    result = mean_variance_weights(data, max_weight=0.35)
+
+    assert np.isfinite(result.expected_return)
+    assert np.isclose(result.weights.sum(), 1.0)
+
+
+def test_mean_variance_regularizes_a_singular_complete_case_covariance() -> None:
+    data = sample_returns()
+    data["NVDA"] = 0.0  # finite, but its sample-covariance diagonal is zero
+
+    result = mean_variance_weights(data, max_weight=0.35)
+
+    assert np.isfinite(result.expected_return)
+    assert np.isclose(result.weights.sum(), 1.0)
+    assert (result.weights <= 0.35 + 1e-8).all()
+
+
 def test_frontier_and_causal_backtest_run() -> None:
     data = sample_returns()
     frontier = efficient_frontier(data, [1.0, 5.0], max_weight=0.35)

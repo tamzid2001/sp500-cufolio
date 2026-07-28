@@ -101,7 +101,7 @@ def _regular_session_minute_closes(bars: pd.DataFrame) -> pd.DataFrame:
     clean["symbol"] = clean["symbol"].astype(str).str.upper().str.strip()
     clean["close"] = pd.to_numeric(clean["close"], errors="coerce")
     clean = clean.dropna(subset=["timestamp", "close"])
-    clean = clean[(clean["symbol"] != "") & (clean["close"] > 0)]
+    clean = clean[(clean["symbol"] != "") & (clean["close"] > 0) & np.isfinite(clean["close"])]
     clean = clean.drop_duplicates(["symbol", "timestamp"], keep="last")
     local = clean["timestamp"].dt.tz_convert(NEW_YORK)
     clock = local.dt.time
@@ -135,9 +135,40 @@ def _exact_minute_prices(minute_bars: pd.DataFrame, at: pd.Timestamp) -> pd.Seri
         (clean["timestamp"] == at)
         & clean["close"].notna()
         & (clean["close"] > 0)
+        & np.isfinite(clean["close"])
         & clean["symbol"].ne("")
     ]
     return exact.drop_duplicates("symbol", keep="last").set_index("symbol")["close"]
+
+
+def _exact_minute_price_matrix(
+    minute_bars: pd.DataFrame,
+    *,
+    local_times: set[clock_time],
+) -> pd.DataFrame:
+    """Build one exact-price matrix for a fixed set of New York clock minutes.
+
+    A month audit has many decisions but only five decision minutes per
+    session. Normalizing the raw one-minute file once avoids rescanning every
+    historical row for every individual forecast while retaining the exact
+    same no-forward-fill rule as :func:`_exact_minute_prices`.
+    """
+    required = {"timestamp", "symbol", "close"}
+    if missing := required.difference(minute_bars.columns):
+        raise ValueError(f"intraday bars are missing required columns: {sorted(missing)}")
+    clean = minute_bars.loc[:, ["timestamp", "symbol", "close"]].copy()
+    clean["timestamp"] = pd.to_datetime(clean["timestamp"], utc=True, errors="coerce")
+    clean["symbol"] = clean["symbol"].astype(str).str.upper().str.strip()
+    clean["close"] = pd.to_numeric(clean["close"], errors="coerce")
+    clean = clean.dropna(subset=["timestamp", "close"])
+    clean = clean[(clean["symbol"] != "") & (clean["close"] > 0) & np.isfinite(clean["close"])]
+    local = clean["timestamp"].dt.tz_convert(NEW_YORK)
+    clean = clean.loc[local.dt.time.isin(local_times)]
+    return (
+        clean.drop_duplicates(["symbol", "timestamp"], keep="last")
+        .pivot(index="timestamp", columns="symbol", values="close")
+        .sort_index()
+    )
 
 
 def _selection_timestamps(session_dates: pd.DatetimeIndex) -> list[pd.Timestamp]:
@@ -200,6 +231,48 @@ def _quarter_hour_returns(
     return pd.DataFrame(records)
 
 
+def _primary_preferred_outcome_closes(
+    primary_closes: pd.DataFrame,
+    fallback_minute_bars: pd.DataFrame | None,
+) -> pd.DataFrame:
+    """Fill only missing execution closes from a separately supplied source.
+
+    Forecast training labels and decision-time prices always come from the
+    primary IEX input.  This helper is deliberately limited to *outcome*
+    scoring: it preserves every available primary close and only supplies an
+    exact timestamp/symbol value where IEX had no usable print.  It never
+    forward-fills a price and cannot introduce a fallback-only asset into a
+    portfolio.
+    """
+    if fallback_minute_bars is None or fallback_minute_bars.empty:
+        return primary_closes
+    try:
+        fallback_clean = _regular_session_minute_closes(fallback_minute_bars)
+    except ValueError:
+        return primary_closes
+    fallback_closes = fallback_clean.pivot(
+        index="timestamp", columns="symbol", values="close",
+    ).sort_index()
+    # Primary columns define the universe.  A fallback can repair an endpoint
+    # for a selected IEX symbol, but must not create a fallback-only holding.
+    index = primary_closes.index.union(fallback_closes.index)
+    fallback_aligned = fallback_closes.reindex(index=index, columns=primary_closes.columns)
+    return primary_closes.reindex(index=index).combine_first(fallback_aligned)
+
+
+def _fallback_execution_endpoint_count(
+    primary_closes: pd.DataFrame,
+    outcome_closes: pd.DataFrame,
+    start: pd.Timestamp,
+    symbols: pd.Index,
+) -> int:
+    """Count exact execution prices repaired from the outcome fallback."""
+    endpoints = pd.date_range(start, start + HOLDING_DELTA, freq=REBALANCE_DELTA)
+    primary = primary_closes.reindex(index=endpoints, columns=symbols)
+    outcome = outcome_closes.reindex(index=endpoints, columns=symbols)
+    return int((primary.isna() & outcome.notna()).to_numpy().sum())
+
+
 def _target_weights(
     hourly_returns: pd.DataFrame,
     target_ends: pd.Series,
@@ -214,6 +287,7 @@ def _target_weights(
 ) -> tuple[pd.Series | None, dict[str, object]]:
     """Select an allocation using only labels completed strictly before a decision."""
     training = hourly_returns.loc[target_ends.reindex(hourly_returns.index) < decision_at]
+    training = training.replace([np.inf, -np.inf], np.nan)
     training = training.tail(lookback_scenarios)
     required_candidates = int(np.ceil((1 - 1e-12) / max_weight))
     eligible = training.columns[
@@ -676,6 +750,8 @@ def run_hourly_paper_cadence_backtest(
     transaction_cost_bps: float = 0.0,
     evaluation_start: str | date | None = None,
     evaluation_end: str | date | None = None,
+    outcome_fallback_minute_bars: pd.DataFrame | None = None,
+    outcome_fallback_source: str = "yfinance_1m_fallback",
 ) -> HourlyPaperCadenceBacktestResult:
     """Audit the exact forecast and rebalance cadence used by paper trading.
 
@@ -685,6 +761,9 @@ def run_hourly_paper_cadence_backtest(
     start and then every 15 minutes.  A forecast is scored only when every
     selected asset has each exact execution endpoint; an unavailable endpoint
     is reported as unavailable, never carried forward or converted to zero.
+    An optional fallback can repair only previously missing *realized*
+    endpoints.  It never contributes decision prices, training labels, or
+    portfolio selection and every repaired endpoint is counted in the output.
     """
     if top_n < 2:
         raise ValueError("top_n must be at least two")
@@ -703,6 +782,11 @@ def run_hourly_paper_cadence_backtest(
         raise ValueError("evaluation_start must not be after evaluation_end")
 
     hourly_returns, target_ends, closes = build_one_hour_return_panel(minute_bars)
+    outcome_closes = _primary_preferred_outcome_closes(closes, outcome_fallback_minute_bars)
+    decision_prices = _exact_minute_price_matrix(
+        minute_bars,
+        local_times={selection for selection, _target_start in PAPER_CADENCE_FORECAST_TIMES},
+    )
     all_symbols = closes.columns
     session_days = sorted({timestamp.tz_convert(NEW_YORK).date() for timestamp in closes.index})
     selected_session_days = [
@@ -717,13 +801,15 @@ def run_hourly_paper_cadence_backtest(
     performance_rows: list[dict[str, object]] = []
     selection_rows: list[dict[str, object]] = []
     forecast_rows: list[dict[str, object]] = []
+    fallback_repaired_execution_endpoint_prices = 0
+    realized_with_fallback_endpoint = 0
 
     for session_day in selected_session_days:
         for selection_time, target_time in PAPER_CADENCE_FORECAST_TIMES:
             decision_at = _session_timestamp(session_day, selection_time)
             target_start = _session_timestamp(session_day, target_time)
             target_end = target_start + HOLDING_DELTA
-            current_prices = _exact_minute_prices(minute_bars, decision_at)
+            current_prices = decision_prices.reindex([decision_at]).iloc[0].dropna()
             weights, diagnostic = _target_weights(
                 hourly_returns,
                 target_ends,
@@ -772,7 +858,7 @@ def run_hourly_paper_cadence_backtest(
                         "target_weight": float(weight),
                     }
                 )
-            quarter_returns = _quarter_hour_returns(closes, target_start, weights.index)
+            quarter_returns = _quarter_hour_returns(outcome_closes, target_start, weights.index)
             if quarter_returns is None:
                 forecast_rows.append(
                     {
@@ -792,6 +878,13 @@ def run_hourly_paper_cadence_backtest(
                 holdings = pd.Series(0.0, index=all_symbols)
                 cash = equity
                 continue
+
+            repaired_endpoint_prices = _fallback_execution_endpoint_count(
+                closes, outcome_closes, target_start, weights.index,
+            )
+            fallback_repaired_execution_endpoint_prices += repaired_endpoint_prices
+            if repaired_endpoint_prices:
+                realized_with_fallback_endpoint += 1
 
             opening_equity = equity
             target = weights.reindex(all_symbols).fillna(0.0)
@@ -821,6 +914,9 @@ def run_hourly_paper_cadence_backtest(
                         "hourly_target_start": target_start,
                         "hourly_target_end": target_end,
                         "selection_recomputed": rebalance_at == target_start,
+                        "outcome_price_source": (
+                            outcome_fallback_source if repaired_endpoint_prices else "primary_iex"
+                        ),
                         "turnover": turnover,
                         "transaction_cost": transaction_cost,
                         "gross_simple_return": float((interval_returns * weights).sum()),
@@ -840,6 +936,10 @@ def run_hourly_paper_cadence_backtest(
                     "realized_gross_simple_return": realized_gross,
                     "realized_net_simple_return": realized_net,
                     "prediction_error_percentage_points": (realized_gross - expected_simple) * 100,
+                    "outcome_price_source": (
+                        outcome_fallback_source if repaired_endpoint_prices else "primary_iex"
+                    ),
+                    "fallback_repaired_execution_endpoint_prices": repaired_endpoint_prices,
                 }
             )
 
@@ -864,7 +964,11 @@ def run_hourly_paper_cadence_backtest(
         "research_only": True,
         "strategy_cadence": "09:20,10:20,11:20,12:20,14:20 New York forecasts; 15-minute target rebalances",
         "bar_interval": "1m",
-        "market_data_rule": "exact IEX minute closes only; no forward fill, stale-price substitution, or zero-return substitution",
+        "market_data_rule": (
+            "primary IEX one-minute closes determine every training label, decision price, and portfolio; "
+            "an optional outcome fallback may fill only otherwise-missing exact execution endpoints; "
+            "no forward fill, stale-price substitution, or zero-return substitution"
+        ),
         "causality_rule": "each training target_end is strictly earlier than its forecast decision timestamp",
         "target_horizon_minutes": HOLDING_MINUTES,
         "execution_rebalance_frequency_minutes": REBALANCE_MINUTES,
@@ -883,6 +987,11 @@ def run_hourly_paper_cadence_backtest(
         "directional_accuracy": directional_accuracy,
         "total_transaction_cost": float(performance["transaction_cost"].sum()) if not performance.empty else 0.0,
         "ending_equity": equity,
+        "outcome_fallback_source": outcome_fallback_source if outcome_fallback_minute_bars is not None else None,
+        "outcome_fallback_available": bool(outcome_fallback_minute_bars is not None and not outcome_fallback_minute_bars.empty),
+        "fallback_repaired_execution_endpoint_prices": fallback_repaired_execution_endpoint_prices,
+        "forecast_windows_realized_with_fallback_endpoint": realized_with_fallback_endpoint,
+        "forecast_windows_realized_with_primary_iex_only": int(len(realized) - realized_with_fallback_endpoint),
     }
     return HourlyPaperCadenceBacktestResult(performance, selections, forecasts, status)
 
@@ -905,6 +1014,18 @@ def main() -> None:
     parser.add_argument("--evaluation-start", help="optional inclusive New York calendar date for --paper-cadence")
     parser.add_argument("--evaluation-end", help="optional inclusive New York calendar date for --paper-cadence")
     parser.add_argument(
+        "--outcome-fallback-input",
+        help=(
+            "optional CSV with exact one-minute closes used only to repair missing realized execution "
+            "endpoints; it never changes IEX training data, decisions, or selected weights"
+        ),
+    )
+    parser.add_argument(
+        "--outcome-fallback-source",
+        default="yfinance_1m_fallback",
+        help="label recorded for the optional realized-outcome fallback",
+    )
+    parser.add_argument(
         "--decision-at",
         help="UTC-offset timestamp for a causal candidate-only output (for example 2026-07-28T14:30:00Z)",
     )
@@ -916,6 +1037,7 @@ def main() -> None:
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     bars = pd.read_csv(args.input)
+    outcome_fallback = pd.read_csv(args.outcome_fallback_input) if args.outcome_fallback_input else None
     if args.decision_at:
         candidate = generate_hourly_one_hour_candidate(
             bars,
@@ -947,6 +1069,8 @@ def main() -> None:
             transaction_cost_bps=args.transaction_cost_bps,
             evaluation_start=args.evaluation_start,
             evaluation_end=args.evaluation_end,
+            outcome_fallback_minute_bars=outcome_fallback,
+            outcome_fallback_source=args.outcome_fallback_source,
         )
         result.performance.to_csv(output_dir / "paper_cadence_quarter_hour_rebalances.csv", index=False)
         result.selections.to_csv(output_dir / "paper_cadence_hourly_portfolios.csv", index=False)

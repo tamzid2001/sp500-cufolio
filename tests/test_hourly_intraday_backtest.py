@@ -7,6 +7,7 @@ import pandas as pd
 
 from cufolio_cpu.hourly_intraday_backtest import (
     NEW_YORK,
+    _exact_minute_price_matrix,
     _quarter_hour_returns,
     build_one_hour_return_panel,
     generate_to_close_candidate,
@@ -230,3 +231,79 @@ def test_paper_cadence_endpoint_set_covers_decisions_labels_and_all_rebalance_bo
         "12:00", "12:15", "12:20", "12:30", "13:00", "13:15", "13:30", "14:00",
         "14:15", "14:20", "14:30", "14:45", "15:00", "15:15", "15:30",
     }
+
+
+def test_exact_price_matrix_retains_only_requested_finite_decision_minutes() -> None:
+    bars = pd.DataFrame(
+        [
+            {"timestamp": "2026-01-02T14:20:00Z", "symbol": "AAA", "close": 100.0},  # 09:20 ET
+            {"timestamp": "2026-01-02T14:21:00Z", "symbol": "AAA", "close": 101.0},
+            {"timestamp": "2026-01-02T15:20:00Z", "symbol": "AAA", "close": np.inf},  # 10:20 ET
+            {"timestamp": "2026-01-02T15:20:00Z", "symbol": "BBB", "close": 90.0},
+        ]
+    )
+
+    prices = _exact_minute_price_matrix(
+        bars,
+        local_times={pd.Timestamp("09:20").time(), pd.Timestamp("10:20").time()},
+    )
+
+    assert prices.loc[pd.Timestamp("2026-01-02T14:20:00Z"), "AAA"] == 100.0
+    assert pd.isna(prices.loc[pd.Timestamp("2026-01-02T15:20:00Z"), "AAA"])
+    assert prices.loc[pd.Timestamp("2026-01-02T15:20:00Z"), "BBB"] == 90.0
+
+
+def test_paper_cadence_outcome_fallback_repairs_only_a_missing_execution_price() -> None:
+    bars = _minute_bars()
+    premarket_rows: list[dict[str, object]] = []
+    for session in pd.bdate_range("2026-01-02", periods=12):
+        session_open = pd.Timestamp(session, tz=NEW_YORK) + pd.Timedelta(hours=9, minutes=30)
+        day_opens = bars.loc[pd.to_datetime(bars["timestamp"], utc=True).eq(session_open.tz_convert("UTC"))]
+        for selection_time in ("09:20", "10:20", "11:20", "12:20", "14:20"):
+            selection = pd.Timestamp(f"{session.date()} {selection_time}", tz=NEW_YORK).tz_convert("UTC")
+            for row in day_opens.itertuples(index=False):
+                premarket_rows.append({"timestamp": selection, "symbol": row.symbol, "close": row.close})
+    complete = pd.concat([bars, pd.DataFrame(premarket_rows)], ignore_index=True)
+    final_session = pd.Timestamp("2026-01-19").date()
+    options = dict(
+        top_n=3,
+        lookback_scenarios=30,
+        min_training_scenarios=5,
+        max_weight=0.50,
+        evaluation_start=final_session,
+        evaluation_end=final_session,
+    )
+    baseline = run_hourly_paper_cadence_backtest(complete, **options)
+    first_forecast = baseline.forecasts.iloc[0]
+    decision = pd.Timestamp(first_forecast["decision_timestamp"])
+    selected = baseline.selections.loc[
+        pd.to_datetime(baseline.selections["decision_timestamp"], utc=True).eq(decision)
+    ]
+    repaired_symbol = str(selected.iloc[0]["symbol"])
+    # 10:45 is an execution endpoint for the first 10:30 -> 11:30 target.
+    missing_at = pd.Timestamp("2026-01-19 10:45", tz=NEW_YORK).tz_convert("UTC")
+    missing_row = complete.loc[
+        pd.to_datetime(complete["timestamp"], utc=True).eq(missing_at)
+        & complete["symbol"].eq(repaired_symbol)
+    ].copy()
+    sparse = complete.drop(index=missing_row.index)
+
+    incomplete = run_hourly_paper_cadence_backtest(sparse, **options)
+    repaired = run_hourly_paper_cadence_backtest(
+        sparse,
+        outcome_fallback_minute_bars=missing_row,
+        outcome_fallback_source="test_exact_fallback",
+        **options,
+    )
+
+    incomplete_first = incomplete.forecasts.iloc[0]
+    repaired_first = repaired.forecasts.iloc[0]
+    assert incomplete_first["forecast_status"] == "missing_exact_one_minute_execution_prices"
+    assert repaired_first["forecast_status"] == "selected_and_realized"
+    assert repaired_first["outcome_price_source"] == "test_exact_fallback"
+    assert repaired_first["fallback_repaired_execution_endpoint_prices"] == 1
+    # The fallback may score an otherwise unobservable outcome, but cannot
+    # change the already-causal forecast, selection, or expected return.
+    assert incomplete_first["expected_one_hour_log_return"] == repaired_first["expected_one_hour_log_return"]
+    assert incomplete.selections.equals(repaired.selections)
+    assert repaired.status["fallback_repaired_execution_endpoint_prices"] == 1

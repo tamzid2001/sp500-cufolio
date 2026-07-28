@@ -582,6 +582,7 @@ def run_hourly_paper_session(
     allow_live_trading: bool = False,
     checkpoint_path: str | Path | None = None,
     minute_cache_path: str | Path | None = None,
+    historical_minute_cache_path: str | Path | None = None,
     minute_cache_polling: bool = True,
     stop_at: pd.Timestamp | None = None,
     resume: bool = False,
@@ -611,6 +612,20 @@ def run_hourly_paper_session(
     completed_events = set(str(item) for item in checkpoint["completed_events"])
     minute_cache_file = Path(minute_cache_path) if minute_cache_path is not None else None
     bars: pd.DataFrame | None = _read_minute_cache(minute_cache_file) if minute_cache_file is not None else None
+    historical_cache_file = (
+        Path(historical_minute_cache_path) if historical_minute_cache_path is not None else None
+    )
+    if historical_cache_file is not None and historical_cache_file != minute_cache_file:
+        seed = _read_minute_cache(historical_cache_file)
+        if not seed.empty:
+            bars = _minute_cache_projection(
+                pd.concat([seed, bars], ignore_index=True) if bars is not None and not bars.empty else seed
+            )
+            print(
+                "HOURLY HISTORY SEED RESTORED | "
+                f"path={historical_cache_file} {_cache_summary(bars)}",
+                flush=True,
+            )
     minute_stream: AlpacaMinuteBarStream | None = None
     minute_cache_health = MinuteCacheHealth()
     if minute_cache_polling:
@@ -634,7 +649,8 @@ def run_hourly_paper_session(
         "HOURLY PAPER SESSION STARTED | "
         f"mode={client.mode} session={session_day.isoformat()} symbols={len(symbols)} "
         f"resume={resume} completed_events={len(completed_events)} checkpoint={checkpoint_file or 'none'} "
-        f"cache={minute_cache_file or 'none'} minute_polling={minute_cache_polling} {_cache_summary(bars)}",
+        f"cache={minute_cache_file or 'none'} historical_seed={historical_cache_file or 'none'} "
+        f"minute_polling={minute_cache_polling} {_cache_summary(bars)}",
         flush=True,
     )
 
@@ -924,6 +940,10 @@ def main() -> None:
     parser.add_argument("--session-date", required=True, help="New York session date, YYYY-MM-DD")
     parser.add_argument("--history-start", required=True, help="UTC start for one-minute training history")
     parser.add_argument("--output-dir", required=True)
+    parser.add_argument(
+        "--historical-minute-cache",
+        help="optional retained IEX minute-history seed merged with the rolling live cache",
+    )
     parser.add_argument("--top-n", type=int, default=20)
     parser.add_argument("--lookback-scenarios", type=int, default=120)
     parser.add_argument("--min-training-scenarios", type=int, default=20)
@@ -953,6 +973,7 @@ def main() -> None:
         min_weight_drift=args.min_weight_drift,
         mode=args.mode,
         allow_live_trading=args.allow_live_trading,
+        historical_minute_cache_path=args.historical_minute_cache,
     )
     print(f"Completed {len(ledger)} {args.mode}-session events")
 

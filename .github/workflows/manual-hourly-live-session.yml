@@ -1,4 +1,4 @@
-name: Manual hourly live session
+name: Manual five-minute live session
 
 on:
   workflow_dispatch:
@@ -8,7 +8,7 @@ on:
         required: true
         type: string
       history_start:
-        description: "UTC start for completed one-hour training outcomes"
+        description: "UTC start for completed one-minute training bars (at least 28 calendar days before the session)"
         required: true
         type: string
       live_confirmation:
@@ -51,17 +51,19 @@ jobs:
           test "${{ inputs.live_confirmation }}" = "SUBMIT_LIVE_ORDERS"
           test -n "$ALPACA_LIVE_API_KEY"
           test -n "$ALPACA_LIVE_SECRET_KEY"
-      - name: Run live hourly session
+      - name: Run live five-minute session
         run: |
-          python -m cufolio_cpu.hourly_paper_session \
+          python -m cufolio_cpu.five_minute_paper_session \
             --session-date "${{ inputs.session_date }}" \
             --history-start "${{ inputs.history_start }}" \
-            --output-dir artifacts/manual_hourly_live_session \
+            --output-dir artifacts/manual_five_minute_live_session \
+            --minute-cache var/manual_five_minute_live_minute_history.csv.gz \
+            --historical-minute-cache var/iex_one_minute_history.csv.gz \
             --mode live \
             --allow-live-trading
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: manual-hourly-live-session-ledger
-          path: artifacts/manual_hourly_live_session
+          name: manual-five-minute-live-session-ledger
+          path: artifacts/manual_five_minute_live_session
           if-no-files-found: warn

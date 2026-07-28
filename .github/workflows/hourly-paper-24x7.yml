@@ -1,8 +1,7 @@
-name: 24/7 hourly paper runner
+name: 24/7 five-minute paper runner
 
-# A paper-only, self-handing runner. Each invocation stays below GitHub's
-# six-hour ceiling, persists the resumable hourly state, then queues its
-# successor. The watchdog is only a recovery safety net.
+# The legacy filename is retained so queued self-handoffs and the watchdog
+# replace the former hourly strategy instead of starting a second runner.
 on:
   workflow_dispatch:
     inputs:
@@ -16,7 +15,7 @@ permissions:
   actions: write
 
 concurrency:
-  group: cufolio-hourly-paper-24x7-singleton
+  group: cufolio-five-minute-paper-24x7-singleton
   cancel-in-progress: false
 
 jobs:
@@ -38,14 +37,14 @@ jobs:
           python-version: "3.12"
           cache: pip
 
-      - name: Restore rolling minute-endpoint cache
+      - name: Restore rolling full-minute IEX cache
         id: minute_cache_restore
         uses: actions/cache/restore@v4
         with:
-          path: var/hourly_paper_24x7_minute_endpoints.csv.gz
-          key: hourly-paper-minute-endpoints-${{ github.run_id }}
+          path: var/five_minute_paper_24x7_minute_history.csv.gz
+          key: five-minute-paper-minute-history-${{ github.run_id }}
           restore-keys: |
-            hourly-paper-minute-endpoints-
+            five-minute-paper-minute-history-
 
       - name: Report paper-runner handoff configuration
         env:
@@ -54,48 +53,46 @@ jobs:
           cache_status=miss
           if test "$CACHE_HIT" = "true"; then
             cache_status=exact-hit
-          elif test -f var/hourly_paper_24x7_minute_endpoints.csv.gz; then
+          elif test -f var/five_minute_paper_24x7_minute_history.csv.gz; then
             cache_status=rolling-hit
           fi
-          echo "HOURLY PAPER HANDOFF STARTED | run=${GITHUB_RUN_ID} sha=${GITHUB_SHA} mode=paper slice=${RUN_SECONDS}s cache=${cache_status}"
+          echo "FIVE MINUTE PAPER HANDOFF STARTED | run=${GITHUB_RUN_ID} sha=${GITHUB_SHA} mode=paper slice=${RUN_SECONDS}s cache=${cache_status}"
 
-      - name: Install hourly paper-runner dependencies
+      - name: Install five-minute paper-runner dependencies
         run: pip install -r requirements.txt
 
-      - name: Verify resumable one-hour paper cadence
-        run: pytest -q tests/test_hourly_paper_session.py tests/test_hourly_intraday_backtest.py
+      - name: Verify causal five-minute paper cadence
+        run: pytest -q tests/test_five_minute_paper_session.py tests/test_intraday_forecast_audits.py tests/test_optimization.py
 
-      - name: Run paper-only hourly session handoff slice
+      - name: Run paper-only five-minute session handoff slice
         run: |
           set -euo pipefail
           test -n "$ALPACA_API_KEY"
           test -n "$ALPACA_SECRET_KEY"
-          python -m cufolio_cpu.hourly_paper_daemon \
+          python -m cufolio_cpu.five_minute_paper_daemon \
             --run-seconds "$RUN_SECONDS" \
-            --state var/hourly_paper_24x7_state.json \
-            --minute-cache var/hourly_paper_24x7_minute_endpoints.csv.gz \
-            --history-calendar-days 45 \
-            --output-dir artifacts/hourly_paper_24x7 \
+            --state var/five_minute_paper_24x7_state.json \
+            --minute-cache var/five_minute_paper_24x7_minute_history.csv.gz \
+            --historical-minute-cache var/iex_one_minute_history.csv.gz \
+            --history-calendar-days 55 \
+            --output-dir artifacts/five_minute_paper_24x7 \
             --top-n 20 \
             --max-weight 0.10
 
-      - name: Persist hourly paper handoff state
+      - name: Persist five-minute paper handoff state
         if: always()
         run: |
           set -euo pipefail
-          if test ! -f var/hourly_paper_24x7_state.json; then
-            echo "HOURLY PAPER STATE UNCHANGED | no checkpoint was created in this slice."
+          if test ! -f var/five_minute_paper_24x7_state.json; then
+            echo "FIVE MINUTE PAPER STATE UNCHANGED | no checkpoint was created in this slice."
             exit 0
           fi
-          # The runner can start from a slightly stale checkout while another
-          # deployment updates main. Publish from a fresh detached worktree
-          # instead of rebasing two independently-written JSON checkpoints.
           git fetch origin main
           publish_root="$(mktemp -d)"
           publish_dir="$publish_root/checkpoint-publish"
           git worktree add --detach "$publish_dir" origin/main
-          LOCAL_STATE="$GITHUB_WORKSPACE/var/hourly_paper_24x7_state.json" \
-          REMOTE_STATE="$publish_dir/var/hourly_paper_24x7_state.json" \
+          LOCAL_STATE="$GITHUB_WORKSPACE/var/five_minute_paper_24x7_state.json" \
+          REMOTE_STATE="$publish_dir/var/five_minute_paper_24x7_state.json" \
           python - <<'PY'
           import json
           import os
@@ -105,9 +102,6 @@ jobs:
           remote_path = Path(os.environ["REMOTE_STATE"])
           local = json.loads(local_path.read_text(encoding="utf-8"))
           remote = json.loads(remote_path.read_text(encoding="utf-8")) if remote_path.exists() else {}
-
-          # A checkpoint only describes one New York session.  A newer session
-          # replaces an older one; same-day handoffs union their durable facts.
           if remote.get("session_date", "") != local.get("session_date", ""):
               merged = local if local.get("session_date", "") >= remote.get("session_date", "") else remote
           else:
@@ -119,48 +113,45 @@ jobs:
                           result.append(item)
                           seen.add(key)
                   return result
-
               merged = {
                   "format_version": max(int(remote.get("format_version", 1)), int(local.get("format_version", 1))),
                   "session_date": local.get("session_date") or remote.get("session_date"),
                   "completed_events": sorted(set(remote.get("completed_events", [])) | set(local.get("completed_events", []))),
-                  "targets_by_start": {**remote.get("targets_by_start", {}), **local.get("targets_by_start", {})},
-                  "forecast_details": {**remote.get("forecast_details", {}), **local.get("forecast_details", {})},
                   "ledger": unique(remote.get("ledger", []) + local.get("ledger", [])),
               }
           remote_path.parent.mkdir(parents=True, exist_ok=True)
           remote_path.write_text(json.dumps(merged, indent=2) + "\n", encoding="utf-8")
           PY
           cd "$publish_dir"
-          git add -f var/hourly_paper_24x7_state.json
+          git add -f var/five_minute_paper_24x7_state.json
           if git diff --cached --quiet; then
-            echo "HOURLY PAPER STATE UNCHANGED | no handoff checkpoint commit required."
+            echo "FIVE MINUTE PAPER STATE UNCHANGED | no handoff checkpoint commit required."
             exit 0
           fi
-          git config user.name "cufolio hourly paper runner"
+          git config user.name "cufolio five-minute paper runner"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git commit -m "chore: checkpoint hourly paper session [skip ci]"
+          git commit -m "chore: checkpoint five-minute paper session [skip ci]"
           git push origin HEAD:main
-          echo "HOURLY PAPER STATE PUBLISHED | merged checkpoint changes were published to main."
+          echo "FIVE MINUTE PAPER STATE PUBLISHED | merged checkpoint changes were published to main."
 
       - name: Check minute cache for handoff
         if: always()
         id: minute_cache_present
         run: |
-          if test -f var/hourly_paper_24x7_minute_endpoints.csv.gz; then
+          if test -f var/five_minute_paper_24x7_minute_history.csv.gz; then
             echo "save=true" >> "$GITHUB_OUTPUT"
-            echo "HOURLY PAPER CACHE HANDOFF READY | bytes=$(wc -c < var/hourly_paper_24x7_minute_endpoints.csv.gz)"
+            echo "FIVE MINUTE PAPER CACHE HANDOFF READY | bytes=$(wc -c < var/five_minute_paper_24x7_minute_history.csv.gz)"
           else
             echo "save=false" >> "$GITHUB_OUTPUT"
-            echo "HOURLY PAPER CACHE HANDOFF EMPTY | no cache was created in this slice."
+            echo "FIVE MINUTE PAPER CACHE HANDOFF EMPTY | no cache was created in this slice."
           fi
 
-      - name: Save rolling minute-endpoint cache
+      - name: Save rolling full-minute IEX cache
         if: always() && steps.minute_cache_present.outputs.save == 'true'
         uses: actions/cache/save@v4
         with:
-          path: var/hourly_paper_24x7_minute_endpoints.csv.gz
-          key: hourly-paper-minute-endpoints-${{ github.run_id }}
+          path: var/five_minute_paper_24x7_minute_history.csv.gz
+          key: five-minute-paper-minute-history-${{ github.run_id }}
 
       - name: Queue the next 5h45m paper handoff
         if: success()
@@ -168,15 +159,15 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh workflow run hourly-paper-24x7.yml --repo "$GITHUB_REPOSITORY" --ref main -f run_seconds=20700
-          echo "HOURLY PAPER HANDOFF QUEUED | paper-only next 5h45m slice."
+          echo "FIVE MINUTE PAPER HANDOFF QUEUED | paper-only next 5h45m slice."
 
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: hourly-paper-24x7-${{ github.run_id }}
+          name: five-minute-paper-24x7-${{ github.run_id }}
           path: |
-            var/hourly_paper_24x7_state.json
-            var/hourly_paper_24x7_minute_endpoints.csv.gz
-            artifacts/hourly_paper_24x7/
+            var/five_minute_paper_24x7_state.json
+            var/five_minute_paper_24x7_minute_history.csv.gz
+            artifacts/five_minute_paper_24x7/
           if-no-files-found: warn
           retention-days: 30

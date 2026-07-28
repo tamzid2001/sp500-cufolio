@@ -18,10 +18,34 @@ class OptimizationResult:
 
 
 def _coerce_returns(returns: pd.DataFrame) -> pd.DataFrame:
-    clean = returns.dropna(axis=0, how="any").astype(float)
+    # An invalid market-data endpoint makes its complete return scenario
+    # unusable. Never pass an infinity through to a covariance solver.
+    clean = returns.replace([np.inf, -np.inf], np.nan).dropna(axis=0, how="any").astype(float)
     if len(clean) < 5 or clean.shape[1] < 2:
         raise ValueError("at least five complete observations and two assets are required")
+    if not np.isfinite(clean.to_numpy(dtype=float)).all():
+        raise ValueError("return scenarios must be finite")
     return clean
+
+
+def _regularized_covariance(returns: pd.DataFrame) -> np.ndarray:
+    """Return a finite, symmetric, positive-definite sample covariance.
+
+    Real minute data can yield an exactly constant endpoint-return column in a
+    short complete-case panel.  The sample covariance is then singular, which
+    causes CVXPY's generic PSD checker to call an unstable sparse eigensolver
+    on some runner builds.  A scale-aware ridge makes the objective strictly
+    convex; ``psd_wrap`` below records that constructed fact without asking
+    the generic checker to rediscover it numerically.
+    """
+    values = returns.to_numpy(dtype=float)
+    covariance = np.atleast_2d(np.cov(values, rowvar=False, ddof=1))
+    covariance = (covariance + covariance.T) / 2
+    if not np.isfinite(covariance).all():
+        raise ValueError("sample covariance must be finite")
+    diagonal_scale = max(float(np.abs(np.diag(covariance)).max()), 1e-12)
+    ridge = max(diagonal_scale * 1e-8, 1e-12)
+    return covariance + np.eye(covariance.shape[0]) * ridge
 
 
 def mean_cvar_weights(
@@ -86,10 +110,10 @@ def mean_variance_weights(
     if max_weight * n_assets < 1 - 1e-12:
         raise ValueError("max_weight is too small to construct a fully invested portfolio")
     mean = clean.mean().to_numpy()
-    covariance = clean.cov().to_numpy() + np.eye(n_assets) * 1e-10
+    covariance = _regularized_covariance(clean)
     weights = cp.Variable(n_assets)
     problem = cp.Problem(
-        cp.Maximize(mean @ weights - risk_aversion * cp.quad_form(weights, covariance)),
+        cp.Maximize(mean @ weights - risk_aversion * cp.quad_form(weights, cp.psd_wrap(covariance))),
         [cp.sum(weights) == 1, weights >= 0, weights <= max_weight],
     )
     problem.solve(solver=cp.CLARABEL)
@@ -124,10 +148,10 @@ def forecast_mean_variance_weights(
     n_assets = clean.shape[1]
     if max_weight * n_assets < 1 - 1e-12:
         raise ValueError("max_weight is too small to construct a fully invested portfolio")
-    covariance = clean.cov().to_numpy() + np.eye(n_assets) * 1e-10
+    covariance = _regularized_covariance(clean)
     weights = cp.Variable(n_assets)
     problem = cp.Problem(
-        cp.Maximize(forecast.to_numpy() @ weights - risk_aversion * cp.quad_form(weights, covariance)),
+        cp.Maximize(forecast.to_numpy() @ weights - risk_aversion * cp.quad_form(weights, cp.psd_wrap(covariance))),
         [cp.sum(weights) == 1, weights >= 0, weights <= max_weight],
     )
     problem.solve(solver=cp.CLARABEL)

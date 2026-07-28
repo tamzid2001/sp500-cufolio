@@ -42,6 +42,14 @@ class FiveMinuteForecastBacktestResult:
     summary: dict[str, object]
 
 
+@dataclass(frozen=True)
+class IntradayForecastCandidate:
+    """One causal 5- or 15-minute target available for an execution runner."""
+
+    weights: pd.DataFrame
+    status: dict[str, object]
+
+
 def _regular_session_minute_closes(bars: pd.DataFrame) -> pd.DataFrame:
     required = {"timestamp", "symbol", "close"}
     if missing := required.difference(bars.columns):
@@ -171,7 +179,10 @@ def _select_portfolio(
     """Select one causal five-minute portfolio and disclose all quality gates."""
     training = labels.loc[target_ends.reindex(labels.index) < decision_at].tail(lookback_observations)
     training_ends = target_ends.reindex(training.index)
-    current_prices = closes.reindex([decision_at]).iloc[0].dropna()
+    # A left-labelled 09:35 bar completes at 09:36, so a 09:35 decision can
+    # only use the prior bar's close.  This must match the realized start
+    # endpoint and the live runner's completed-minute cache.
+    current_prices = closes.reindex([_close_timestamp_known_at(decision_at)]).iloc[0].dropna()
     training_days = training.index.tz_convert(NEW_YORK).date
     required_candidates = int(np.ceil((1 - 1e-12) / max_weight))
     diagnostic: dict[str, object] = {
@@ -244,6 +255,85 @@ def _select_portfolio(
         }
     )
     return weights, expected.reindex(weights.index), diagnostic
+
+
+def generate_intraday_forecast_candidate(
+    minute_bars: pd.DataFrame,
+    *,
+    decision_at: str | pd.Timestamp,
+    interval_minutes: int = FORECAST_INTERVAL_MINUTES,
+    top_n: int = 20,
+    max_weight: float = 0.10,
+    risk_aversion: float = 10.0,
+    lookback_observations: int = 780,
+    min_training_sessions: int = 10,
+    min_covariance_scenarios: int = 500,
+    seasonality_prior_observations: int = 20,
+) -> IntradayForecastCandidate:
+    """Generate the single completed-bar forecast used by the live runner.
+
+    This is deliberately the same selection function as the audit.  Labels
+    are limited to targets completed strictly before ``decision_at`` and the
+    eligibility price is the preceding, fully completed one-minute close.
+    The supplied frame may include later rows (as it does in a historical
+    test); they cannot influence this candidate.
+    """
+    if interval_minutes not in {5, 15}:
+        raise ValueError("interval_minutes must be 5 or 15")
+    decision = _as_utc_timestamp(decision_at)
+    clean = _regular_session_minute_closes(minute_bars)
+    closes = clean.pivot(index="timestamp", columns="symbol", values="close").sort_index()
+    session_day = decision.tz_convert(NEW_YORK).date()
+    if session_day not in set(clean["session_date"]):
+        raise ValueError("decision_at session is not present in the supplied regular-session bars")
+    valid_decisions = _decision_grid(session_day, interval_minutes=interval_minutes)
+    if decision not in valid_decisions:
+        raise ValueError(
+            f"decision_at must be one of the causal {interval_minutes}-minute session boundaries"
+        )
+    available_days = sorted(set(clean["session_date"]))
+    labels, target_ends = _non_overlapping_label_panel(
+        closes, available_days, interval_minutes=interval_minutes,
+    )
+    weights, expected_by_asset, diagnostic = _select_portfolio(
+        labels,
+        target_ends,
+        closes,
+        decision_at=decision,
+        top_n=top_n,
+        max_weight=max_weight,
+        risk_aversion=risk_aversion,
+        lookback_observations=lookback_observations,
+        min_training_sessions=min_training_sessions,
+        min_covariance_scenarios=min_covariance_scenarios,
+        seasonality_prior_observations=seasonality_prior_observations,
+    )
+    status: dict[str, object] = {
+        **diagnostic,
+        "weights_generated": weights is not None and expected_by_asset is not None,
+        "decision_timestamp": decision.isoformat(),
+        "decision_price_timestamp": _close_timestamp_known_at(decision).isoformat(),
+        "target_end": (decision + timedelta(minutes=interval_minutes)).isoformat(),
+        "forecast_interval_minutes": interval_minutes,
+        "forecast_horizon_minutes": interval_minutes,
+        "causality_rule": (
+            "training target_end is strictly earlier than the decision and the decision price is "
+            "the preceding completed one-minute close"
+        ),
+    }
+    if weights is None or expected_by_asset is None:
+        return IntradayForecastCandidate(
+            pd.DataFrame(columns=["symbol", "target_weight", "predicted_asset_log_return"]),
+            status,
+        )
+    candidates = pd.DataFrame(
+        {
+            "symbol": weights.index,
+            "target_weight": weights.to_numpy(dtype=float),
+            "predicted_asset_log_return": expected_by_asset.reindex(weights.index).to_numpy(dtype=float),
+        }
+    )
+    return IntradayForecastCandidate(candidates, status)
 
 
 def _empty_holdings() -> pd.DataFrame:
@@ -456,10 +546,14 @@ def _render_markdown_report(result: FiveMinuteForecastBacktestResult) -> str:
     def percent(value: object) -> str:
         return "n/a" if value is None or pd.isna(value) else f"{float(value):+.4%}"
 
+    if summary.get("evaluation_start") and summary.get("evaluation_end"):
+        evaluated_label = f"`{summary['evaluation_start']}` through `{summary['evaluation_end']}` ({summary.get('evaluation_sessions', 'n/a')} sessions with bars)"
+    else:
+        evaluated_label = f"`{summary['evaluated_session_date']}`"
     lines = [
         f"# Causal {interval_minutes}-minute forecast audit",
         "",
-        f"- Evaluated session: `{summary['evaluated_session_date']}`",
+        f"- Evaluation: {evaluated_label}",
         f"- Decision windows: {summary['decision_windows']}; forecasts: {summary['forecast_windows']}; exact realized windows: {summary['realized_windows']}",
         f"- Forecast model: {summary['forecast_model']}",
         "- This is research-only: it creates no orders and does not claim that an expected return must equal a realized return.",
@@ -488,7 +582,7 @@ def _render_markdown_report(result: FiveMinuteForecastBacktestResult) -> str:
         "| --- | --- | --- | ---: | ---: | ---: | ---: | --- |",
     ]
     for row in result.ledger.itertuples(index=False):
-        decision = pd.Timestamp(row.decision_timestamp).tz_convert(NEW_YORK).strftime("%H:%M")
+        decision = pd.Timestamp(row.decision_timestamp).tz_convert(NEW_YORK).strftime("%Y-%m-%d %H:%M")
         expected = percent(row.expected_portfolio_simple_return)
         actual = percent(row.actual_portfolio_simple_return)
         error = (
@@ -517,25 +611,16 @@ def _write_markdown_report(path: Path, result: FiveMinuteForecastBacktestResult)
     path.write_text(_render_markdown_report(result), encoding="utf-8")
 
 
-def run_intraday_forecast_backtest(
-    minute_bars: pd.DataFrame,
+def _validate_intraday_backtest_parameters(
     *,
     interval_minutes: int,
-    session_date: str | date | None = None,
-    top_n: int = 20,
-    max_weight: float = 0.10,
-    risk_aversion: float = 10.0,
-    lookback_observations: int = 780,
-    min_training_sessions: int = 10,
-    min_covariance_scenarios: int = 500,
-    seasonality_prior_observations: int = 20,
-) -> FiveMinuteForecastBacktestResult:
-    """Audit every non-overlapping intraday forecast in one completed session.
-
-    ``lookback_observations`` counts non-overlapping interval labels, not raw
-    minute bars. This is intentionally distinct from the hourly runner's
-    120-scenario / twenty-session policy.
-    """
+    top_n: int,
+    max_weight: float,
+    lookback_observations: int,
+    min_training_sessions: int,
+    min_covariance_scenarios: int,
+    seasonality_prior_observations: int,
+) -> None:
     if interval_minutes not in {5, 15}:
         raise ValueError("interval_minutes must be 5 or 15")
     if top_n < 2:
@@ -553,13 +638,47 @@ def run_intraday_forecast_backtest(
     if seasonality_prior_observations < 1:
         raise ValueError("seasonality_prior_observations must be positive")
 
+
+def run_intraday_forecast_backtest_range(
+    minute_bars: pd.DataFrame,
+    *,
+    interval_minutes: int,
+    evaluation_start: str | date,
+    evaluation_end: str | date,
+    top_n: int = 20,
+    max_weight: float = 0.10,
+    risk_aversion: float = 10.0,
+    lookback_observations: int = 780,
+    min_training_sessions: int = 10,
+    min_covariance_scenarios: int = 500,
+    seasonality_prior_observations: int = 20,
+) -> FiveMinuteForecastBacktestResult:
+    """Audit every causal forecast over an inclusive range of sessions.
+
+    The minute panel and non-overlapping label matrix are built once, then
+    each session's decisions consume only labels completed before that exact
+    decision.  This permits a multi-month audit without rebuilding the raw
+    one-minute panel for every session.
+    """
+    _validate_intraday_backtest_parameters(
+        interval_minutes=interval_minutes,
+        top_n=top_n,
+        max_weight=max_weight,
+        lookback_observations=lookback_observations,
+        min_training_sessions=min_training_sessions,
+        min_covariance_scenarios=min_covariance_scenarios,
+        seasonality_prior_observations=seasonality_prior_observations,
+    )
+    first = date.fromisoformat(str(evaluation_start))
+    last = date.fromisoformat(str(evaluation_end))
+    if first > last:
+        raise ValueError("evaluation_start must not be after evaluation_end")
+
     clean = _regular_session_minute_closes(minute_bars)
     available_days = sorted(set(clean["session_date"]))
-    requested = date.fromisoformat(str(session_date)) if session_date is not None else None
-    eligible_days = [day for day in available_days if requested is None or day <= requested]
-    if not eligible_days:
-        raise ValueError("the requested session date is not present in the supplied regular-session bars")
-    evaluated_day = eligible_days[-1]
+    evaluated_days = [day for day in available_days if first <= day <= last]
+    if not evaluated_days:
+        raise ValueError("the requested evaluation range has no regular sessions in the supplied bars")
     closes = clean.pivot(index="timestamp", columns="symbol", values="close").sort_index()
     labels, target_ends = _non_overlapping_label_panel(
         closes, available_days, interval_minutes=interval_minutes
@@ -567,68 +686,71 @@ def run_intraday_forecast_backtest(
 
     ledger_rows: list[dict[str, object]] = []
     holdings_rows: list[dict[str, object]] = []
-    for decision_at in _decision_grid(evaluated_day, interval_minutes=interval_minutes):
-        target_end = decision_at + timedelta(minutes=interval_minutes)
-        weights, expected_by_asset, diagnostic = _select_portfolio(
-            labels,
-            target_ends,
-            closes,
-            decision_at=decision_at,
-            top_n=top_n,
-            max_weight=max_weight,
-            risk_aversion=risk_aversion,
-            lookback_observations=lookback_observations,
-            min_training_sessions=min_training_sessions,
-            min_covariance_scenarios=min_covariance_scenarios,
-            seasonality_prior_observations=seasonality_prior_observations,
-        )
-        row: dict[str, object] = {
-            "decision_timestamp": decision_at,
-            "target_end": target_end,
-            "decision_price_timestamp": _close_timestamp_known_at(decision_at),
-            "realized_price_timestamp": _close_timestamp_known_at(target_end),
-            **diagnostic,
-            "holding_count": 0,
-            "realized_status": "not_forecast",
-            "actual_portfolio_log_return": np.nan,
-            "actual_portfolio_simple_return": np.nan,
-            "realized_data_source": "not_forecast",
-        }
-        if weights is not None and expected_by_asset is not None:
-            row["holding_count"] = int(len(weights))
-            start_prices = closes.reindex([_close_timestamp_known_at(decision_at)], columns=weights.index).iloc[0]
-            end_prices = closes.reindex([_close_timestamp_known_at(target_end)], columns=weights.index).iloc[0]
-            realized_simple = end_prices / start_prices - 1
-            if realized_simple.isna().any() or not np.isfinite(realized_simple.to_numpy(dtype=float)).all():
-                row["realized_status"] = "missing_exact_realized_endpoint"
-                row["realized_data_source"] = "incomplete"
-            else:
-                portfolio_simple = float(weights.dot(realized_simple))
-                row["realized_status"] = "ok"
-                row["actual_portfolio_simple_return"] = portfolio_simple
-                row["actual_portfolio_log_return"] = float(np.log1p(portfolio_simple))
-                row["realized_data_source"] = "primary_input"
-            realized_log = np.log1p(realized_simple)
-            for symbol, weight in weights.items():
-                holdings_rows.append(
-                    {
-                        "decision_timestamp": decision_at,
-                        "target_end": target_end,
-                        "symbol": symbol,
-                        "target_weight": float(weight),
-                        "predicted_asset_log_return": float(expected_by_asset[symbol]),
-                        "realized_asset_log_return": float(realized_log[symbol]) if pd.notna(realized_log[symbol]) else np.nan,
-                        "realized_asset_simple_return": float(realized_simple[symbol]) if pd.notna(realized_simple[symbol]) else np.nan,
-                        "realized_price_source": "primary_input" if pd.notna(realized_simple[symbol]) else "missing",
-                    }
-                )
-        ledger_rows.append(row)
+    for evaluated_day in evaluated_days:
+        for decision_at in _decision_grid(evaluated_day, interval_minutes=interval_minutes):
+            target_end = decision_at + timedelta(minutes=interval_minutes)
+            weights, expected_by_asset, diagnostic = _select_portfolio(
+                labels,
+                target_ends,
+                closes,
+                decision_at=decision_at,
+                top_n=top_n,
+                max_weight=max_weight,
+                risk_aversion=risk_aversion,
+                lookback_observations=lookback_observations,
+                min_training_sessions=min_training_sessions,
+                min_covariance_scenarios=min_covariance_scenarios,
+                seasonality_prior_observations=seasonality_prior_observations,
+            )
+            row: dict[str, object] = {
+                "session_date": evaluated_day.isoformat(),
+                "decision_timestamp": decision_at,
+                "target_end": target_end,
+                "decision_price_timestamp": _close_timestamp_known_at(decision_at),
+                "realized_price_timestamp": _close_timestamp_known_at(target_end),
+                **diagnostic,
+                "holding_count": 0,
+                "realized_status": "not_forecast",
+                "actual_portfolio_log_return": np.nan,
+                "actual_portfolio_simple_return": np.nan,
+                "realized_data_source": "not_forecast",
+            }
+            if weights is not None and expected_by_asset is not None:
+                row["holding_count"] = int(len(weights))
+                start_prices = closes.reindex([_close_timestamp_known_at(decision_at)], columns=weights.index).iloc[0]
+                end_prices = closes.reindex([_close_timestamp_known_at(target_end)], columns=weights.index).iloc[0]
+                realized_simple = end_prices / start_prices - 1
+                if realized_simple.isna().any() or not np.isfinite(realized_simple.to_numpy(dtype=float)).all():
+                    row["realized_status"] = "missing_exact_realized_endpoint"
+                    row["realized_data_source"] = "incomplete"
+                else:
+                    portfolio_simple = float(weights.dot(realized_simple))
+                    row["realized_status"] = "ok"
+                    row["actual_portfolio_simple_return"] = portfolio_simple
+                    row["actual_portfolio_log_return"] = float(np.log1p(portfolio_simple))
+                    row["realized_data_source"] = "primary_input"
+                realized_log = np.log1p(realized_simple)
+                for symbol, weight in weights.items():
+                    holdings_rows.append(
+                        {
+                            "session_date": evaluated_day.isoformat(),
+                            "decision_timestamp": decision_at,
+                            "target_end": target_end,
+                            "symbol": symbol,
+                            "target_weight": float(weight),
+                            "predicted_asset_log_return": float(expected_by_asset[symbol]),
+                            "realized_asset_log_return": float(realized_log[symbol]) if pd.notna(realized_log[symbol]) else np.nan,
+                            "realized_asset_simple_return": float(realized_simple[symbol]) if pd.notna(realized_simple[symbol]) else np.nan,
+                            "realized_price_source": "primary_input" if pd.notna(realized_simple[symbol]) else "missing",
+                        }
+                    )
+            ledger_rows.append(row)
     ledger = pd.DataFrame(ledger_rows)
     holdings = pd.DataFrame(holdings_rows) if holdings_rows else _empty_holdings()
     summary = _summary(
         ledger,
-        requested_session_date=requested.isoformat() if requested else None,
-        evaluated_session_date=evaluated_day,
+        requested_session_date=None,
+        evaluated_session_date=evaluated_days[-1],
         interval_minutes=interval_minutes,
     )
     summary.update(
@@ -644,9 +766,50 @@ def run_intraday_forecast_backtest(
             "minimum_training_sessions": min_training_sessions,
             "minimum_covariance_scenarios": min_covariance_scenarios,
             "seasonality_prior_observations": seasonality_prior_observations,
+            "evaluation_start": first.isoformat(),
+            "evaluation_end": last.isoformat(),
+            "evaluation_sessions": int(len(evaluated_days)),
         }
     )
     return FiveMinuteForecastBacktestResult(ledger=ledger, holdings=holdings, summary=summary)
+
+
+def run_intraday_forecast_backtest(
+    minute_bars: pd.DataFrame,
+    *,
+    interval_minutes: int,
+    session_date: str | date | None = None,
+    top_n: int = 20,
+    max_weight: float = 0.10,
+    risk_aversion: float = 10.0,
+    lookback_observations: int = 780,
+    min_training_sessions: int = 10,
+    min_covariance_scenarios: int = 500,
+    seasonality_prior_observations: int = 20,
+) -> FiveMinuteForecastBacktestResult:
+    """Audit every non-overlapping intraday forecast in one completed session."""
+    clean = _regular_session_minute_closes(minute_bars)
+    available_days = sorted(set(clean["session_date"]))
+    requested = date.fromisoformat(str(session_date)) if session_date is not None else None
+    eligible_days = [day for day in available_days if requested is None or day <= requested]
+    if not eligible_days:
+        raise ValueError("the requested session date is not present in the supplied regular-session bars")
+    evaluated_day = eligible_days[-1]
+    result = run_intraday_forecast_backtest_range(
+        minute_bars,
+        interval_minutes=interval_minutes,
+        evaluation_start=evaluated_day,
+        evaluation_end=evaluated_day,
+        top_n=top_n,
+        max_weight=max_weight,
+        risk_aversion=risk_aversion,
+        lookback_observations=lookback_observations,
+        min_training_sessions=min_training_sessions,
+        min_covariance_scenarios=min_covariance_scenarios,
+        seasonality_prior_observations=seasonality_prior_observations,
+    )
+    result.summary["requested_session_date"] = requested.isoformat() if requested else None
+    return result
 
 
 def run_five_minute_forecast_backtest(
@@ -662,6 +825,8 @@ def main() -> None:
     parser.add_argument("--input", required=True, help="CSV or CSV.GZ with timestamp,symbol,close one-minute bars")
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--session-date", help="YYYY-MM-DD; defaults to the latest complete session in the input")
+    parser.add_argument("--evaluation-start", help="inclusive YYYY-MM-DD range start; requires --evaluation-end")
+    parser.add_argument("--evaluation-end", help="inclusive YYYY-MM-DD range end; requires --evaluation-start")
     parser.add_argument("--top-n", type=int, default=20)
     parser.add_argument("--max-weight", type=float, default=0.10)
     parser.add_argument("--risk-aversion", type=float, default=10.0)
@@ -674,18 +839,34 @@ def main() -> None:
         help="Optional one-minute fallback bars used only to repair otherwise-missing realized endpoints",
     )
     args = parser.parse_args()
-    result = run_intraday_forecast_backtest(
-        pd.read_csv(args.input),
-        interval_minutes=FORECAST_INTERVAL_MINUTES,
-        session_date=args.session_date,
-        top_n=args.top_n,
-        max_weight=args.max_weight,
-        risk_aversion=args.risk_aversion,
-        lookback_observations=args.lookback_observations,
-        min_training_sessions=args.min_training_sessions,
-        min_covariance_scenarios=args.min_covariance_scenarios,
-        seasonality_prior_observations=args.seasonality_prior_observations,
-    )
+    if bool(args.evaluation_start) != bool(args.evaluation_end):
+        parser.error("--evaluation-start and --evaluation-end must be supplied together")
+    if args.session_date and args.evaluation_start:
+        parser.error("--session-date cannot be combined with --evaluation-start/--evaluation-end")
+    common = {
+        "interval_minutes": FORECAST_INTERVAL_MINUTES,
+        "top_n": args.top_n,
+        "max_weight": args.max_weight,
+        "risk_aversion": args.risk_aversion,
+        "lookback_observations": args.lookback_observations,
+        "min_training_sessions": args.min_training_sessions,
+        "min_covariance_scenarios": args.min_covariance_scenarios,
+        "seasonality_prior_observations": args.seasonality_prior_observations,
+    }
+    minute_bars = pd.read_csv(args.input)
+    if args.evaluation_start:
+        result = run_intraday_forecast_backtest_range(
+            minute_bars,
+            evaluation_start=args.evaluation_start,
+            evaluation_end=args.evaluation_end,
+            **common,
+        )
+    else:
+        result = run_intraday_forecast_backtest(
+            minute_bars,
+            session_date=args.session_date,
+            **common,
+        )
     if args.fallback_input:
         result = reconcile_intraday_forecast_outcomes(
             result,

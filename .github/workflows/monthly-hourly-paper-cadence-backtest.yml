@@ -12,7 +12,7 @@ on:
         type: string
         default: "31"
       history_calendar_days:
-        description: "Calendar days to download before the UTC cutoff, including the trailing training panel"
+        description: "Minimum retained-history span expected before the evaluation cutoff; no market-data download is performed"
         type: string
         default: "75"
       top_n:
@@ -50,8 +50,6 @@ jobs:
     timeout-minutes: 180
     env:
       PYTHONPATH: ${{ github.workspace }}/src
-      ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
-      ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
       INPUT_EVALUATION_END: ${{ inputs.evaluation_end }}
       INPUT_EVALUATION_CALENDAR_DAYS: ${{ inputs.evaluation_calendar_days || '31' }}
       INPUT_HISTORY_CALENDAR_DAYS: ${{ inputs.history_calendar_days || '75' }}
@@ -111,14 +109,14 @@ jobs:
           )
           PY
 
-      - name: Select current S&P 500 convenience universe
-        run: python -m cufolio_cpu.universe --output artifacts/current_sp500_universe.csv
-
-      - name: Download compact exact IEX endpoint history
+      - name: Reuse retained primary and outcome-repair histories
         run: |
           set -euo pipefail
-          test -n "$ALPACA_API_KEY"
-          test -n "$ALPACA_SECRET_KEY"
+          test -s var/iex_one_minute_history.csv.gz
+          test -s var/yfinance_monthly_outcome_fallback.csv.gz
+          mkdir -p artifacts
+          cp var/iex_one_minute_history.csv.gz artifacts/hourly_paper_cadence_iex_history.csv.gz
+          cp var/yfinance_monthly_outcome_fallback.csv.gz artifacts/hourly_paper_cadence_outcome_fallback.csv.gz
           python - <<'PY'
           import json
           import os
@@ -126,39 +124,35 @@ jobs:
 
           import pandas as pd
 
-          from cufolio_cpu.alpaca import download_minute_endpoint_bars
           from cufolio_cpu.hourly_intraday_backtest import hourly_paper_cadence_endpoint_times
 
-          universe = pd.read_csv("artifacts/current_sp500_universe.csv")
-          column = "source_symbol" if "source_symbol" in universe.columns else "symbol"
-          symbols = universe[column].dropna().astype(str).str.upper().drop_duplicates().tolist()
-          bars = download_minute_endpoint_bars(
-              symbols,
-              os.environ["DATA_START"],
-              os.environ["DATA_END"],
-              endpoint_times=hourly_paper_cadence_endpoint_times(),
-          )
-          Path("artifacts").mkdir(exist_ok=True)
-          bars.to_csv("artifacts/hourly_paper_cadence_iex_endpoints.csv.gz", index=False, compression="gzip")
+          bars = pd.read_csv("artifacts/hourly_paper_cadence_iex_history.csv.gz")
+          fallback = pd.read_csv("artifacts/hourly_paper_cadence_outcome_fallback.csv.gz")
           local = pd.to_datetime(bars["timestamp"], utc=True).dt.tz_convert("America/New_York") if not bars.empty else pd.Series(dtype="datetime64[ns]")
           report = {
-              "market_data_source": "alpaca_iex",
+              "market_data_source": "retained_alpaca_iex_one_minute_history",
+              "outcome_repair_source": "retained_yfinance_one_minute_exact_endpoints",
+              "outcome_repair_rule": "used only where the primary IEX input lacks an exact execution endpoint; it cannot affect labels, decisions, symbols, or weights",
               "bar_interval": "1m",
               "rows": int(len(bars)),
               "symbols": int(bars["symbol"].nunique()) if not bars.empty else 0,
               "session_dates": int(local.dt.date.nunique()) if not bars.empty else 0,
-              "endpoint_times_requested": sorted(endpoint.strftime("%H:%M") for endpoint in hourly_paper_cadence_endpoint_times()),
+              "outcome_repair_rows": int(len(fallback)),
+              "outcome_repair_symbols": int(fallback["symbol"].nunique()) if not fallback.empty else 0,
+              "forecast_and_rebalance_endpoint_times": sorted(endpoint.strftime("%H:%M") for endpoint in hourly_paper_cadence_endpoint_times()),
           }
-          Path("artifacts/hourly_paper_cadence_iex_download_status.json").write_text(json.dumps(report, indent=2) + "\n")
-          print(f"MONTHLY HOURLY IEX ENDPOINT HISTORY | rows={report['rows']:,} symbols={report['symbols']} sessions={report['session_dates']}")
+          Path("artifacts/hourly_paper_cadence_iex_history_status.json").write_text(json.dumps(report, indent=2) + "\n")
+          print(f"MONTHLY HOURLY RETAINED HISTORY | iex_rows={report['rows']:,} iex_symbols={report['symbols']} sessions={report['session_dates']} outcome_repair_rows={report['outcome_repair_rows']:,}")
           if bars.empty:
-              raise RuntimeError("Alpaca IEX returned no endpoint bars; no backtest was calculated")
+              raise RuntimeError("retained Alpaca IEX history is empty; no backtest was calculated")
           PY
 
       - name: Run causal one-month forecast and 15-minute-rebalance audit
         run: |
           python -m cufolio_cpu.hourly_intraday_backtest \
-            --input artifacts/hourly_paper_cadence_iex_endpoints.csv.gz \
+            --input artifacts/hourly_paper_cadence_iex_history.csv.gz \
+            --outcome-fallback-input artifacts/hourly_paper_cadence_outcome_fallback.csv.gz \
+            --outcome-fallback-source retained_yfinance_1m_exact_outcome_fallback \
             --output-dir artifacts/monthly_hourly_paper_cadence_backtest \
             --paper-cadence \
             --evaluation-start "$EVALUATION_START" \
@@ -186,12 +180,14 @@ jobs:
               "",
               f"- Evaluation: `{status['evaluation_start']}` through `{status['evaluation_end']}`",
               f"- Exact forecast coverage: `{realized}/{considered}` ({status['forecast_coverage']:.1%})",
+              f"- Exact realized coverage among selected forecasts: `{realized}/{status['forecast_windows_selected']}`",
               f"- Expected compounded return on exactly realized windows: `{status['expected_compounded_return_on_realized_windows']:+.4%}`",
               f"- Actual gross compounded return: `{status['actual_gross_compounded_return']:+.4%}`",
               f"- Mean absolute forecast error: `{status['mean_absolute_error_bps']:.2f} bps`",
               f"- Directional accuracy: `{status['directional_accuracy']:.1%}`" if status["directional_accuracy"] is not None else "- Directional accuracy: unavailable",
               f"- 15-minute rebalance rows: `{Path('artifacts/monthly_hourly_paper_cadence_backtest/paper_cadence_quarter_hour_rebalances.csv').read_text().count(chr(10)) - 1}`",
-              "- Data: Alpaca IEX exact one-minute endpoint closes; unavailable endpoints remain unavailable.",
+              f"- Exact execution endpoints repaired from the retained outcome cache: `{status['fallback_repaired_execution_endpoint_prices']}` across `{status['forecast_windows_realized_with_fallback_endpoint']}` forecasts.",
+              "- Data rule: retained Alpaca IEX history fixes every training label, decision, and portfolio; retained Yahoo one-minute data can fill only missing exact realized execution endpoints. Remaining unavailable endpoints stay unavailable.",
           ]
           with Path(os.environ["GITHUB_STEP_SUMMARY"]).open("a", encoding="utf-8") as summary:
               summary.write("\n".join(lines) + "\n")
