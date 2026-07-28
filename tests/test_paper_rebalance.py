@@ -30,6 +30,7 @@ class FakePaperClient:
         self.open_orders = open_orders or []
         self.submitted: list[dict[str, str]] = []
         self.closed_positions: list[str] = []
+        self.bulk_close_requests: list[bool] = []
         self.asset_requests: list[str] = []
         self.mode = "paper"
         self.base_url = "https://paper-api.alpaca.markets/v2"
@@ -57,6 +58,11 @@ class FakePaperClient:
     def close_position(self, symbol: str) -> dict[str, object]:
         self.closed_positions.append(symbol)
         return {"id": f"close-{len(self.closed_positions)}"}
+
+    def close_all_positions(self, *, cancel_orders: bool) -> list[dict[str, object]]:
+        self.bulk_close_requests.append(cancel_orders)
+        self.closed_positions.extend(str(position["symbol"]) for position in self.positions)
+        return [{"id": f"close-{symbol}", "status": 200} for symbol in self.closed_positions]
 
 
 def test_configured_research_targets_are_fully_invested_and_capped() -> None:
@@ -175,6 +181,21 @@ def test_end_of_day_flatten_closes_every_long_position() -> None:
     result = run_end_of_day_flatten(client, execute=True)
     assert result["status"] == "end_of_day_flatten_submitted"
     assert client.closed_positions == ["AAA", "BBB"]
+    assert client.bulk_close_requests == [True]
+
+
+def test_end_of_day_flatten_cancels_open_orders_instead_of_deferring_the_close() -> None:
+    client = FakePaperClient(
+        positions=[{"symbol": "AAA", "side": "long", "market_value": "500", "qty": "5"}],
+        open_orders=[{"id": "still-open"}],
+    )
+
+    result = run_end_of_day_flatten(client, execute=True)
+
+    assert result["status"] == "end_of_day_flatten_submitted"
+    assert result["cancelled_open_orders_before_flatten"] is True
+    assert client.bulk_close_requests == [True]
+    assert client.closed_positions == ["AAA"]
 
 
 def test_end_of_day_transition_retains_overlap_and_exits_only_removed_symbols() -> None:
