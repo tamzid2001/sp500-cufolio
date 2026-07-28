@@ -247,6 +247,21 @@ def test_last_completed_session_minute_never_uses_partial_or_pre_session_bar() -
     ) == pd.Timestamp("2026-07-28T13:20:00Z")
 
 
+def test_complete_history_session_requires_every_hourly_label_endpoint() -> None:
+    day = pd.Timestamp("2026-07-27", tz="America/New_York")
+    endpoints = pd.date_range(day + pd.Timedelta(hours=9, minutes=30), periods=7, freq="h")
+    bars = pd.DataFrame(
+        {
+            "timestamp": endpoints.tz_convert("UTC"),
+            "symbol": ["AAA"] * len(endpoints),
+            "close": range(100, 107),
+        }
+    )
+
+    assert hourly_paper_session._complete_history_sessions(bars, date(2026, 7, 28)) == 1
+    assert hourly_paper_session._complete_history_sessions(bars.iloc[:-1], date(2026, 7, 28)) == 0
+
+
 def test_rolling_history_start_uses_compact_window_and_rejects_too_little_history() -> None:
     reference = pd.Timestamp("2026-07-28T13:20:00Z")
     assert rolling_history_start(reference, calendar_days=45) == "2026-06-13T13:20:00+00:00"

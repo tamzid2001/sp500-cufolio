@@ -48,6 +48,12 @@ LIVE_MINUTE_CACHE_END = clock_time(15, 30)
 # session). Keep a buffer for holidays, sparse symbols, and the strict
 # complete-case covariance step without retaining every one-minute row.
 MINUTE_CACHE_SESSION_LIMIT = 35
+# A 120-scenario optimization consumes six completed hourly labels per full
+# session. Twenty prior sessions provide the intended trailing panel and leave
+# enough room for holidays or a sparse constituent without treating an
+# otherwise non-empty one-day cache as training-ready.
+MINIMUM_HISTORY_SESSIONS = 20
+HISTORY_LABEL_ENDPOINT_TIMES = frozenset(clock_time(hour, 30) for hour in range(9, 16))
 CACHE_ENDPOINT_TIMES = frozenset(
     {
         # Exact decision minutes for the five live forecasts.
@@ -135,6 +141,7 @@ def _history_through(
     decision_at: pd.Timestamp,
     cache_path: Path | None = None,
     minute_stream: AlpacaMinuteBarStream | None = None,
+    force_history_bootstrap: bool = False,
 ) -> pd.DataFrame:
     """Fetch only missing minute bars and merge them into the durable cache.
 
@@ -145,7 +152,11 @@ def _history_through(
     end = decision_at + timedelta(minutes=1)
     requested_symbols = {symbol.upper().strip() for symbol in symbols}
     streamed = minute_stream.completed_bars_through(decision_at) if minute_stream is not None else pd.DataFrame()
-    if bars is None or bars.empty:
+    if force_history_bootstrap:
+        combined = download_minute_bars(symbols, start, end)
+        if bars is not None and not bars.empty:
+            combined = pd.concat([bars, combined], ignore_index=True)
+    elif bars is None or bars.empty:
         try:
             combined = download_minute_bars(symbols, start, end)
         except Exception:
@@ -183,6 +194,20 @@ def _history_through(
     if cache_path is not None:
         _write_minute_cache(cache_path, compact)
     return compact
+
+
+def _complete_history_sessions(bars: pd.DataFrame | None, session_day: date) -> int:
+    """Count earlier local sessions that retain every hourly label endpoint."""
+    if bars is None or bars.empty:
+        return 0
+    timestamps = pd.to_datetime(bars["timestamp"], utc=True, errors="coerce")
+    local = timestamps.dt.tz_convert(NEW_YORK)
+    earlier = local.loc[local.dt.date < session_day]
+    endpoint_rows = earlier.loc[earlier.dt.time.isin(HISTORY_LABEL_ENDPOINT_TIMES)]
+    if endpoint_rows.empty:
+        return 0
+    endpoint_sets = endpoint_rows.groupby(endpoint_rows.dt.date).agg(lambda values: set(values.dt.time))
+    return sum(HISTORY_LABEL_ENDPOINT_TIMES.issubset(times) for times in endpoint_sets)
 
 
 def _minute_cache_projection(bars: pd.DataFrame) -> pd.DataFrame:
@@ -513,25 +538,23 @@ def run_hourly_paper_session(
             f"kind={event.kind} scheduled={event.due_at.isoformat()} observed={observed_at.isoformat()} reason={reason}",
             flush=True,
         )
-    # The full S&P one-minute history is the expensive operation.  Start it
-    # before the first 09:20 forecast, then fetch only the new minutes at each
-    # later forecast.  This keeps the 10:30 paper entry timely without looking
-    # past any forecast's exact observed minute.
+    # The full S&P one-minute history is the expensive operation. Build it
+    # whenever the cache has fewer than twenty complete prior sessions, even
+    # if a handoff begins after 09:20. Without this recovery path, a failed
+    # first-day cache would retain a few live rows forever but never contain
+    # enough completed labels for an hourly forecast.
     events = session_events(session_day)
     first_selection = events[0].selection_at
     assert first_selection is not None
     prefetch_now = now()
     if (
-        (bars is None or bars.empty)
-        and prefetch_now < first_selection
-        and (stop_at is None or first_selection <= stop_at)
+        _complete_history_sessions(bars, session_day) < MINIMUM_HISTORY_SESSIONS
+        and (stop_at is None or prefetch_now <= stop_at)
     ):
-        # The first ever run must build the trailing history.  Later 5h45m
-        # handoffs restore the compact cache and deliberately do no overnight
-        # re-download before the 09:20 selection minute is available.
         print(
             "HOURLY HISTORY BOOTSTRAP STARTED | "
-            f"start={history_start} through={prefetch_now.isoformat()} symbols={len(symbols)}",
+            f"start={history_start} through={prefetch_now.isoformat()} symbols={len(symbols)} "
+            f"complete_sessions={_complete_history_sessions(bars, session_day)}",
             flush=True,
         )
         bootstrap_started = time.monotonic()
@@ -542,6 +565,7 @@ def run_hourly_paper_session(
             decision_at=prefetch_now,
             cache_path=minute_cache_file,
             minute_stream=minute_stream,
+            force_history_bootstrap=True,
         )
         print(
             "HOURLY HISTORY BOOTSTRAP READY | "
