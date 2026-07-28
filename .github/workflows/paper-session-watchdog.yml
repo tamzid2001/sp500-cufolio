@@ -1,4 +1,4 @@
-name: 24/7 hourly paper runner watchdog
+name: 24/7 five-minute paper runner watchdog
 
 on:
   schedule:
@@ -17,7 +17,7 @@ jobs:
   monitor:
     runs-on: ubuntu-latest
     steps:
-      - name: Monitor the actual 24/7 hourly paper runner
+      - name: Monitor the actual 24/7 five-minute paper runner
         env:
           GH_TOKEN: ${{ github.token }}
           REPOSITORY: ${{ github.repository }}
@@ -68,13 +68,13 @@ jobs:
           IFS='|' read -r decision run_id run_status conclusion updated_at age_seconds head_sha run_url <<< "$assessment"
           echo "WATCHDOG STATUS | runner=${run_id} status=${run_status} conclusion=${conclusion} age=${age_seconds}s updated=${updated_at} sha=${head_sha} url=${run_url}"
           {
-            echo "### 24/7 hourly paper watchdog"
+            echo "### 24/7 five-minute paper watchdog"
             echo "- Decision: \`${decision}\`"
             echo "- Runner: [${run_id}](${run_url}) — status \`${run_status}\`, age ${age_seconds}s, SHA \`${head_sha}\`"
           } >> "$GITHUB_STEP_SUMMARY"
           case "$decision" in
             ok)
-              echo "WATCHDOG OK | 24/7 hourly paper runner is active or queued; no duplicate dispatch."
+              echo "WATCHDOG OK | 24/7 five-minute paper runner is active or queued; no duplicate dispatch."
               exit 0
               ;;
             wait)
@@ -82,7 +82,7 @@ jobs:
               exit 0
               ;;
             recover)
-              echo "WATCHDOG RECOVERY REQUIRED | no active 24/7 hourly paper runner."
+              echo "WATCHDOG RECOVERY REQUIRED | no active 24/7 five-minute paper runner."
               ;;
             *)
               echo "::error::Watchdog produced an invalid decision: $decision"
@@ -90,4 +90,4 @@ jobs:
               ;;
           esac
           gh workflow run hourly-paper-24x7.yml --repo "$REPOSITORY" --ref main -f run_seconds=20700
-          echo "WATCHDOG DISPATCHED | 24/7 hourly paper runner recovery queued."
+          echo "WATCHDOG DISPATCHED | 24/7 five-minute paper runner recovery queued."

@@ -8,9 +8,11 @@ import pandas as pd
 from cufolio_cpu.fifteen_minute_intraday_backtest import run_fifteen_minute_forecast_backtest
 from cufolio_cpu.five_minute_intraday_backtest import (
     NEW_YORK,
+    generate_intraday_forecast_candidate,
     _render_markdown_report,
     reconcile_intraday_forecast_outcomes,
     run_five_minute_forecast_backtest,
+    run_intraday_forecast_backtest_range,
 )
 
 
@@ -99,6 +101,61 @@ def test_future_target_prices_do_not_change_the_first_five_minute_forecast() -> 
         .loc[:, ["symbol", "target_weight", "predicted_asset_log_return"]]
         .reset_index(drop=True),
     )
+
+
+def test_five_minute_candidate_uses_the_prior_completed_decision_bar() -> None:
+    bars = _minute_bars()
+    decision = pd.Timestamp("2026-01-19T14:35:00Z")  # 09:35 New York
+    baseline = generate_intraday_forecast_candidate(
+        bars,
+        decision_at=decision,
+        top_n=3,
+        max_weight=0.50,
+        lookback_observations=780,
+        min_training_sessions=10,
+        min_covariance_scenarios=500,
+    )
+    # The 09:35-labelled bar is not complete until 09:36. Removing all of
+    # those future-at-decision observations must not change the 09:35 target.
+    without_incomplete_bar = bars.loc[pd.to_datetime(bars["timestamp"], utc=True).ne(decision)].copy()
+    causal = generate_intraday_forecast_candidate(
+        without_incomplete_bar,
+        decision_at=decision,
+        top_n=3,
+        max_weight=0.50,
+        lookback_observations=780,
+        min_training_sessions=10,
+        min_covariance_scenarios=500,
+    )
+
+    assert baseline.status["weights_generated"]
+    assert causal.status["weights_generated"]
+    assert baseline.status["decision_price_timestamp"] == "2026-01-19T14:34:00+00:00"
+    pd.testing.assert_frame_equal(baseline.weights, causal.weights)
+
+
+def test_multi_session_five_minute_audit_keeps_each_session_and_causal_boundaries() -> None:
+    result = run_intraday_forecast_backtest_range(
+        _minute_bars(),
+        interval_minutes=5,
+        evaluation_start="2026-01-16",
+        evaluation_end="2026-01-19",
+        top_n=3,
+        max_weight=0.50,
+        lookback_observations=780,
+        min_training_sessions=10,
+        min_covariance_scenarios=500,
+    )
+    assert result.summary["evaluation_sessions"] == 2
+    assert result.summary["evaluation_start"] == "2026-01-16"
+    assert result.summary["evaluation_end"] == "2026-01-19"
+    assert len(result.ledger) == 154
+    assert result.ledger["session_date"].nunique() == 2
+    assert set(result.ledger["forecast_status"]) == {"ok"}
+    assert (
+        pd.to_datetime(result.ledger["training_end"], utc=True)
+        < pd.to_datetime(result.ledger["decision_timestamp"], utc=True)
+    ).all()
 
 
 def test_missing_realized_endpoint_marks_a_forecast_incomplete_without_reweighting() -> None:
