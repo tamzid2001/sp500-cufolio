@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  actions: write
+  actions: read
   contents: read
 
 concurrency:
@@ -14,36 +14,40 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  recover:
+  monitor:
     runs-on: ubuntu-latest
     steps:
-      - name: Restart a broken session chain only
+      - name: Monitor the actual bounded hourly paper session
         env:
           GH_TOKEN: ${{ github.token }}
           REPOSITORY: ${{ github.repository }}
         run: |
           set -euo pipefail
-          runs="$(gh run list --repo "$REPOSITORY" --workflow 'Paper market-session runner' --limit 20 --json status,conclusion,updatedAt)"
-          RUNS="$runs" python - <<'PY' > decision.txt
-          import json, os
-          from datetime import datetime, timedelta, timezone
+          runs="$(gh run list --repo "$REPOSITORY" --workflow 'july-28-hourly-paper-session.yml' --limit 20 --json status,conclusion,updatedAt)"
+          RUNS="$runs" python - <<'PY'
+          import json, os, sys
+          from datetime import datetime, time
+          from zoneinfo import ZoneInfo
+
+          new_york = ZoneInfo("America/New_York")
+          now = datetime.now(new_york)
+          session_date = datetime(2026, 7, 28, tzinfo=new_york).date()
+          session_open = time(9, 20)
+          session_done = time(15, 45)
+          if now.date() != session_date or not session_open <= now.time() < session_done:
+              print("Outside the July 28 09:20--15:45 ET monitoring window.")
+              raise SystemExit(0)
 
           runs = json.loads(os.environ["RUNS"])
           active = {"queued", "in_progress", "pending", "requested", "waiting"}
           if any(run["status"] in active for run in runs):
-              print("healthy")
-              raise SystemExit
+              print("Hourly paper session is active.")
+              raise SystemExit(0)
           if not runs:
-              print("restart")
-              raise SystemExit
+              sys.exit("No hourly paper-session run was found during its expected window.")
           latest = max(runs, key=lambda run: run["updatedAt"])
-          updated = datetime.fromisoformat(latest["updatedAt"].replace("Z", "+00:00"))
-          stale = datetime.now(timezone.utc) - updated > timedelta(minutes=10)
-          print("restart" if latest["conclusion"] != "success" or stale else "healthy")
+          sys.exit(
+              "Hourly paper session is not active during its expected window; "
+              f"latest conclusion={latest['conclusion']!r}, updatedAt={latest['updatedAt']}."
+          )
           PY
-          if [ "$(cat decision.txt)" = healthy ]; then
-            echo "A session runner is active or the latest handoff is still healthy."
-            exit 0
-          fi
-          echo "::warning::Session chain is absent, failed, cancelled, or stale; dispatching recovery run."
-          gh workflow run paper-session-runner.yml --repo "$REPOSITORY" --ref main -f session=am

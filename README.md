@@ -168,7 +168,11 @@ python -m cufolio_cpu.daily_cycle \
 ```
 
 Only add `--execute` after reviewing the plan. Live credentials never fall back
-to the paper variables, and no GitHub Actions live-trading workflow is enabled.
+to the paper variables. The manual-only hourly live workflow also requires the
+literal `SUBMIT_LIVE_ORDERS` confirmation plus GitHub's `live-trading`
+environment, which should be configured with required reviewers and separate
+`ALPACA_LIVE_API_KEY` / `ALPACA_LIVE_SECRET_KEY` secrets. It has no cron
+schedule, and the hourly paper workflow remains paper-only.
 
 ## yfinance (credential-free research)
 

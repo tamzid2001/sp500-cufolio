@@ -1,10 +1,10 @@
-"""Paper-only, 70-minute-ahead hourly portfolio forecast session.
+"""Paper-first hourly portfolio forecast session with 15-minute rebalancing.
 
 This runner is intentionally separate from the daily paper worker.  It holds
 one process for a bounded regular-session window, forecasts each one-hour
-target 70 minutes before it begins, and submits *paper* rebalances every
-fifteen minutes during that target.  It never accepts a live-trading mode or
-credentials.
+target before it begins, and submits rebalances every fifteen minutes during
+that target. Paper trading is the default; live mode requires a separate,
+explicit acknowledgement and separate credentials.
 """
 
 from __future__ import annotations
@@ -26,8 +26,18 @@ from .hourly_intraday_backtest import NEW_YORK, generate_hourly_one_hour_candida
 from .paper_rebalance import AlpacaTradingClient, load_target_weights, run_end_of_day_flatten, run_rebalance
 from .universe import current_sp500_universe
 
-TARGET_START_HOURS = (10, 11, 12, 13, 14)
 FORECAST_LEAD = timedelta(hours=1, minutes=10)
+FINAL_TARGET_REFRESH_LEAD = timedelta(minutes=10)
+TARGET_FORECAST_LEADS = (
+    (10, FORECAST_LEAD),
+    (11, FORECAST_LEAD),
+    (12, FORECAST_LEAD),
+    (13, FORECAST_LEAD),
+    # The final 14:30--15:30 target is refreshed at 14:20 using the newest
+    # observed minute, as requested.  It replaces the old 70-minute lead for
+    # this final window; there is no duplicate target or duplicate order.
+    (14, FINAL_TARGET_REFRESH_LEAD),
+)
 MAX_START_LAG = timedelta(minutes=10)
 
 
@@ -42,17 +52,17 @@ class SessionEvent:
 def session_events(session_day: date) -> list[SessionEvent]:
     """Return the exact paper-session schedule for a New York session date.
 
-    Forecasts are made at 09:20, 10:20, ..., 13:20 New York time using only
-    the exact observed selection-minute price.  They target the respectively
-    later 10:30--11:30 through 14:30--15:30 windows.  Each target is first
-    paper-rebalanced at its start and then at +15, +30, and +45 minutes.  A
-    15:30 target start is intentionally impossible because its one-hour
-    holding window would cross the regular-session close.
+    Forecasts are made at 09:20, 10:20, 11:20, 12:20, and 14:20 New York
+    time using only the exact observed selection-minute price. They target
+    the respectively later 10:30--11:30 through 14:30--15:30 windows. The
+    final 14:20 selection produces the 14:30--15:30 target requested by the
+    user. Each target is first rebalanced at its start and then at +15, +30,
+    and +45 minutes, followed by a 15:30 flatten.
     """
     events: list[SessionEvent] = []
-    for hour in TARGET_START_HOURS:
+    for hour, forecast_lead in TARGET_FORECAST_LEADS:
         target_start = pd.Timestamp.combine(session_day, clock_time(hour, 30)).tz_localize(NEW_YORK).tz_convert("UTC")
-        selection_at = target_start - FORECAST_LEAD
+        selection_at = target_start - forecast_lead
         events.append(SessionEvent("select", selection_at, selection_at, target_start))
         for minutes in (0, 15, 30, 45):
             events.append(
@@ -114,21 +124,26 @@ def run_hourly_paper_session(
     risk_aversion: float = 10.0,
     min_order_notional: Decimal = Decimal("1"),
     min_weight_drift: Decimal = Decimal("0.0025"),
+    mode: Literal["paper", "live"] = "paper",
+    allow_live_trading: bool = False,
     now: Callable[[], pd.Timestamp] = _utc_timestamp,
     sleep: Callable[[float], None] = time.sleep,
 ) -> list[dict[str, object]]:
-    """Run the bounded paper-only selection/rebalance/flatten session.
+    """Run the bounded selection/rebalance/flatten session.
 
     A delayed GitHub Actions start of more than ten minutes after a planned
-    selection fails closed before submitting any stale paper order.
+    selection fails closed before submitting any stale order. ``live`` is
+    deliberately unavailable unless ``allow_live_trading`` is explicit.
     """
+    if mode == "live" and not allow_live_trading:
+        raise ValueError("live mode requires allow_live_trading=True")
     output = Path(output_dir)
     output.mkdir(parents=True, exist_ok=True)
     universe = current_sp500_universe()
     symbol_column = "source_symbol" if "source_symbol" in universe.columns else "symbol"
     symbols = universe[symbol_column].dropna().astype(str).str.upper().drop_duplicates().to_list()
     universe.to_csv(output / "current_sp500_universe.csv", index=False)
-    client = AlpacaTradingClient.from_environment(mode="paper")
+    client = AlpacaTradingClient.from_environment(mode=mode)
     bars: pd.DataFrame | None = None
     targets_by_start: dict[pd.Timestamp, dict[str, Decimal]] = {}
     forecast_details: dict[pd.Timestamp, dict[str, object]] = {}
@@ -153,7 +168,7 @@ def run_hourly_paper_session(
             assert event.target_start is not None
             if observed_at > event.due_at + MAX_START_LAG:
                 raise RuntimeError(
-                    f"forecast selection at {event.selection_at.isoformat()} is too late for the planned paper entry: "
+                    f"forecast selection at {event.selection_at.isoformat()} is too late for the planned entry: "
                     f"runner reached it at {observed_at.isoformat()}"
                 )
             bars = _history_through(bars, symbols, start=history_start, decision_at=event.selection_at)
@@ -172,7 +187,7 @@ def run_hourly_paper_session(
                 max_weight=float(max_weight),
                 risk_aversion=risk_aversion,
             )
-            stamp = event.target_start.strftime("%H%M")
+            stamp = f"{event.target_start.strftime('%H%M')}_from_{event.selection_at.strftime('%H%M')}"
             candidate_path = output / f"candidate_for_{stamp}.csv"
             candidate.weights.to_csv(candidate_path, index=False)
             _write_json(output / f"candidate_{stamp}_status.json", candidate.status)
@@ -187,6 +202,7 @@ def run_hourly_paper_session(
                 "selection_timestamp": event.selection_at.isoformat(),
                 "target_start": event.target_start.isoformat(),
                 "target_end": candidate.status["target_end"],
+                "trading_mode": client.mode,
                 "expected_one_hour_log_return": expected_log,
                 "expected_one_hour_simple_return": float(np.expm1(expected_log)),
                 "candidate_file": candidate_path.name,
@@ -204,7 +220,7 @@ def run_hourly_paper_session(
             assert event.target_start is not None
             if observed_at > event.due_at + MAX_START_LAG:
                 raise RuntimeError(
-                    f"paper rebalance for {event.target_start.isoformat()} is too late: "
+                    f"portfolio rebalance for {event.target_start.isoformat()} is too late: "
                     f"runner reached it at {observed_at.isoformat()}"
                 )
             if event.target_start not in targets_by_start:
@@ -241,7 +257,7 @@ def run_hourly_paper_session(
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Run a bounded causal hourly Alpaca paper-trading session.")
+    parser = argparse.ArgumentParser(description="Run a bounded causal hourly Alpaca portfolio session.")
     parser.add_argument("--session-date", required=True, help="New York session date, YYYY-MM-DD")
     parser.add_argument("--history-start", required=True, help="UTC start for one-minute training history")
     parser.add_argument("--output-dir", required=True)
@@ -252,7 +268,15 @@ def main() -> None:
     parser.add_argument("--risk-aversion", type=float, default=10.0)
     parser.add_argument("--min-order-notional", type=Decimal, default=Decimal("1"))
     parser.add_argument("--min-weight-drift", type=Decimal, default=Decimal("0.0025"))
+    parser.add_argument("--mode", choices=["paper", "live"], default="paper")
+    parser.add_argument(
+        "--allow-live-trading",
+        action="store_true",
+        help="required with --mode live; paper is the default",
+    )
     args = parser.parse_args()
+    if args.mode == "live" and not args.allow_live_trading:
+        parser.error("--mode live requires --allow-live-trading and ALPACA_LIVE_* credentials")
     ledger = run_hourly_paper_session(
         session_day=date.fromisoformat(args.session_date),
         history_start=args.history_start,
@@ -264,8 +288,10 @@ def main() -> None:
         risk_aversion=args.risk_aversion,
         min_order_notional=args.min_order_notional,
         min_weight_drift=args.min_weight_drift,
+        mode=args.mode,
+        allow_live_trading=args.allow_live_trading,
     )
-    print(f"Completed {len(ledger)} paper-session events")
+    print(f"Completed {len(ledger)} {args.mode}-session events")
 
 
 if __name__ == "__main__":
