@@ -20,9 +20,15 @@ from typing import Any, Callable, Literal
 
 import pandas as pd
 
-from .alpaca import AlpacaMinuteBarStream, download_minute_bars, download_yfinance_minute_bars
+from .alpaca import (
+    AlpacaMinuteBarStream,
+    download_minute_bars,
+    download_minute_endpoint_bars,
+    download_yfinance_minute_bars,
+)
 from .five_minute_intraday_backtest import (
     NEW_YORK,
+    OPENING_DECISION_PRICE_TIME,
     SESSION_CLOSE,
     SESSION_OPEN,
     _decision_grid,
@@ -32,10 +38,11 @@ from .hourly_paper_session import MinuteCacheHealth
 from .paper_rebalance import AlpacaTradingClient, load_target_weights, run_end_of_day_flatten, run_rebalance
 from .universe import current_sp500_universe
 
-# 780 five-minute observations need just over ten full sessions. Retaining 16
-# sessions leaves fifteen completed sessions after today's first bar arrives:
-# enough for the exact trailing model window while avoiding a 35-session pivot
-# at every Action handoff.
+# The opening-inclusive five-minute grid provides 78 labels per session, so
+# 780 observations require ten completed sessions. Retaining 16 sessions
+# leaves fifteen completed sessions after today's first bar arrives: enough
+# for the exact trailing model window while avoiding a 35-session pivot at
+# every Action handoff.
 MINUTE_CACHE_SESSION_LIMIT = 16
 MINIMUM_HISTORY_SESSIONS = 10
 MAX_EVENT_LAG = timedelta(seconds=90)
@@ -63,13 +70,21 @@ def _utc_timestamp(value: datetime | pd.Timestamp | None = None) -> pd.Timestamp
 
 
 def five_minute_events(session_day: date) -> list[tuple[str, pd.Timestamp]]:
-    """Return 09:35--15:55 decisions and the 15:59 flat-close event.
+    """Return 09:30--15:55 decisions and the 15:59 flat-close event.
 
-    The first 09:35 decision uses the completed 09:30--09:34 opening data.
+    The first 09:30 decision uses the completed 09:29 left-labelled bar and
+    forecasts the 09:30--09:35 opening window.
     The final 15:55 decision is handled by a separately trained four-minute
     model so its target ends exactly at the 15:59 flatten boundary.
     """
-    return [("forecast_and_order", at) for at in _decision_grid(session_day, interval_minutes=FORECAST_CADENCE_MINUTES)] + [
+    return [
+        ("forecast_and_order", at)
+        for at in _decision_grid(
+            session_day,
+            interval_minutes=FORECAST_CADENCE_MINUTES,
+            opening_decision=True,
+        )
+    ] + [
         (
             "flatten",
             (
@@ -114,7 +129,11 @@ def _regular_minute_cache_projection(bars: pd.DataFrame) -> pd.DataFrame:
     if clean.empty:
         return pd.DataFrame(columns=["timestamp", "symbol", "close"])
     local = clean["timestamp"].dt.tz_convert(NEW_YORK)
-    clean = clean.loc[(local.dt.time >= SESSION_OPEN) & (local.dt.time < SESSION_CLOSE)].copy()
+    keep = (
+        ((local.dt.time >= SESSION_OPEN) & (local.dt.time < SESSION_CLOSE))
+        | (local.dt.time == OPENING_DECISION_PRICE_TIME)
+    )
+    clean = clean.loc[keep].copy()
     if clean.empty:
         return pd.DataFrame(columns=["timestamp", "symbol", "close"])
     local = clean["timestamp"].dt.tz_convert(NEW_YORK)
@@ -158,9 +177,13 @@ def _write_minute_cache(path: Path, bars: pd.DataFrame) -> None:
 
 def _completed_bar_at(observed_at: pd.Timestamp, session_day: date) -> pd.Timestamp | None:
     completed = _utc_timestamp(observed_at).floor("min") - timedelta(minutes=1)
-    open_at = pd.Timestamp.combine(session_day, SESSION_OPEN).tz_localize(NEW_YORK).tz_convert("UTC")
+    opening_anchor = (
+        pd.Timestamp.combine(session_day, OPENING_DECISION_PRICE_TIME)
+        .tz_localize(NEW_YORK)
+        .tz_convert("UTC")
+    )
     close_at = pd.Timestamp.combine(session_day, SESSION_CLOSE).tz_localize(NEW_YORK).tz_convert("UTC") - timedelta(minutes=1)
-    if completed < open_at:
+    if completed < opening_anchor:
         return None
     return min(completed, close_at)
 
@@ -223,12 +246,16 @@ def _merge_current_minutes(
     normalized = bars
     if not isinstance(normalized.get("timestamp", pd.Series(dtype="object")).dtype, pd.DatetimeTZDtype):
         normalized = _regular_minute_cache_projection(normalized)
-    session_open = pd.Timestamp.combine(session_day, SESSION_OPEN).tz_localize(NEW_YORK).tz_convert("UTC")
+    session_anchor = (
+        pd.Timestamp.combine(session_day, OPENING_DECISION_PRICE_TIME)
+        .tz_localize(NEW_YORK)
+        .tz_convert("UTC")
+    )
     today = pd.to_datetime(normalized["timestamp"], utc=True).dt.tz_convert(NEW_YORK).dt.date.eq(session_day)
     current = normalized.loc[today]
     # Re-request a small overlap to repair sparse websocket minutes and a
     # partial provider response without downloading the historical panel again.
-    fetch_start = session_open if current.empty else max(session_open, current["timestamp"].max() - timedelta(minutes=4))
+    fetch_start = session_anchor if current.empty else max(session_anchor, current["timestamp"].max() - timedelta(minutes=4))
     if fetch_start > completed:
         fetch_start = completed
     incremental = pd.DataFrame(columns=["timestamp", "symbol", "close"])
@@ -281,6 +308,17 @@ def _prior_sessions(bars: pd.DataFrame, session_day: date) -> int:
         return 0
     days = pd.to_datetime(bars["timestamp"], utc=True).dt.tz_convert(NEW_YORK).dt.date
     return int(days[days < session_day].nunique())
+
+
+def _prior_opening_anchor_sessions(bars: pd.DataFrame, session_day: date) -> int:
+    """Count prior sessions with the causal 09:29 opening decision price."""
+    if bars.empty:
+        return 0
+    timestamps = pd.to_datetime(bars["timestamp"], utc=True).dt.tz_convert(NEW_YORK)
+    anchor_days = timestamps.loc[
+        (timestamps.dt.time == OPENING_DECISION_PRICE_TIME) & (timestamps.dt.date < session_day)
+    ].dt.date
+    return int(anchor_days.nunique())
 
 
 def _default_checkpoint(session_day: date) -> dict[str, object]:
@@ -379,11 +417,33 @@ def run_five_minute_paper_session(
             print(f"FIVE MINUTE HISTORY BOOTSTRAPPED | {_cache_summary(bars)}", flush=True)
         except Exception as error:
             _record_degraded(health, "alpaca_iex_history", _utc_timestamp(), error)
+    elif _prior_opening_anchor_sessions(bars, session_day) < MINIMUM_HISTORY_SESSIONS:
+        # Older retained caches began at 09:30.  Fetch only the missing 09:29
+        # endpoints rather than re-downloading the multi-million-row history,
+        # so the opening model has the same causal anchor as a fresh cache.
+        try:
+            opening_anchors = download_minute_endpoint_bars(
+                symbols,
+                history_start,
+                _utc_timestamp(),
+                endpoint_times={OPENING_DECISION_PRICE_TIME},
+            )
+            bars = _regular_minute_cache_projection(pd.concat([bars, opening_anchors], ignore_index=True))
+            if cache_file is not None:
+                _write_minute_cache(cache_file, bars)
+            print(
+                "FIVE MINUTE OPENING ANCHORS BACKFILLED | "
+                f"prior_sessions={_prior_opening_anchor_sessions(bars, session_day)} {_cache_summary(bars)}",
+                flush=True,
+            )
+        except Exception as error:
+            _record_degraded(health, "alpaca_iex_opening_anchor_history", _utc_timestamp(), error)
     def build_engine(forecast_horizon_minutes: int) -> RealtimeIntradayForecastEngine:
         return RealtimeIntradayForecastEngine(
             bars,
             interval_minutes=FORECAST_CADENCE_MINUTES,
             forecast_horizon_minutes=forecast_horizon_minutes,
+            opening_decision=True,
             top_n=top_n,
             max_weight=float(max_weight),
             risk_aversion=risk_aversion,

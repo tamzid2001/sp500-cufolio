@@ -25,6 +25,9 @@ from .optimize import forecast_mean_variance_weights
 NEW_YORK = ZoneInfo("America/New_York")
 SESSION_OPEN = clock_time(9, 30)
 SESSION_CLOSE = clock_time(16, 0)
+# Alpaca minute bars are left-labelled.  The 09:29 bar has closed at the
+# 09:30 market open and is the causal opening decision price.
+OPENING_DECISION_PRICE_TIME = clock_time(9, 29)
 FORECAST_INTERVAL_MINUTES = 5
 FORECAST_HORIZON_MINUTES = 5
 MINUTE_BAR_WIDTH = timedelta(minutes=1)
@@ -73,9 +76,14 @@ def _regular_session_minute_closes(bars: pd.DataFrame) -> pd.DataFrame:
     clean = clean.drop_duplicates(["timestamp", "symbol"], keep="last")
     local = clean["timestamp"].dt.tz_convert(NEW_YORK)
     # Alpaca labels a minute bar with the *left* side of the interval.  The
-    # regular session therefore contains 09:30 through 15:59, not a synthetic
-    # 16:00 bar.  See the Market Data FAQ linked in the README.
-    regular = (local.dt.time >= SESSION_OPEN) & (local.dt.time < SESSION_CLOSE)
+    # tradable regular session contains 09:30 through 15:59, and the exact
+    # 09:29 pre-open bar is retained only as the fully closed decision-price
+    # anchor for the 09:30 forecast.  No other extended-hours observations
+    # enter the model.
+    regular = (
+        ((local.dt.time >= SESSION_OPEN) & (local.dt.time < SESSION_CLOSE))
+        | (local.dt.time == OPENING_DECISION_PRICE_TIME)
+    )
     clean = clean.loc[regular].copy()
     if clean.empty:
         raise ValueError("no positive one-minute closes fall in the US regular session")
@@ -87,11 +95,22 @@ def _timestamp(session_day: date, at: clock_time) -> pd.Timestamp:
     return pd.Timestamp.combine(session_day, at).tz_localize(NEW_YORK).tz_convert("UTC")
 
 
-def _decision_grid(session_day: date, *, interval_minutes: int) -> pd.DatetimeIndex:
-    # A decision at 09:30 cannot causally use the 09:30 one-minute close: that
-    # close is only known just after 09:31.  Start after the first complete
-    # interval, and use the prior bar's close for every decision below.
-    start = _timestamp(session_day, SESSION_OPEN) + timedelta(minutes=interval_minutes)
+def _decision_grid(
+    session_day: date,
+    *,
+    interval_minutes: int,
+    opening_decision: bool = False,
+) -> pd.DatetimeIndex:
+    """Return causal decision boundaries for one regular session.
+
+    The five-minute production strategy opts into the 09:30 opening decision,
+    whose eligibility price is the completed 09:29 left-labelled minute bar.
+    Other interval audits retain their established first boundary at one full
+    interval after the open unless they explicitly opt in.
+    """
+    start = _timestamp(session_day, SESSION_OPEN)
+    if not opening_decision:
+        start += timedelta(minutes=interval_minutes)
     final_decision = _timestamp(session_day, SESSION_CLOSE) - timedelta(minutes=interval_minutes)
     return pd.date_range(start, final_decision, freq=f"{interval_minutes}min")
 
@@ -122,13 +141,18 @@ def _non_overlapping_label_panel(
     *,
     interval_minutes: int,
     forecast_horizon_minutes: int | None = None,
+    opening_decision: bool = False,
 ) -> tuple[pd.DataFrame, pd.Series]:
     """Return non-overlapping intraday log-return labels and their ends."""
     horizon = _resolve_forecast_horizon_minutes(interval_minutes, forecast_horizon_minutes)
     rows: list[pd.Series] = []
     ends: dict[pd.Timestamp, pd.Timestamp] = {}
     for session_day in session_days:
-        for decision_at in _decision_grid(session_day, interval_minutes=interval_minutes):
+        for decision_at in _decision_grid(
+            session_day,
+            interval_minutes=interval_minutes,
+            opening_decision=opening_decision,
+        ):
             target_end = decision_at + timedelta(minutes=horizon)
             start_prices = closes.reindex([_close_timestamp_known_at(decision_at)]).iloc[0]
             end_prices = closes.reindex([_close_timestamp_known_at(target_end)]).iloc[0]
@@ -362,7 +386,7 @@ class RealtimeIntradayForecastEngine:
     Expensive regular-session cleaning, pivoting, and historical labels are
     constructed exactly once per handoff slice. ``update_minute_bars`` only
     writes new completed bars into that panel and refreshes the affected
-    session's 77 label rows. The engine never uses a decision's in-progress
+    session's configured causal label rows. The engine never uses a decision's in-progress
     minute bar; callers provide it only after it has completed.
     """
 
@@ -372,6 +396,7 @@ class RealtimeIntradayForecastEngine:
         *,
         interval_minutes: int = FORECAST_INTERVAL_MINUTES,
         forecast_horizon_minutes: int | None = None,
+        opening_decision: bool = False,
         top_n: int = 20,
         max_weight: float = 0.10,
         risk_aversion: float = 10.0,
@@ -394,6 +419,7 @@ class RealtimeIntradayForecastEngine:
         self._forecast_horizon_minutes = _resolve_forecast_horizon_minutes(
             interval_minutes, forecast_horizon_minutes
         )
+        self._opening_decision = opening_decision
         self._top_n = top_n
         self._max_weight = max_weight
         self._risk_aversion = risk_aversion
@@ -408,6 +434,7 @@ class RealtimeIntradayForecastEngine:
             self._available_days,
             interval_minutes=self._interval_minutes,
             forecast_horizon_minutes=self._forecast_horizon_minutes,
+            opening_decision=self._opening_decision,
         )
         self._prepared: dict[pd.Timestamp, _PreparedIntradayTraining] = {}
 
@@ -419,18 +446,26 @@ class RealtimeIntradayForecastEngine:
     def forecast_horizon_minutes(self) -> int:
         return self._forecast_horizon_minutes
 
-    def _validate_decision(self, decision: pd.Timestamp) -> date:
+    def _validate_decision(self, decision: pd.Timestamp, *, require_session_data: bool) -> date:
         session_day = decision.tz_convert(NEW_YORK).date()
-        if session_day not in self._available_days:
+        if require_session_data and session_day not in self._available_days:
             raise ValueError("decision_at session is not present in the supplied regular-session bars")
-        if decision not in _decision_grid(session_day, interval_minutes=self._interval_minutes):
+        if decision not in _decision_grid(
+            session_day,
+            interval_minutes=self._interval_minutes,
+            opening_decision=self._opening_decision,
+        ):
             raise ValueError(
                 f"decision_at must be one of the causal {self._interval_minutes}-minute session boundaries"
             )
         return session_day
 
     def _refresh_session_labels(self, session_day: date) -> None:
-        decisions = _decision_grid(session_day, interval_minutes=self._interval_minutes)
+        decisions = _decision_grid(
+            session_day,
+            interval_minutes=self._interval_minutes,
+            opening_decision=self._opening_decision,
+        )
         starts = self._closes.reindex(index=decisions - MINUTE_BAR_WIDTH)
         ends = self._closes.reindex(
             index=decisions + timedelta(minutes=self._forecast_horizon_minutes) - MINUTE_BAR_WIDTH
@@ -464,7 +499,11 @@ class RealtimeIntradayForecastEngine:
     def prepare_for_decision(self, decision_at: str | pd.Timestamp, *, prepared_at: str | pd.Timestamp | None = None) -> None:
         """Precompute immutable training inputs before the decision's final bar is known."""
         decision = _as_utc_timestamp(decision_at)
-        self._validate_decision(decision)
+        # At 09:29, one minute before the opening decision, today's 09:29
+        # bar is still in progress.  Historical training is nevertheless
+        # fixed and can be prepared before the current session exists in the
+        # panel; the final candidate still requires that completed anchor.
+        self._validate_decision(decision, require_session_data=False)
         training = self._labels.loc[
             self._target_ends.reindex(self._labels.index) < decision
         ].tail(self._lookback_observations).copy()
@@ -478,7 +517,7 @@ class RealtimeIntradayForecastEngine:
     def generate_candidate(self, decision_at: str | pd.Timestamp) -> IntradayForecastCandidate:
         """Finalize one prepared forecast using the now-completed decision price."""
         decision = _as_utc_timestamp(decision_at)
-        self._validate_decision(decision)
+        self._validate_decision(decision, require_session_data=True)
         prepared = self._prepared.get(decision)
         if prepared is None:
             self.prepare_for_decision(decision)
@@ -515,6 +554,7 @@ def generate_intraday_forecast_candidate(
     decision_at: str | pd.Timestamp,
     interval_minutes: int = FORECAST_INTERVAL_MINUTES,
     forecast_horizon_minutes: int | None = None,
+    opening_decision: bool = False,
     top_n: int = 20,
     max_weight: float = 0.10,
     risk_aversion: float = 10.0,
@@ -535,6 +575,7 @@ def generate_intraday_forecast_candidate(
         minute_bars,
         interval_minutes=interval_minutes,
         forecast_horizon_minutes=forecast_horizon_minutes,
+        opening_decision=opening_decision,
         top_n=top_n,
         max_weight=max_weight,
         risk_aversion=risk_aversion,
@@ -855,6 +896,7 @@ def run_intraday_forecast_backtest_range(
     interval_minutes: int,
     evaluation_start: str | date,
     evaluation_end: str | date,
+    opening_decision: bool = False,
     top_n: int = 20,
     max_weight: float = 0.10,
     risk_aversion: float = 10.0,
@@ -891,13 +933,20 @@ def run_intraday_forecast_backtest_range(
         raise ValueError("the requested evaluation range has no regular sessions in the supplied bars")
     closes = clean.pivot(index="timestamp", columns="symbol", values="close").sort_index()
     labels, target_ends = _non_overlapping_label_panel(
-        closes, available_days, interval_minutes=interval_minutes
+        closes,
+        available_days,
+        interval_minutes=interval_minutes,
+        opening_decision=opening_decision,
     )
 
     ledger_rows: list[dict[str, object]] = []
     holdings_rows: list[dict[str, object]] = []
     for evaluated_day in evaluated_days:
-        for decision_at in _decision_grid(evaluated_day, interval_minutes=interval_minutes):
+        for decision_at in _decision_grid(
+            evaluated_day,
+            interval_minutes=interval_minutes,
+            opening_decision=opening_decision,
+        ):
             target_end = decision_at + timedelta(minutes=interval_minutes)
             weights, expected_by_asset, diagnostic = _select_portfolio(
                 labels,
@@ -979,6 +1028,7 @@ def run_intraday_forecast_backtest_range(
             "evaluation_start": first.isoformat(),
             "evaluation_end": last.isoformat(),
             "evaluation_sessions": int(len(evaluated_days)),
+            "opening_decision": bool(opening_decision),
         }
     )
     return FiveMinuteForecastBacktestResult(ledger=ledger, holdings=holdings, summary=summary)
@@ -989,6 +1039,7 @@ def run_intraday_forecast_backtest(
     *,
     interval_minutes: int,
     session_date: str | date | None = None,
+    opening_decision: bool = False,
     top_n: int = 20,
     max_weight: float = 0.10,
     risk_aversion: float = 10.0,
@@ -1010,6 +1061,7 @@ def run_intraday_forecast_backtest(
         interval_minutes=interval_minutes,
         evaluation_start=evaluated_day,
         evaluation_end=evaluated_day,
+        opening_decision=opening_decision,
         top_n=top_n,
         max_weight=max_weight,
         risk_aversion=risk_aversion,
@@ -1027,7 +1079,9 @@ def run_five_minute_forecast_backtest(
     **kwargs: object,
 ) -> FiveMinuteForecastBacktestResult:
     """Backward-compatible five-minute specialization of the generic audit."""
-    return run_intraday_forecast_backtest(minute_bars, interval_minutes=5, **kwargs)
+    options: dict[str, object] = {"opening_decision": True}
+    options.update(kwargs)
+    return run_intraday_forecast_backtest(minute_bars, interval_minutes=5, **options)
 
 
 def main() -> None:
@@ -1055,6 +1109,7 @@ def main() -> None:
         parser.error("--session-date cannot be combined with --evaluation-start/--evaluation-end")
     common = {
         "interval_minutes": FORECAST_INTERVAL_MINUTES,
+        "opening_decision": True,
         "top_n": args.top_n,
         "max_weight": args.max_weight,
         "risk_aversion": args.risk_aversion,

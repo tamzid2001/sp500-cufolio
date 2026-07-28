@@ -70,7 +70,7 @@ jobs:
           # Exactly three calendar months of evaluation, plus a conservative
           # 28-day warm-up so the first session has at least ten prior sessions.
           evaluation_start = (pd.Timestamp(evaluation_end) - pd.DateOffset(months=3)).date()
-          data_start_local = pd.Timestamp(evaluation_start, tz=NEW_YORK) - pd.Timedelta(days=28) + pd.Timedelta(hours=9, minutes=30)
+          data_start_local = pd.Timestamp(evaluation_start, tz=NEW_YORK) - pd.Timedelta(days=28) + pd.Timedelta(hours=9, minutes=29)
           data_end_local = pd.Timestamp(evaluation_end, tz=NEW_YORK) + pd.Timedelta(days=1)
           data_start = data_start_local.tz_convert("UTC")
           data_end = data_end_local.tz_convert("UTC")

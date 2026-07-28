@@ -10,7 +10,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from .five_minute_intraday_backtest import NEW_YORK
+from .five_minute_intraday_backtest import NEW_YORK, OPENING_DECISION_PRICE_TIME
 from .five_minute_paper_session import run_five_minute_paper_session
 
 DEFAULT_HISTORY_CALENDAR_DAYS = 55
@@ -25,7 +25,12 @@ def rolling_history_start(reference: pd.Timestamp, *, calendar_days: int) -> str
     if calendar_days < 28:
         raise ValueError("history_calendar_days must be at least 28")
     local_day = reference.tz_convert(NEW_YORK).date() - timedelta(days=calendar_days)
-    return pd.Timestamp(f"{local_day.isoformat()} 09:30", tz=NEW_YORK).tz_convert("UTC").isoformat()
+    return (
+        pd.Timestamp.combine(local_day, OPENING_DECISION_PRICE_TIME)
+        .tz_localize(NEW_YORK)
+        .tz_convert("UTC")
+        .isoformat()
+    )
 
 
 def run_five_minute_paper_daemon(

@@ -23,7 +23,7 @@ def _minute_bars(sessions: int = 12) -> pd.DataFrame:
     rows: list[dict[str, object]] = []
     for session in pd.bdate_range("2026-01-02", periods=sessions):
         timestamps = pd.date_range(
-            session + timedelta(hours=9, minutes=30), periods=391, freq="min", tz=NEW_YORK
+            session + timedelta(hours=9, minutes=29), periods=392, freq="min", tz=NEW_YORK
         )
         market = rng.normal(0.0, 0.00018, len(timestamps) - 1)
         for number, symbol in enumerate(prices):
@@ -47,10 +47,11 @@ def test_five_minute_audit_is_causal_and_reconciles_each_non_overlapping_window(
         lookback_observations=780,
         min_training_sessions=10,
         min_covariance_scenarios=500,
+        opening_decision=True,
     )
 
     ledger = result.ledger
-    assert len(ledger) == 77
+    assert len(ledger) == 78
     assert set(ledger["forecast_status"]) == {"ok"}
     assert set(ledger["realized_status"]) == {"ok"}
     assert (pd.to_datetime(ledger["target_end"], utc=True) - pd.to_datetime(ledger["decision_timestamp"], utc=True) == timedelta(minutes=5)).all()
@@ -66,7 +67,7 @@ def test_five_minute_audit_is_causal_and_reconciles_each_non_overlapping_window(
     assert np.allclose(result.holdings.groupby("decision_timestamp")["target_weight"].sum(), 1.0)
     assert (result.holdings["target_weight"] > 0).all()
     assert (result.holdings["target_weight"] <= 0.50 + 1e-12).all()
-    assert result.summary["realized_windows"] == 77
+    assert result.summary["realized_windows"] == 78
     assert result.summary["compounded_actual_return"] == np.expm1(ledger["actual_portfolio_log_return"].sum())
 
 
@@ -110,6 +111,7 @@ def test_five_minute_candidate_uses_the_prior_completed_decision_bar() -> None:
     baseline = generate_intraday_forecast_candidate(
         bars,
         decision_at=decision,
+        opening_decision=True,
         top_n=3,
         max_weight=0.50,
         lookback_observations=780,
@@ -122,6 +124,7 @@ def test_five_minute_candidate_uses_the_prior_completed_decision_bar() -> None:
     causal = generate_intraday_forecast_candidate(
         without_incomplete_bar,
         decision_at=decision,
+        opening_decision=True,
         top_n=3,
         max_weight=0.50,
         lookback_observations=780,
@@ -133,6 +136,49 @@ def test_five_minute_candidate_uses_the_prior_completed_decision_bar() -> None:
     assert causal.status["weights_generated"]
     assert baseline.status["decision_price_timestamp"] == "2026-01-19T14:34:00+00:00"
     pd.testing.assert_frame_equal(baseline.weights, causal.weights)
+
+
+def test_opening_candidate_uses_the_closed_0929_bar_for_the_0930_to_0935_target() -> None:
+    bars = _minute_bars()
+    decision = pd.Timestamp("2026-01-19T14:30:00Z")  # 09:30 New York
+    candidate = generate_intraday_forecast_candidate(
+        bars,
+        decision_at=decision,
+        opening_decision=True,
+        top_n=3,
+        max_weight=0.50,
+        lookback_observations=780,
+        min_training_sessions=10,
+        min_covariance_scenarios=500,
+    )
+
+    assert candidate.status["weights_generated"]
+    assert candidate.status["decision_price_timestamp"] == "2026-01-19T14:29:00+00:00"
+    assert candidate.status["target_end"] == "2026-01-19T14:35:00+00:00"
+
+
+def test_opening_training_can_be_prepared_before_the_current_0929_bar_closes() -> None:
+    bars = _minute_bars()
+    decision = pd.Timestamp("2026-01-19T14:30:00Z")
+    timestamps = pd.to_datetime(bars["timestamp"], utc=True)
+    before_opening_anchor = bars.loc[timestamps.dt.date.ne(decision.date())].copy()
+    opening_anchor = bars.loc[timestamps.eq(pd.Timestamp("2026-01-19T14:29:00Z"))].copy()
+    options = {
+        "top_n": 3,
+        "max_weight": 0.50,
+        "lookback_observations": 780,
+        "min_training_sessions": 10,
+        "min_covariance_scenarios": 500,
+        "opening_decision": True,
+    }
+    engine = RealtimeIntradayForecastEngine(before_opening_anchor, **options)
+    engine.prepare_for_decision(decision, prepared_at="2026-01-19T14:29:00Z")
+    engine.update_minute_bars(opening_anchor)
+    prepared = engine.generate_candidate(decision)
+    full = generate_intraday_forecast_candidate(bars, decision_at=decision, **options)
+
+    assert prepared.status["training_prepared_at"] == "2026-01-19T14:29:00+00:00"
+    pd.testing.assert_frame_equal(prepared.weights, full.weights)
 
 
 def test_realtime_engine_prepares_training_before_the_final_decision_bar_and_matches_full_rebuild() -> None:
@@ -153,6 +199,7 @@ def test_realtime_engine_prepares_training_before_the_final_decision_bar_and_mat
         lookback_observations=780,
         min_training_sessions=10,
         min_covariance_scenarios=500,
+        opening_decision=True,
     )
     engine.prepare_for_decision(decision, prepared_at="2026-01-19T14:34:00Z")
     engine.update_minute_bars(final_bar)
@@ -160,6 +207,7 @@ def test_realtime_engine_prepares_training_before_the_final_decision_bar_and_mat
     full_rebuild = generate_intraday_forecast_candidate(
         bars,
         decision_at=decision,
+        opening_decision=True,
         top_n=3,
         max_weight=0.50,
         lookback_observations=780,
@@ -188,6 +236,7 @@ def test_closing_four_minute_engine_uses_four_minute_labels_and_ends_at_1559() -
     options = {
         "interval_minutes": 5,
         "forecast_horizon_minutes": 4,
+        "opening_decision": True,
         "top_n": 3,
         "max_weight": 0.50,
         "lookback_observations": 780,
@@ -218,6 +267,7 @@ def test_trailing_sixteen_session_cache_preserves_the_780_label_target() -> None
     retained_days = sorted(local_days.unique())[-16:]
     compact = bars.loc[local_days.isin(retained_days)].copy()
     options = {
+        "opening_decision": True,
         "top_n": 3,
         "max_weight": 0.50,
         "lookback_observations": 780,
@@ -235,6 +285,7 @@ def test_multi_session_five_minute_audit_keeps_each_session_and_causal_boundarie
     result = run_intraday_forecast_backtest_range(
         _minute_bars(),
         interval_minutes=5,
+        opening_decision=True,
         evaluation_start="2026-01-16",
         evaluation_end="2026-01-19",
         top_n=3,
@@ -246,7 +297,7 @@ def test_multi_session_five_minute_audit_keeps_each_session_and_causal_boundarie
     assert result.summary["evaluation_sessions"] == 2
     assert result.summary["evaluation_start"] == "2026-01-16"
     assert result.summary["evaluation_end"] == "2026-01-19"
-    assert len(result.ledger) == 154
+    assert len(result.ledger) == 156
     assert result.ledger["session_date"].nunique() == 2
     assert set(result.ledger["forecast_status"]) == {"ok"}
     assert (
@@ -270,7 +321,7 @@ def test_missing_realized_endpoint_marks_a_forecast_incomplete_without_reweighti
         baseline.holdings["decision_timestamp"] == baseline.ledger.iloc[0]["decision_timestamp"], "symbol"
     ].iloc[0]
     timestamps = pd.to_datetime(bars["timestamp"], utc=True)
-    missing = timestamps.eq(pd.Timestamp("2026-01-19T14:39:00Z")) & bars["symbol"].eq(first_symbol)
+    missing = timestamps.eq(pd.Timestamp("2026-01-19T14:34:00Z")) & bars["symbol"].eq(first_symbol)
     incomplete = run_five_minute_forecast_backtest(
         bars.loc[~missing].copy(),
         session_date="2026-01-19",
