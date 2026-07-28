@@ -5,7 +5,12 @@ from types import SimpleNamespace
 
 import pandas as pd
 
-from cufolio_cpu.alpaca import AlpacaMinuteBarStream, download_minute_bars, load_symbols
+from cufolio_cpu.alpaca import (
+    AlpacaMinuteBarStream,
+    download_minute_bars,
+    download_minute_endpoint_bars,
+    load_symbols,
+)
 
 
 def test_alpaca_symbol_loader_prefers_source_symbol_for_share_classes(tmp_path) -> None:
@@ -69,4 +74,48 @@ def test_iex_websocket_buffer_returns_only_completed_bar_minutes() -> None:
 
     assert completed.to_dict("records") == [
         {"timestamp": pd.Timestamp("2026-07-28T14:20:00Z"), "symbol": "AAA", "close": 101.25}
+    ]
+
+
+def test_endpoint_downloader_keeps_only_requested_new_york_minutes_and_uses_iex(monkeypatch) -> None:
+    from alpaca.data.enums import DataFeed
+    from alpaca.data.historical import StockHistoricalDataClient
+
+    requests = []
+
+    class FakeClient:
+        def __init__(self, *_args) -> None:
+            pass
+
+        def get_stock_bars(self, request):
+            requests.append(request)
+            return SimpleNamespace(
+                df=pd.DataFrame(
+                    {"close": [100.0, 101.0, 102.0]},
+                    index=pd.MultiIndex.from_tuples(
+                        [
+                            ("AAA", pd.Timestamp("2026-07-28T13:20:00Z")),  # 09:20 ET
+                            ("AAA", pd.Timestamp("2026-07-28T13:21:00Z")),
+                            ("AAA", pd.Timestamp("2026-07-28T14:30:00Z")),  # 10:30 ET
+                        ],
+                        names=["symbol", "timestamp"],
+                    ),
+                )
+            )
+
+    monkeypatch.setenv("ALPACA_API_KEY", "paper-key")
+    monkeypatch.setenv("ALPACA_SECRET_KEY", "paper-secret")
+    monkeypatch.setattr(StockHistoricalDataClient, "__new__", staticmethod(lambda *_args, **_kwargs: FakeClient()))
+
+    bars = download_minute_endpoint_bars(
+        ["AAA"],
+        "2026-07-28T13:00:00Z",
+        "2026-07-28T15:00:00Z",
+        endpoint_times={pd.Timestamp("09:20").time(), pd.Timestamp("10:30").time()},
+    )
+
+    assert requests[0].feed == DataFeed.IEX
+    assert bars["timestamp"].tolist() == [
+        pd.Timestamp("2026-07-28T13:20:00Z"),
+        pd.Timestamp("2026-07-28T14:30:00Z"),
     ]

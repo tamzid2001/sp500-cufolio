@@ -1,0 +1,206 @@
+name: One-month hourly paper-cadence backtest
+
+on:
+  workflow_dispatch:
+    inputs:
+      evaluation_end:
+        description: "Optional UTC date after the final completed New York session (YYYY-MM-DD); blank uses today and therefore excludes the in-progress session"
+        type: string
+        default: ""
+      evaluation_calendar_days:
+        description: "Inclusive New York calendar-day span to report"
+        type: string
+        default: "31"
+      history_calendar_days:
+        description: "Calendar days to download before the UTC cutoff, including the trailing training panel"
+        type: string
+        default: "75"
+      top_n:
+        description: "Maximum optimizer candidates"
+        type: string
+        default: "20"
+      max_weight:
+        description: "Per-name long-only cap"
+        type: string
+        default: "0.10"
+      lookback_scenarios:
+        description: "Maximum completed hourly scenarios used by each forecast"
+        type: string
+        default: "120"
+      min_training_scenarios:
+        description: "Minimum exact completed one-hour scenarios"
+        type: string
+        default: "20"
+      transaction_cost_bps:
+        description: "Hypothetical cost applied at every 15-minute target reset; paper-market return is 0"
+        type: string
+        default: "0"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cufolio-monthly-hourly-paper-cadence-backtest
+  cancel-in-progress: false
+
+jobs:
+  backtest:
+    name: Exact IEX one-month audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    env:
+      PYTHONPATH: ${{ github.workspace }}/src
+      ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
+      ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
+      INPUT_EVALUATION_END: ${{ inputs.evaluation_end }}
+      INPUT_EVALUATION_CALENDAR_DAYS: ${{ inputs.evaluation_calendar_days || '31' }}
+      INPUT_HISTORY_CALENDAR_DAYS: ${{ inputs.history_calendar_days || '75' }}
+      INPUT_TOP_N: ${{ inputs.top_n || '20' }}
+      INPUT_MAX_WEIGHT: ${{ inputs.max_weight || '0.10' }}
+      INPUT_LOOKBACK_SCENARIOS: ${{ inputs.lookback_scenarios || '120' }}
+      INPUT_MIN_TRAINING_SCENARIOS: ${{ inputs.min_training_scenarios || '20' }}
+      INPUT_TRANSACTION_COST_BPS: ${{ inputs.transaction_cost_bps || '0' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install research dependencies
+        run: pip install -r requirements.txt
+
+      - name: Verify exact live-cadence backtest rules
+        run: pytest -q tests/test_alpaca.py tests/test_hourly_intraday_backtest.py
+
+      - name: Derive completed-session evaluation and training windows
+        run: |
+          python - <<'PY'
+          import os
+          from datetime import timedelta
+          from pathlib import Path
+          from zoneinfo import ZoneInfo
+
+          import pandas as pd
+
+          cutoff_input = os.environ["INPUT_EVALUATION_END"].strip()
+          cutoff = pd.Timestamp(cutoff_input, tz="UTC") if cutoff_input else pd.Timestamp.now(tz="UTC").normalize()
+          cutoff = cutoff.normalize()
+          evaluation_days = int(os.environ["INPUT_EVALUATION_CALENDAR_DAYS"])
+          history_days = int(os.environ["INPUT_HISTORY_CALENDAR_DAYS"])
+          if evaluation_days < 1 or history_days < evaluation_days + 35:
+              raise SystemExit("history_calendar_days must exceed evaluation_calendar_days by at least 35 days")
+          last_completed_ny_date = (cutoff - pd.Timedelta(minutes=1)).tz_convert(ZoneInfo("America/New_York")).date()
+          evaluation_start = last_completed_ny_date - timedelta(days=evaluation_days - 1)
+          data_start = cutoff - pd.Timedelta(days=history_days)
+          environment = Path(os.environ["GITHUB_ENV"])
+          environment.write_text(
+              "\n".join((
+                  f"DATA_START={data_start.isoformat()}",
+                  f"DATA_END={cutoff.isoformat()}",
+                  f"EVALUATION_START={evaluation_start.isoformat()}",
+                  f"EVALUATION_END={last_completed_ny_date.isoformat()}",
+              )) + "\n",
+              encoding="utf-8",
+          )
+          print(
+              "MONTHLY HOURLY AUDIT WINDOW | "
+              f"data={data_start.isoformat()}..{cutoff.isoformat()} "
+              f"evaluation={evaluation_start.isoformat()}..{last_completed_ny_date.isoformat()}"
+          )
+          PY
+
+      - name: Select current S&P 500 convenience universe
+        run: python -m cufolio_cpu.universe --output artifacts/current_sp500_universe.csv
+
+      - name: Download compact exact IEX endpoint history
+        run: |
+          set -euo pipefail
+          test -n "$ALPACA_API_KEY"
+          test -n "$ALPACA_SECRET_KEY"
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          import pandas as pd
+
+          from cufolio_cpu.alpaca import download_minute_endpoint_bars
+          from cufolio_cpu.hourly_intraday_backtest import hourly_paper_cadence_endpoint_times
+
+          universe = pd.read_csv("artifacts/current_sp500_universe.csv")
+          column = "source_symbol" if "source_symbol" in universe.columns else "symbol"
+          symbols = universe[column].dropna().astype(str).str.upper().drop_duplicates().tolist()
+          bars = download_minute_endpoint_bars(
+              symbols,
+              os.environ["DATA_START"],
+              os.environ["DATA_END"],
+              endpoint_times=hourly_paper_cadence_endpoint_times(),
+          )
+          Path("artifacts").mkdir(exist_ok=True)
+          bars.to_csv("artifacts/hourly_paper_cadence_iex_endpoints.csv.gz", index=False, compression="gzip")
+          local = pd.to_datetime(bars["timestamp"], utc=True).dt.tz_convert("America/New_York") if not bars.empty else pd.Series(dtype="datetime64[ns]")
+          report = {
+              "market_data_source": "alpaca_iex",
+              "bar_interval": "1m",
+              "rows": int(len(bars)),
+              "symbols": int(bars["symbol"].nunique()) if not bars.empty else 0,
+              "session_dates": int(local.dt.date.nunique()) if not bars.empty else 0,
+              "endpoint_times_requested": sorted(endpoint.strftime("%H:%M") for endpoint in hourly_paper_cadence_endpoint_times()),
+          }
+          Path("artifacts/hourly_paper_cadence_iex_download_status.json").write_text(json.dumps(report, indent=2) + "\n")
+          print(f"MONTHLY HOURLY IEX ENDPOINT HISTORY | rows={report['rows']:,} symbols={report['symbols']} sessions={report['session_dates']}")
+          if bars.empty:
+              raise RuntimeError("Alpaca IEX returned no endpoint bars; no backtest was calculated")
+          PY
+
+      - name: Run causal one-month forecast and 15-minute-rebalance audit
+        run: |
+          python -m cufolio_cpu.hourly_intraday_backtest \
+            --input artifacts/hourly_paper_cadence_iex_endpoints.csv.gz \
+            --output-dir artifacts/monthly_hourly_paper_cadence_backtest \
+            --paper-cadence \
+            --evaluation-start "$EVALUATION_START" \
+            --evaluation-end "$EVALUATION_END" \
+            --top-n "$INPUT_TOP_N" \
+            --max-weight "$INPUT_MAX_WEIGHT" \
+            --lookback-scenarios "$INPUT_LOOKBACK_SCENARIOS" \
+            --min-training-scenarios "$INPUT_MIN_TRAINING_SCENARIOS" \
+            --transaction-cost-bps "$INPUT_TRANSACTION_COST_BPS"
+
+      - name: Publish exact coverage and rebalance summary
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          status = json.loads(Path("artifacts/monthly_hourly_paper_cadence_backtest/paper_cadence_backtest_status.json").read_text())
+          realized = int(status["forecast_windows_realized_exactly"])
+          considered = int(status["forecast_windows_considered"])
+          if realized == 0:
+              raise RuntimeError("No exact realized forecast windows were available; inspect the endpoint artifact")
+          lines = [
+              "### One-month hourly paper-cadence audit",
+              "",
+              f"- Evaluation: `{status['evaluation_start']}` through `{status['evaluation_end']}`",
+              f"- Exact forecast coverage: `{realized}/{considered}` ({status['forecast_coverage']:.1%})",
+              f"- Expected compounded return on exactly realized windows: `{status['expected_compounded_return_on_realized_windows']:+.4%}`",
+              f"- Actual gross compounded return: `{status['actual_gross_compounded_return']:+.4%}`",
+              f"- Mean absolute forecast error: `{status['mean_absolute_error_bps']:.2f} bps`",
+              f"- Directional accuracy: `{status['directional_accuracy']:.1%}`" if status["directional_accuracy"] is not None else "- Directional accuracy: unavailable",
+              f"- 15-minute rebalance rows: `{Path('artifacts/monthly_hourly_paper_cadence_backtest/paper_cadence_quarter_hour_rebalances.csv').read_text().count(chr(10)) - 1}`",
+              "- Data: Alpaca IEX exact one-minute endpoint closes; unavailable endpoints remain unavailable.",
+          ]
+          with Path(os.environ["GITHUB_STEP_SUMMARY"]).open("a", encoding="utf-8") as summary:
+              summary.write("\n".join(lines) + "\n")
+          print("\n".join(lines))
+          PY
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: monthly-hourly-paper-cadence-backtest-${{ github.run_id }}
+          path: artifacts/
+          if-no-files-found: error
+          retention-days: 30

@@ -13,7 +13,7 @@ import argparse
 import json
 import os
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime, time as clock_time, timedelta
 from decimal import Decimal
 from pathlib import Path
@@ -42,6 +42,8 @@ TARGET_FORECAST_LEADS = (
 MAX_START_LAG = timedelta(minutes=10)
 WAIT_HEARTBEAT_INTERVAL = timedelta(minutes=5)
 EVENT_PRIORITY_GUARD = timedelta(seconds=90)
+MINUTE_CACHE_FAILURE_NOTICE_INTERVAL = timedelta(minutes=5)
+MINUTE_CACHE_MAX_REPAIR_BACKOFF = timedelta(minutes=5)
 LIVE_MINUTE_CACHE_START = clock_time(9, 20)
 LIVE_MINUTE_CACHE_END = clock_time(15, 30)
 # A 120-scenario fit needs about 20 full sessions (six one-hour outcomes per
@@ -72,6 +74,57 @@ class SessionEvent:
     due_at: pd.Timestamp
     selection_at: pd.Timestamp | None = None
     target_start: pd.Timestamp | None = None
+
+
+@dataclass
+class MinuteCacheHealth:
+    """Rate-limit transient cache-provider failures without hiding staleness.
+
+    This state is intentionally process-local. The durable cache contains the
+    data; this object only prevents a temporary IEX or Yahoo interruption from
+    producing one identical error line and one full-universe fallback request
+    per minute.
+    """
+
+    source: str = "cold_start"
+    last_success_at: pd.Timestamp | None = None
+    last_failure_at: pd.Timestamp | None = None
+    retry_after: dict[str, pd.Timestamp] = field(default_factory=dict)
+    failure_counts: dict[str, int] = field(default_factory=dict)
+    last_notice_at: pd.Timestamp | None = None
+
+    def may_attempt(self, source: str, observed_at: pd.Timestamp) -> bool:
+        return observed_at >= self.retry_after.get(source, observed_at)
+
+    def record_success(self, source: str, observed_at: pd.Timestamp) -> None:
+        self.source = source
+        self.last_success_at = observed_at
+        self.failure_counts.pop(source, None)
+        self.retry_after.pop(source, None)
+
+    def record_failure(self, source: str, observed_at: pd.Timestamp) -> pd.Timestamp:
+        attempts = self.failure_counts.get(source, 0) + 1
+        self.failure_counts[source] = attempts
+        delay = min(
+            MINUTE_CACHE_MAX_REPAIR_BACKOFF,
+            timedelta(seconds=30 * (2 ** min(attempts - 1, 4))),
+        )
+        retry_at = observed_at + delay
+        self.source = f"degraded_{source}"
+        self.last_failure_at = observed_at
+        self.retry_after[source] = retry_at
+        return retry_at
+
+    def should_emit_notice(self, observed_at: pd.Timestamp) -> bool:
+        if self.last_notice_at is None or observed_at - self.last_notice_at >= MINUTE_CACHE_FAILURE_NOTICE_INTERVAL:
+            self.last_notice_at = observed_at
+            return True
+        return False
+
+
+def _cache_health_summary(health: MinuteCacheHealth) -> str:
+    successful = health.last_success_at.isoformat() if health.last_success_at is not None else "none"
+    return f"cache_source={health.source} cache_last_success={successful}"
 
 
 def session_events(session_day: date) -> list[SessionEvent]:
@@ -159,9 +212,14 @@ def _history_through(
     elif bars is None or bars.empty:
         try:
             combined = download_minute_bars(symbols, start, end)
-        except Exception:
+        except Exception as error:
             # A full training bootstrap needs Alpaca IEX history. Yahoo's
             # one-minute data is only a bounded, latest-bar repair path.
+            if pd.Timestamp(end) - pd.Timestamp(start) > pd.Timedelta(days=8):
+                raise RuntimeError(
+                    "Alpaca IEX historical bootstrap was unavailable; refusing to replace the required "
+                    "multi-session training panel with a short Yahoo request"
+                ) from error
             combined = download_yfinance_minute_bars(symbols, start, end)
     else:
         existing = _minute_cache_projection(bars)
@@ -257,6 +315,26 @@ def _last_completed_session_minute(observed_at: pd.Timestamp, session_day: date)
     return min(completed, session_close)
 
 
+def _record_cache_provider_failure(
+    health: MinuteCacheHealth | None,
+    *,
+    source: str,
+    observed_at: pd.Timestamp,
+    error: Exception,
+) -> None:
+    """Emit one bounded, secret-free cache-health notice per outage period."""
+    if health is None:
+        print(f"MINUTE CACHE DEGRADED | source={source} reason={error}", flush=True)
+        return
+    retry_at = health.record_failure(source, observed_at)
+    if health.should_emit_notice(observed_at):
+        print(
+            "MINUTE CACHE DEGRADED | "
+            f"source={source} retry_after={retry_at.isoformat()} reason={error}",
+            flush=True,
+        )
+
+
 def _refresh_current_session_minutes(
     bars: pd.DataFrame | None,
     symbols: list[str],
@@ -265,8 +343,15 @@ def _refresh_current_session_minutes(
     observed_at: pd.Timestamp,
     cache_path: Path | None,
     minute_stream: AlpacaMinuteBarStream | None = None,
+    cache_health: MinuteCacheHealth | None = None,
 ) -> pd.DataFrame:
-    """Append completed websocket bars; use Yahoo only after stream failure."""
+    """Append completed IEX stream bars and repair only when the stream is unavailable.
+
+    The live order of preference is IEX websocket, explicit IEX REST, then a
+    bounded Yahoo one-minute repair.  No code path leaves the feed implicit,
+    so a paper account cannot accidentally retry a recent SIP request.
+    """
+    observed = _utc_timestamp(observed_at)
     completed = _last_completed_session_minute(observed_at, session_day)
     if completed is None:
         return bars if bars is not None else pd.DataFrame(columns=["timestamp", "symbol", "close"])
@@ -295,27 +380,52 @@ def _refresh_current_session_minutes(
         incremental = incremental.loc[
             pd.to_datetime(incremental["timestamp"], utc=True, errors="coerce") >= fetch_start
         ].copy()
-    if incremental.empty and minute_stream is None:
-        # This path is retained for deterministic callers that intentionally
-        # disable the stream. ``download_minute_bars`` explicitly selects IEX.
-        source = "alpaca_iex_rest_repair"
-        try:
-            incremental = download_minute_bars(symbols, fetch_start, completed + timedelta(minutes=1))
-        except Exception:
-            source = "yfinance_1m_fallback"
-            incremental = download_yfinance_minute_bars(symbols, fetch_start, completed + timedelta(minutes=1))
-    elif incremental.empty and (minute_stream.error is not None or not minute_stream.connected):
-        source = "yfinance_1m_fallback"
-        incremental = download_yfinance_minute_bars(symbols, fetch_start, completed + timedelta(minutes=1))
-    elif incremental.empty:
-        # A healthy connection can publish after this short polling cycle. Do
-        # not fall back to a SIP REST request or consume a partial minute.
-        print(
-            "MINUTE CACHE WEBSOCKET WAIT | "
-            f"from={fetch_start.isoformat()} through={completed.isoformat()} status=connected",
-            flush=True,
-        )
+    stream_available = (
+        minute_stream is not None
+        and bool(getattr(minute_stream, "available", getattr(minute_stream, "connected", False)))
+    )
+    if incremental.empty and stream_available:
+        # During an authenticated-startup interval or a quiet IEX minute the
+        # websocket can have no completed bar yet. Wait for it instead of
+        # issuing a redundant full-universe request every minute.
         return existing
+    if incremental.empty:
+        # A stream failure must first repair through the explicitly entitled
+        # IEX REST feed.  Yahoo is a bounded last resort only after that IEX
+        # request fails or returns no usable current-session row.
+        iex_source = "alpaca_iex_rest_repair"
+        if cache_health is None or cache_health.may_attempt(iex_source, observed):
+            try:
+                incremental = download_minute_bars(symbols, fetch_start, completed + timedelta(minutes=1))
+                source = iex_source
+                if incremental.empty and cache_health is not None:
+                    cache_health.record_failure(iex_source, observed)
+            except Exception as error:
+                _record_cache_provider_failure(
+                    cache_health,
+                    source=iex_source,
+                    observed_at=observed,
+                    error=error,
+                )
+        if incremental.empty:
+            yahoo_source = "yfinance_1m_fallback"
+            if cache_health is None or cache_health.may_attempt(yahoo_source, observed):
+                try:
+                    incremental = download_yfinance_minute_bars(
+                        symbols, fetch_start, completed + timedelta(minutes=1)
+                    )
+                    source = yahoo_source
+                    if incremental.empty and cache_health is not None:
+                        cache_health.record_failure(yahoo_source, observed)
+                except Exception as error:
+                    _record_cache_provider_failure(
+                        cache_health,
+                        source=yahoo_source,
+                        observed_at=observed,
+                        error=error,
+                    )
+        if incremental.empty:
+            return existing
     # Treat provider end-boundary semantics conservatively: even if a response
     # happens to include the next in-progress timestamp, it cannot enter this
     # causal cache until that minute has closed on a later poll.
@@ -327,6 +437,8 @@ def _refresh_current_session_minutes(
     merged = _minute_cache_projection(combined)
     if cache_path is not None:
         _write_minute_cache(cache_path, merged)
+    if cache_health is not None:
+        cache_health.record_success(source, observed)
     print(
         "MINUTE CACHE REFRESHED | "
         f"source={source} from={fetch_start.isoformat()} through={completed.isoformat()} downloaded={len(incremental):,} "
@@ -487,6 +599,7 @@ def run_hourly_paper_session(
     minute_cache_file = Path(minute_cache_path) if minute_cache_path is not None else None
     bars: pd.DataFrame | None = _read_minute_cache(minute_cache_file) if minute_cache_file is not None else None
     minute_stream: AlpacaMinuteBarStream | None = None
+    minute_cache_health = MinuteCacheHealth()
     if minute_cache_polling:
         try:
             minute_stream = AlpacaMinuteBarStream(symbols)
@@ -495,7 +608,8 @@ def run_hourly_paper_session(
         except Exception as error:
             # Never quietly switch to SIP. The scheduled IEX / Yahoo paths
             # below remain available and the exact failure is logged.
-            print(f"MINUTE CACHE WEBSOCKET FAILED | feed=iex error={error}", flush=True)
+            minute_cache_health.record_failure("alpaca_iex_websocket", _utc_timestamp())
+            print(f"MINUTE CACHE WEBSOCKET UNAVAILABLE | feed=iex reason={error}", flush=True)
     targets_by_start = _restore_targets(checkpoint)
     forecast_details = {
         _utc_timestamp(pd.Timestamp(target_start)): dict(details)
@@ -602,23 +716,25 @@ def run_hourly_paper_session(
                         observed_at=current,
                         cache_path=minute_cache_file,
                         minute_stream=minute_stream,
+                        cache_health=minute_cache_health,
                     )
                 except Exception as error:
                     # This background cache is an acceleration only.  A
                     # failed minute refresh must never delay or suppress the
                     # next paper order; the scheduled forecast fetch remains
                     # the authoritative fail-closed data path.
-                    print(
-                        "MINUTE CACHE REFRESH FAILED | "
-                        f"completed={completed_minute.isoformat()} error={error}",
-                        flush=True,
+                    _record_cache_provider_failure(
+                        minute_cache_health,
+                        source="cache_refresh",
+                        observed_at=current,
+                        error=error,
                     )
             if last_wait_heartbeat is None or current - last_wait_heartbeat >= WAIT_HEARTBEAT_INTERVAL:
                 remaining = max(0, int((event.due_at - current).total_seconds()))
                 print(
                     "HOURLY PAPER WAIT | "
                     f"next={event.kind} due={event.due_at.isoformat()} now={current.isoformat()} "
-                    f"remaining={remaining}s {_cache_summary(bars)}",
+                    f"remaining={remaining}s {_cache_summary(bars)} {_cache_health_summary(minute_cache_health)}",
                     flush=True,
                 )
                 last_wait_heartbeat = current

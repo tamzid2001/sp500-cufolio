@@ -203,7 +203,7 @@ def test_current_session_minute_refresh_merges_only_completed_minutes(tmp_path, 
     pd.testing.assert_frame_equal(hourly_paper_session._read_minute_cache(cache_path), refreshed)
 
 
-def test_current_session_uses_yahoo_only_when_iex_websocket_is_disconnected(tmp_path, monkeypatch) -> None:
+def test_current_session_repairs_iex_before_yahoo_when_websocket_is_disconnected(tmp_path, monkeypatch) -> None:
     class DisconnectedStream:
         error = None
         connected = False
@@ -219,8 +219,11 @@ def test_current_session_uses_yahoo_only_when_iex_websocket_is_disconnected(tmp_
             {"timestamp": ["2026-07-28T14:20:00Z"], "symbol": ["AAA"], "close": [101]}
         )
 
-    def fail_iex(*_args, **_kwargs):
-        raise AssertionError("a live refresh must not poll the Alpaca historical endpoint while streaming")
+    iex_attempts = []
+
+    def fail_iex(*args, **_kwargs):
+        iex_attempts.append(args)
+        raise RuntimeError("temporary IEX REST outage")
 
     monkeypatch.setattr(hourly_paper_session, "download_minute_bars", fail_iex)
     monkeypatch.setattr(hourly_paper_session, "download_yfinance_minute_bars", fake_yahoo)
@@ -233,9 +236,75 @@ def test_current_session_uses_yahoo_only_when_iex_websocket_is_disconnected(tmp_
         minute_stream=DisconnectedStream(),
     )
 
+    assert len(iex_attempts) == 1
     assert calls == [(pd.Timestamp("2026-07-28T13:20:00Z"), pd.Timestamp("2026-07-28T14:21:00Z"))]
     assert refreshed.loc[0, "symbol"] == "AAA"
     assert refreshed.loc[0, "close"] == 101
+
+
+def test_starting_websocket_waits_without_repeated_rest_or_yahoo_refreshes(tmp_path, monkeypatch) -> None:
+    class StartingStream:
+        error = None
+        connected = False
+        available = True
+
+        def completed_bars_through(self, _completed):
+            return pd.DataFrame(columns=["timestamp", "symbol", "close"])
+
+    def unexpected_provider(*_args, **_kwargs):
+        raise AssertionError("a still-starting websocket must not trigger a fallback request")
+
+    monkeypatch.setattr(hourly_paper_session, "download_minute_bars", unexpected_provider)
+    monkeypatch.setattr(hourly_paper_session, "download_yfinance_minute_bars", unexpected_provider)
+
+    refreshed = hourly_paper_session._refresh_current_session_minutes(
+        pd.DataFrame(columns=["timestamp", "symbol", "close"]),
+        ["AAA"],
+        session_day=date(2026, 7, 28),
+        observed_at=pd.Timestamp("2026-07-28T14:21:15Z"),
+        cache_path=tmp_path / "minute-endpoints.csv.gz",
+        minute_stream=StartingStream(),
+        cache_health=hourly_paper_session.MinuteCacheHealth(),
+    )
+
+    assert refreshed.empty
+
+
+def test_degraded_cache_rate_limits_identical_provider_repairs(tmp_path, monkeypatch) -> None:
+    class FailedStream:
+        error = RuntimeError("websocket closed")
+        connected = False
+        available = False
+
+        def completed_bars_through(self, _completed):
+            return pd.DataFrame(columns=["timestamp", "symbol", "close"])
+
+    calls = {"iex": 0, "yahoo": 0}
+
+    def unavailable_iex(*_args, **_kwargs):
+        calls["iex"] += 1
+        raise RuntimeError("IEX temporarily unavailable")
+
+    def unavailable_yahoo(*_args, **_kwargs):
+        calls["yahoo"] += 1
+        raise RuntimeError("Yahoo temporarily unavailable")
+
+    monkeypatch.setattr(hourly_paper_session, "download_minute_bars", unavailable_iex)
+    monkeypatch.setattr(hourly_paper_session, "download_yfinance_minute_bars", unavailable_yahoo)
+    health = hourly_paper_session.MinuteCacheHealth()
+    first = pd.Timestamp("2026-07-28T14:21:15Z")
+    for observed_at in (first, first + pd.Timedelta(seconds=15)):
+        hourly_paper_session._refresh_current_session_minutes(
+            pd.DataFrame(columns=["timestamp", "symbol", "close"]),
+            ["AAA"],
+            session_day=date(2026, 7, 28),
+            observed_at=observed_at,
+            cache_path=tmp_path / "minute-endpoints.csv.gz",
+            minute_stream=FailedStream(),
+            cache_health=health,
+        )
+
+    assert calls == {"iex": 1, "yahoo": 1}
 
 
 def test_last_completed_session_minute_never_uses_partial_or_pre_session_bar() -> None:

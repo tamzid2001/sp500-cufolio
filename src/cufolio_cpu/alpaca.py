@@ -6,15 +6,17 @@ import argparse
 import os
 import ssl
 import threading
-from collections.abc import Mapping
-from datetime import datetime
+from collections.abc import Collection, Mapping
+from datetime import datetime, time as clock_time
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 
 
 MINUTE_BAR_COLUMNS = ["timestamp", "symbol", "close"]
+NEW_YORK = ZoneInfo("America/New_York")
 
 
 def load_symbols(path: str | Path) -> list[str]:
@@ -86,6 +88,7 @@ class AlpacaMinuteBarStream:
         self._stream: Any | None = None
         self._thread: threading.Thread | None = None
         self._error: Exception | None = None
+        self._last_bar_at: pd.Timestamp | None = None
 
     @property
     def error(self) -> Exception | None:
@@ -96,6 +99,22 @@ class AlpacaMinuteBarStream:
         """Whether Alpaca currently has an authenticated websocket transport."""
         websocket = getattr(self._stream, "_ws", None)
         return websocket is not None and not getattr(websocket, "closed", False) and self._error is None
+
+    @property
+    def available(self) -> bool:
+        """Whether the stream worker is still able to receive IEX bars.
+
+        Alpaca creates its internal websocket lazily, so ``connected`` can be
+        false for a short authenticated-startup interval.  A live cache must
+        wait through that interval instead of treating it as a failure and
+        repeatedly falling through to another provider.
+        """
+        return self._error is None and self._thread is not None and self._thread.is_alive()
+
+    @property
+    def last_bar_at(self) -> pd.Timestamp | None:
+        """Latest exchange minute received, if the stream has delivered one."""
+        return self._last_bar_at
 
     def start(self) -> None:
         """Open the IEX websocket in a daemon thread and subscribe to bars."""
@@ -126,8 +145,14 @@ class AlpacaMinuteBarStream:
             close = getattr(bar, "close", None)
         if symbol is None or timestamp is None or close is None:
             return
+        timestamp_at = pd.Timestamp(timestamp)
+        if timestamp_at.tzinfo is None:
+            timestamp_at = timestamp_at.tz_localize("UTC")
+        else:
+            timestamp_at = timestamp_at.tz_convert("UTC")
         with self._lock:
-            self._rows.append({"timestamp": timestamp, "symbol": symbol, "close": close})
+            self._rows.append({"timestamp": timestamp_at, "symbol": symbol, "close": close})
+            self._last_bar_at = timestamp_at
 
     def _run(self) -> None:
         assert self._stream is not None
@@ -192,6 +217,65 @@ def download_minute_bars(
     result = pd.concat(frames, ignore_index=True)
     result["timestamp"] = pd.to_datetime(result["timestamp"], utc=True)
     return result.sort_values(["symbol", "timestamp"]).drop_duplicates(["symbol", "timestamp"])
+
+
+def download_minute_endpoint_bars(
+    symbols: list[str],
+    start: str | datetime,
+    end: str | datetime,
+    *,
+    endpoint_times: Collection[clock_time],
+    batch_size: int = 100,
+) -> pd.DataFrame:
+    """Download IEX minutes but retain only exact New York endpoint closes.
+
+    A multi-week intraday audit needs a small, auditable set of timestamps
+    rather than millions of non-decision rows.  Filtering each Alpaca response
+    before appending it keeps the downloaded result compact while preserving
+    the exact prices used for selections, labels, and 15-minute rebalances.
+    This is read-only market-data access and explicitly never requests SIP.
+    """
+    key, secret = _market_data_credentials()
+    if batch_size < 1:
+        raise ValueError("batch_size must be positive")
+    selected_times = frozenset(endpoint_times)
+    if not selected_times:
+        raise ValueError("endpoint_times must contain at least one New York clock time")
+
+    from alpaca.data.enums import DataFeed
+    from alpaca.data.historical import StockHistoricalDataClient
+    from alpaca.data.requests import StockBarsRequest
+    from alpaca.data.timeframe import TimeFrame
+
+    client = StockHistoricalDataClient(key, secret)
+    frames: list[pd.DataFrame] = []
+    for offset in range(0, len(symbols), batch_size):
+        batch = symbols[offset : offset + batch_size]
+        request = StockBarsRequest(
+            symbol_or_symbols=batch,
+            timeframe=TimeFrame.Minute,
+            start=_utc_datetime(start),
+            end=_utc_datetime(end),
+            feed=DataFeed.IEX,
+        )
+        frame = client.get_stock_bars(request).df
+        if frame.empty:
+            continue
+        normalized = _minute_bar_frame(frame.reset_index().loc[:, ["timestamp", "symbol", "close"]].to_dict("records"))
+        if normalized.empty:
+            continue
+        local_times = normalized["timestamp"].dt.tz_convert(NEW_YORK).dt.time
+        endpoint_rows = normalized.loc[local_times.isin(selected_times)]
+        if not endpoint_rows.empty:
+            frames.append(endpoint_rows)
+    if not frames:
+        return _empty_minute_bars()
+    return (
+        pd.concat(frames, ignore_index=True)
+        .sort_values(["symbol", "timestamp"])
+        .drop_duplicates(["symbol", "timestamp"], keep="last")
+        .reset_index(drop=True)
+    )
 
 
 def download_yfinance_minute_bars(

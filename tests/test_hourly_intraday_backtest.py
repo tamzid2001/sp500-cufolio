@@ -11,6 +11,8 @@ from cufolio_cpu.hourly_intraday_backtest import (
     build_one_hour_return_panel,
     generate_to_close_candidate,
     generate_hourly_one_hour_candidate,
+    hourly_paper_cadence_endpoint_times,
+    run_hourly_paper_cadence_backtest,
     run_hourly_one_hour_backtest,
 )
 
@@ -182,3 +184,49 @@ def test_candidate_keeps_a_complete_top_ranked_subset_when_other_assets_are_spar
     assert candidate.status["weights_generated"] is True
     assert candidate.status["training_rows"] >= 5
     assert set(candidate.weights["symbol"]).issubset({"AAA", "BBB"})
+
+
+def test_paper_cadence_backtest_uses_live_forecast_leads_and_exact_quarter_hour_returns() -> None:
+    bars = _minute_bars()
+    premarket_rows: list[dict[str, object]] = []
+    for session in pd.bdate_range("2026-01-02", periods=12):
+        session_open = pd.Timestamp(session, tz=NEW_YORK) + pd.Timedelta(hours=9, minutes=30)
+        day_opens = bars.loc[pd.to_datetime(bars["timestamp"], utc=True).eq(session_open.tz_convert("UTC"))]
+        for selection_time in ("09:20", "10:20", "11:20", "12:20", "14:20"):
+            selection = pd.Timestamp(f"{session.date()} {selection_time}", tz=NEW_YORK).tz_convert("UTC")
+            for row in day_opens.itertuples(index=False):
+                premarket_rows.append({"timestamp": selection, "symbol": row.symbol, "close": row.close})
+    result = run_hourly_paper_cadence_backtest(
+        pd.concat([bars, pd.DataFrame(premarket_rows)], ignore_index=True),
+        top_n=3,
+        lookback_scenarios=30,
+        min_training_scenarios=5,
+        max_weight=0.50,
+        transaction_cost_bps=0.0,
+    )
+
+    realized = result.forecasts.loc[result.forecasts["forecast_status"].eq("selected_and_realized")]
+    assert not realized.empty
+    decisions = pd.to_datetime(realized["decision_timestamp"], utc=True).dt.tz_convert(NEW_YORK)
+    targets = pd.to_datetime(realized["target_start"], utc=True).dt.tz_convert(NEW_YORK)
+    assert set(decisions.dt.strftime("%H:%M")) == {"09:20", "10:20", "11:20", "12:20", "14:20"}
+    assert set(targets.dt.strftime("%H:%M")) == {"10:30", "11:30", "12:30", "13:30", "14:30"}
+    assert (
+        pd.to_datetime(result.selections["training_end"], utc=True)
+        < pd.to_datetime(result.selections["decision_timestamp"], utc=True)
+    ).all()
+    assert result.performance.groupby("hourly_target_start").size().eq(4).all()
+    assert result.status["forecast_windows_realized_exactly"] == len(realized)
+    assert result.status["forecast_coverage"] > 0
+    assert result.status["quarter_hour_rebalance_rows"] == len(result.performance)
+    assert result.status["rebalances_per_exact_realized_window"] == 4
+
+
+def test_paper_cadence_endpoint_set_covers_decisions_labels_and_all_rebalance_boundaries() -> None:
+    endpoints = hourly_paper_cadence_endpoint_times()
+
+    assert {pd.Timestamp.combine(pd.Timestamp("2026-01-02"), endpoint).strftime("%H:%M") for endpoint in endpoints} >= {
+        "09:20", "09:30", "10:20", "10:30", "10:45", "11:00", "11:15", "11:30",
+        "12:00", "12:15", "12:20", "12:30", "13:00", "13:15", "13:30", "14:00",
+        "14:15", "14:20", "14:30", "14:45", "15:00", "15:15", "15:30",
+    }
