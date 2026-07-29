@@ -140,6 +140,37 @@ def test_rolling_endpoint_cache_advances_verified_history_without_redownload(tmp
     ]
 
 
+def test_completed_session_repair_fetches_only_one_session_of_exact_iex_endpoints(tmp_path, monkeypatch) -> None:
+    cache = _load_tool("full_universe_cache_session_repair_tool", "tools/cache_full_alpaca_five_minute_input.py")
+    pd.DataFrame({"symbol": ["AAA"], "tradable": [True], "fractionable": [True]}).to_csv(
+        tmp_path / cache.UNIVERSE_FILENAME, index=False
+    )
+    (tmp_path / cache.METADATA_FILENAME).write_text(
+        cache.json.dumps({"complete": True, "evaluation_end": "2026-07-28"}), encoding="utf-8"
+    )
+    calls = []
+
+    def fake_download(symbols, start, end, *, endpoint_times, batch_size, max_workers):
+        calls.append((symbols, start, end, endpoint_times, batch_size, max_workers))
+        return pd.DataFrame(
+            {
+                "timestamp": ["2026-07-29T13:29:00Z", "2026-07-29T19:59:00Z"],
+                "symbol": ["AAA", "AAA"],
+                "close": [100.0, 101.0],
+            }
+        )
+
+    monkeypatch.setattr(cache, "download_minute_endpoint_bars", fake_download)
+    output = tmp_path / "repair.csv.gz"
+    result = cache.fetch_completed_session_endpoints(tmp_path, output, evaluation_end=date(2026, 7, 29))
+
+    assert result == {"session_date": "2026-07-29", "symbols": 1, "rows": 2}
+    assert calls[0][0] == ["AAA"]
+    assert calls[0][1] == pd.Timestamp("2026-07-29T13:29:00Z")
+    assert calls[0][2] == pd.Timestamp("2026-07-29T20:00:00Z")
+    assert pd.read_csv(output, compression="gzip")["close"].tolist() == [100.0, 101.0]
+
+
 def test_checkpoint_merge_is_monotonic_and_deduplicates_events() -> None:
     publisher = _load_tool("five_minute_checkpoint_publisher", "tools/publish_five_minute_checkpoint.py")
     remote = {
