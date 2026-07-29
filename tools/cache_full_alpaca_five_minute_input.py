@@ -24,7 +24,7 @@ from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame
 from alpaca.trading.client import TradingClient
 from alpaca.trading.enums import AssetClass
-from alpaca.trading.requests import GetAssetsRequest
+from alpaca.trading.requests import GetAssetsRequest, GetCalendarRequest
 
 
 NEW_YORK = ZoneInfo("America/New_York")
@@ -96,6 +96,52 @@ def _cache_is_complete(directory: Path, evaluation_end: date) -> bool:
     )
 
 
+def _discard_stale_cache(directory: Path) -> None:
+    """Remove only the known cache files before starting a new as-of date.
+
+    Request-part identifiers are meaningful only for one evaluation window.
+    Reusing them after the window moves forward would make an apparently
+    complete cache contain the wrong dates, so a new session date always
+    starts a clean, independently verifiable cache.
+    """
+    for filename in (UNIVERSE_FILENAME, BARS_FILENAME, PARTS_FILENAME, METADATA_FILENAME):
+        (directory / filename).unlink(missing_ok=True)
+
+
+def verify_cache(directory: Path, evaluation_end: date) -> dict[str, Any]:
+    """Fail closed unless the complete cache is for the expected session.
+
+    Both compressed inputs are checksummed before a paper runner is allowed to
+    rely on them.  A cache restore can legally return a prefix match, so the
+    key alone is not a freshness or integrity guarantee.
+    """
+    metadata_path = directory / METADATA_FILENAME
+    metadata = _read_metadata(metadata_path)
+    if not bool(metadata.get("complete")):
+        raise RuntimeError("full-universe cache is not marked complete")
+    if metadata.get("evaluation_end") != evaluation_end.isoformat():
+        raise RuntimeError(
+            "full-universe cache is stale: "
+            f"expected {evaluation_end.isoformat()}, found {metadata.get('evaluation_end', 'missing')}"
+        )
+    universe_path = directory / UNIVERSE_FILENAME
+    bars_path = directory / BARS_FILENAME
+    if not universe_path.is_file() or not bars_path.is_file():
+        raise RuntimeError("full-universe cache is missing its universe or endpoint data file")
+    for metadata_key, source in (("universe_sha256", universe_path), ("endpoint_data_sha256", bars_path)):
+        expected = metadata.get(metadata_key)
+        actual = _sha256(source)
+        if not expected or expected != actual:
+            raise RuntimeError(f"full-universe cache checksum mismatch for {source.name}")
+    print(
+        "FULL-UNIVERSE IEX CACHE VERIFIED | "
+        f"symbols={metadata.get('universe_symbols', 0):,} rows={metadata.get('retained_rows', 0):,} "
+        f"evaluation_end={evaluation_end.isoformat()}",
+        flush=True,
+    )
+    return metadata
+
+
 def _write_metadata(path: Path, metadata: dict[str, Any]) -> None:
     path.write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
 
@@ -118,6 +164,33 @@ def _snapshot_universe(key: str, secret: str) -> pd.DataFrame:
     )
 
 
+def latest_completed_market_session(
+    key: str, secret: str, *, now: pd.Timestamp | None = None
+) -> date:
+    """Return the latest NYSE session whose official close has passed.
+
+    The Alpaca market calendar handles weekends, market holidays, and early
+    closes.  During an open session this deliberately returns the preceding
+    session, so a live runner never tries to use incomplete current-day bars
+    as historical training data.
+    """
+    current = pd.Timestamp(now if now is not None else pd.Timestamp.now(tz="UTC"))
+    current = current.tz_localize("UTC") if current.tzinfo is None else current.tz_convert("UTC")
+    local_today = current.tz_convert(NEW_YORK).date()
+    calendar = TradingClient(key, secret, paper=True).get_calendar(
+        GetCalendarRequest(start=local_today - timedelta(days=14), end=local_today)
+    )
+    completed: list[date] = []
+    for session in calendar:
+        close_at = pd.Timestamp(session.close)
+        close_at = close_at.tz_localize(NEW_YORK) if close_at.tzinfo is None else close_at.tz_convert(NEW_YORK)
+        if close_at.tz_convert("UTC") <= current:
+            completed.append(session.date)
+    if not completed:
+        raise RuntimeError("Alpaca calendar returned no completed market session in the last fourteen days")
+    return max(completed)
+
+
 def build_cache(
     directory: Path,
     *,
@@ -134,6 +207,16 @@ def build_cache(
         metadata = _read_metadata(directory / METADATA_FILENAME)
         print(f"FULL-UNIVERSE IEX CACHE HIT | symbols={metadata['universe_symbols']:,} rows={metadata['retained_rows']:,}")
         return metadata
+
+    previous = _read_metadata(directory / METADATA_FILENAME)
+    previous_end = previous.get("evaluation_end")
+    if previous_end and previous_end != evaluation_end.isoformat():
+        print(
+            "FULL-UNIVERSE IEX CACHE REFRESH | "
+            f"previous_evaluation_end={previous_end} evaluation_end={evaluation_end.isoformat()}",
+            flush=True,
+        )
+        _discard_stale_cache(directory)
 
     key = os.environ.get("ALPACA_API_KEY", "")
     secret = os.environ.get("ALPACA_SECRET_KEY", "")
@@ -257,18 +340,48 @@ def build_cache(
 def main() -> None:
     parser = argparse.ArgumentParser(description="Build a full-Alpaca exact one-minute endpoint cache for research.")
     parser.add_argument("--cache-dir", required=True)
-    parser.add_argument("--evaluation-end", required=True, help="Last completed New York session (YYYY-MM-DD)")
+    evaluation_group = parser.add_mutually_exclusive_group(required=True)
+    evaluation_group.add_argument("--evaluation-end", help="Last completed New York session (YYYY-MM-DD)")
+    evaluation_group.add_argument(
+        "--latest-completed-session",
+        action="store_true",
+        help="Resolve the latest completed session from Alpaca's official market calendar",
+    )
+    evaluation_group.add_argument(
+        "--print-latest-completed-session",
+        action="store_true",
+        help="Print the latest completed official session and exit",
+    )
     parser.add_argument("--batch-size", type=int, default=100)
     parser.add_argument("--calendar-window-days", type=int, default=7)
     parser.add_argument("--request-pause-seconds", type=float, default=2.0)
-    args = parser.parse_args()
-    metadata = build_cache(
-        Path(args.cache_dir),
-        evaluation_end=date.fromisoformat(args.evaluation_end),
-        batch_size=args.batch_size,
-        calendar_window_days=args.calendar_window_days,
-        request_pause_seconds=args.request_pause_seconds,
+    parser.add_argument(
+        "--verify-existing",
+        action="store_true",
+        help="Verify the expected completed cache and exit without downloading data",
     )
+    args = parser.parse_args()
+    if args.latest_completed_session or args.print_latest_completed_session:
+        key = os.environ.get("ALPACA_API_KEY", "")
+        secret = os.environ.get("ALPACA_SECRET_KEY", "")
+        if not key or not secret:
+            parser.error("ALPACA_API_KEY and ALPACA_SECRET_KEY are required to resolve the market calendar")
+        resolved_end = latest_completed_market_session(key, secret)
+        if args.print_latest_completed_session:
+            print(resolved_end.isoformat())
+            return
+    else:
+        resolved_end = date.fromisoformat(args.evaluation_end)
+    if args.verify_existing:
+        metadata = verify_cache(Path(args.cache_dir), resolved_end)
+    else:
+        metadata = build_cache(
+            Path(args.cache_dir),
+            evaluation_end=resolved_end,
+            batch_size=args.batch_size,
+            calendar_window_days=args.calendar_window_days,
+            request_pause_seconds=args.request_pause_seconds,
+        )
     print(json.dumps(metadata, indent=2))
 
 

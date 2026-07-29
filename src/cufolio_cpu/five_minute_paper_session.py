@@ -375,7 +375,9 @@ def _persist_checkpoint(path: Path | None, checkpoint: dict[str, object], comple
     checkpoint["completed_events"] = sorted(completed)
     checkpoint["ledger"] = ledger
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(checkpoint, indent=2, default=str) + "\n", encoding="utf-8")
+    temporary = path.with_name(f".{path.name}.tmp")
+    temporary.write_text(json.dumps(checkpoint, indent=2, default=str) + "\n", encoding="utf-8")
+    os.replace(temporary, path)
 
 
 def _execution_summary(report: dict[str, object]) -> str:
@@ -619,7 +621,10 @@ def run_five_minute_paper_session(
                         minute_stream=stream,
                         health=health,
                         repair_from_rest=False,
-                        persist=False,
+                        # The current-session endpoint cache is a rolling
+                        # handoff input. Persist it atomically at every target
+                        # boundary, not only when the long-running slice ends.
+                        persist=True,
                         endpoint_only=True,
                         allow_rest_repair=False,
                         allow_yfinance_fallback=False,
@@ -662,7 +667,9 @@ def run_five_minute_paper_session(
                     minute_stream=stream,
                     health=health,
                     repair_from_rest=False,
-                    persist=False,
+                    # A completed five-minute decision is also a durable
+                    # recovery boundary for the endpoint cache.
+                    persist=True,
                     endpoint_only=True,
                     allow_rest_repair=False,
                     allow_yfinance_fallback=False,

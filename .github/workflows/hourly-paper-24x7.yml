@@ -39,6 +39,20 @@ jobs:
           python-version: "3.12"
           cache: pip
 
+      - name: Install five-minute paper-runner dependencies
+        run: pip install -r requirements.txt
+
+      - name: Resolve the required completed-session cache date
+        id: completed_session
+        run: |
+          set -euo pipefail
+          test -n "$ALPACA_API_KEY"
+          test -n "$ALPACA_SECRET_KEY"
+          evaluation_end="$(python tools/cache_full_alpaca_five_minute_input.py \
+            --cache-dir "$FULL_UNIVERSE_CACHE_DIR" --print-latest-completed-session)"
+          echo "evaluation_end=$evaluation_end" >> "$GITHUB_OUTPUT"
+          echo "FIVE MINUTE FULL-UNIVERSE CACHE REQUIRED | evaluation_end=$evaluation_end"
+
       - name: Restore rolling full-universe endpoint cache
         id: minute_cache_restore
         uses: actions/cache/restore@v4
@@ -53,7 +67,9 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: var/full_alpaca_universe_five_minute
-          key: full-alpaca-iex-1m-endpoints-2026-07-28-${{ hashFiles('tools/cache_full_alpaca_five_minute_input.py') }}
+          key: full-alpaca-iex-1m-endpoints-${{ steps.completed_session.outputs.evaluation_end }}-${{ hashFiles('tools/cache_full_alpaca_five_minute_input.py') }}
+          restore-keys: |
+            full-alpaca-iex-1m-endpoints-
 
       - name: Report paper-runner handoff configuration
         env:
@@ -66,13 +82,19 @@ jobs:
           elif test -f "$LIVE_ENDPOINT_CACHE"; then
             cache_status=rolling-hit
           fi
-          test "$FULL_UNIVERSE_CACHE_HIT" = "true"
           test -s "$FULL_UNIVERSE_CACHE_DIR/alpaca_tradable_fractionable_universe.csv"
           test -s "$FULL_UNIVERSE_CACHE_DIR/iex_one_minute_exact_five_minute_endpoints.csv.gz"
-          echo "FIVE MINUTE PAPER HANDOFF STARTED | run=${GITHUB_RUN_ID} sha=${GITHUB_SHA} mode=paper slice=${RUN_SECONDS}s rolling_cache=${cache_status} universe_cache=verified-full-alpaca"
+          echo "FIVE MINUTE PAPER HANDOFF STARTED | run=${GITHUB_RUN_ID} sha=${GITHUB_SHA} mode=paper slice=${RUN_SECONDS}s rolling_cache=${cache_status} full_cache_restore=${FULL_UNIVERSE_CACHE_HIT:-prefix-or-miss} required_evaluation_end=${{ steps.completed_session.outputs.evaluation_end }}"
 
-      - name: Install five-minute paper-runner dependencies
-        run: pip install -r requirements.txt
+      - name: Verify the full-universe cache is fresh and intact
+        env:
+          EVALUATION_END: ${{ steps.completed_session.outputs.evaluation_end }}
+        run: |
+          set -euo pipefail
+          python tools/cache_full_alpaca_five_minute_input.py \
+            --cache-dir "$FULL_UNIVERSE_CACHE_DIR" \
+            --evaluation-end "$EVALUATION_END" \
+            --verify-existing
 
       - name: Verify causal five-minute paper cadence
         run: pytest -q tests/test_alpaca.py tests/test_five_minute_paper_session.py tests/test_intraday_forecast_audits.py tests/test_optimization.py
@@ -82,6 +104,29 @@ jobs:
           set -euo pipefail
           test -n "$ALPACA_API_KEY"
           test -n "$ALPACA_SECRET_KEY"
+          publish_checkpoint_loop() {
+            while true; do
+              python tools/publish_five_minute_checkpoint.py \
+                --source var/five_minute_paper_24x7_state.json \
+                --repository "$GITHUB_WORKSPACE" \
+                --branch main || echo "FIVE MINUTE CHECKPOINT PUBLISH DEFERRED | will retry in 60 seconds"
+              sleep 60
+            done
+          }
+          publish_checkpoint_loop &
+          publisher_pid=$!
+          cleanup() {
+            runner_status=$?
+            trap - EXIT INT TERM
+            kill "$publisher_pid" 2>/dev/null || true
+            wait "$publisher_pid" 2>/dev/null || true
+            python tools/publish_five_minute_checkpoint.py \
+              --source var/five_minute_paper_24x7_state.json \
+              --repository "$GITHUB_WORKSPACE" \
+              --branch main || echo "FIVE MINUTE CHECKPOINT FINAL PUBLISH DEFERRED"
+            exit "$runner_status"
+          }
+          trap cleanup EXIT INT TERM
           python -m cufolio_cpu.five_minute_paper_daemon \
             --run-seconds "$RUN_SECONDS" \
             --state var/five_minute_paper_24x7_state.json \
@@ -97,56 +142,10 @@ jobs:
         if: always()
         run: |
           set -euo pipefail
-          if test ! -f var/five_minute_paper_24x7_state.json; then
-            echo "FIVE MINUTE PAPER STATE UNCHANGED | no checkpoint was created in this slice."
-            exit 0
-          fi
-          git fetch origin main
-          publish_root="$(mktemp -d)"
-          publish_dir="$publish_root/checkpoint-publish"
-          git worktree add --detach "$publish_dir" origin/main
-          LOCAL_STATE="$GITHUB_WORKSPACE/var/five_minute_paper_24x7_state.json" \
-          REMOTE_STATE="$publish_dir/var/five_minute_paper_24x7_state.json" \
-          python - <<'PY'
-          import json
-          import os
-          from pathlib import Path
-
-          local_path = Path(os.environ["LOCAL_STATE"])
-          remote_path = Path(os.environ["REMOTE_STATE"])
-          local = json.loads(local_path.read_text(encoding="utf-8"))
-          remote = json.loads(remote_path.read_text(encoding="utf-8")) if remote_path.exists() else {}
-          if remote.get("session_date", "") != local.get("session_date", ""):
-              merged = local if local.get("session_date", "") >= remote.get("session_date", "") else remote
-          else:
-              def unique(items):
-                  result, seen = [], set()
-                  for item in items:
-                      key = json.dumps(item, sort_keys=True, separators=(",", ":"))
-                      if key not in seen:
-                          result.append(item)
-                          seen.add(key)
-                  return result
-              merged = {
-                  "format_version": max(int(remote.get("format_version", 1)), int(local.get("format_version", 1))),
-                  "session_date": local.get("session_date") or remote.get("session_date"),
-                  "completed_events": sorted(set(remote.get("completed_events", [])) | set(local.get("completed_events", []))),
-                  "ledger": unique(remote.get("ledger", []) + local.get("ledger", [])),
-              }
-          remote_path.parent.mkdir(parents=True, exist_ok=True)
-          remote_path.write_text(json.dumps(merged, indent=2) + "\n", encoding="utf-8")
-          PY
-          cd "$publish_dir"
-          git add -f var/five_minute_paper_24x7_state.json
-          if git diff --cached --quiet; then
-            echo "FIVE MINUTE PAPER STATE UNCHANGED | no handoff checkpoint commit required."
-            exit 0
-          fi
-          git config user.name "cufolio five-minute paper runner"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git commit -m "chore: checkpoint five-minute paper session [skip ci]"
-          git push origin HEAD:main
-          echo "FIVE MINUTE PAPER STATE PUBLISHED | merged checkpoint changes were published to main."
+          python tools/publish_five_minute_checkpoint.py \
+            --source var/five_minute_paper_24x7_state.json \
+            --repository "$GITHUB_WORKSPACE" \
+            --branch main
 
       - name: Check full-universe endpoint cache for handoff
         if: always()

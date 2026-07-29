@@ -296,6 +296,19 @@ required sells have not completed, it submits no replacement buys. The
 scheduled runner remains paper-only; the same guarded path is used by the
 separately confirmed manual live session.
 
+The full-Alpaca-universe paper runner is fail-closed on cache freshness. An
+after-close workflow resolves Alpaca's official latest completed session,
+refreshes the current tradable-and-fractionable US-equity snapshot and exact
+IEX endpoint cache, then verifies both file checksums. Before it starts a
+market session, the runner independently checks that the restored cache has
+that expected completed-session date; it refuses to trade on an older or
+tampered cache. During the session, completed endpoint data is written
+atomically at each five-minute decision, while the small order/event checkpoint
+is atomically written locally and published to GitHub within one minute. The
+large rolling endpoint cache stays in Actions cache storage rather than Git
+history. This keeps a failed handoff from replaying a completed target without
+committing high-volume market data to the repository.
+
 #### Three-month five-minute execution-slicing research
 
 The manually dispatched [three-month causal five-minute
