@@ -1,0 +1,212 @@
+name: Full Alpaca universe causal five-minute backtest
+
+on:
+  workflow_dispatch:
+    inputs:
+      evaluation_end:
+        description: "Last completed New York session (YYYY-MM-DD)"
+        type: string
+        required: true
+        default: "2026-07-28"
+      top_n:
+        description: "Maximum long-only holdings per five-minute target"
+        type: string
+        required: true
+        default: "20"
+      max_weight:
+        description: "Maximum target weight per asset"
+        type: string
+        required: true
+        default: "0.10"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: full-alpaca-universe-five-minute-${{ inputs.evaluation_end }}
+  cancel-in-progress: false
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    env:
+      PYTHONPATH: ${{ github.workspace }}/src
+      ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
+      ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
+      EVALUATION_END: ${{ inputs.evaluation_end }}
+      TOP_N: ${{ inputs.top_n }}
+      MAX_WEIGHT: ${{ inputs.max_weight }}
+      CACHE_DIR: var/full_alpaca_universe_five_minute
+      OUTPUT_DIR: artifacts/full_alpaca_universe_five_minute
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Verify causal audit implementation
+        run: pytest -q tests/test_alpaca.py tests/test_intraday_forecast_audits.py tests/test_optimization.py
+
+      - name: Restore exact one-minute IEX endpoint cache
+        id: endpoint_cache
+        uses: actions/cache/restore@v4
+        with:
+          path: var/full_alpaca_universe_five_minute
+          key: full-alpaca-iex-1m-endpoints-${{ inputs.evaluation_end }}-${{ hashFiles('tools/cache_full_alpaca_five_minute_input.py') }}
+
+      - name: Build the complete tradable fractionable universe cache
+        run: |
+          set -euo pipefail
+          test -n "$ALPACA_API_KEY"
+          test -n "$ALPACA_SECRET_KEY"
+          python tools/cache_full_alpaca_five_minute_input.py \
+            --cache-dir "$CACHE_DIR" \
+            --evaluation-end "$EVALUATION_END" \
+            --batch-size 100 \
+            --calendar-window-days 7 \
+            --request-pause-seconds 2.0
+
+      - name: Persist the complete IEX endpoint cache before the backtest
+        if: steps.endpoint_cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: var/full_alpaca_universe_five_minute
+          key: full-alpaca-iex-1m-endpoints-${{ inputs.evaluation_end }}-${{ hashFiles('tools/cache_full_alpaca_five_minute_input.py') }}
+
+      - name: Run the causal three-month five-minute portfolio audit
+        run: |
+          set -euo pipefail
+          mkdir -p "$OUTPUT_DIR"
+          EVALUATION_START="$(python - <<'PY'
+          import os
+          import pandas as pd
+          print((pd.Timestamp(os.environ['EVALUATION_END']) - pd.DateOffset(months=3)).date().isoformat())
+          PY
+          )"
+          python -m cufolio_cpu.five_minute_intraday_backtest \
+            --input "$CACHE_DIR/iex_one_minute_exact_five_minute_endpoints.csv.gz" \
+            --output-dir "$OUTPUT_DIR" \
+            --evaluation-start "$EVALUATION_START" \
+            --evaluation-end "$EVALUATION_END" \
+            --top-n "$TOP_N" \
+            --max-weight "$MAX_WEIGHT" \
+            --lookback-observations 780 \
+            --min-training-sessions 10 \
+            --min-covariance-scenarios 500
+
+      - name: Calculate honest return and implementation metrics
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          import numpy as np
+          import pandas as pd
+
+          cache = Path(os.environ['CACHE_DIR'])
+          output = Path(os.environ['OUTPUT_DIR'])
+          source = json.loads((cache / 'metadata.json').read_text())
+          summary = json.loads((output / 'five_minute_forecast_summary.json').read_text())
+          ledger = pd.read_csv(output / 'five_minute_forecast_ledger.csv')
+          holdings = pd.read_csv(output / 'five_minute_forecast_holdings.csv')
+          realized = ledger.loc[ledger['realized_status'].eq('ok')].copy()
+          returns = pd.to_numeric(realized['actual_portfolio_simple_return'], errors='coerce').dropna()
+          log_returns = np.log1p(returns)
+          wealth = (1.0 + returns).cumprod()
+          drawdown = wealth / wealth.cummax() - 1.0 if not wealth.empty else pd.Series(dtype=float)
+          sessions = int(realized['session_date'].nunique()) if not realized.empty else 0
+          periods_per_year = 78 * 252
+          annualized_volatility = float(returns.std(ddof=1) * np.sqrt(periods_per_year)) if len(returns) > 1 else None
+          annualized_sharpe = (
+              float(returns.mean() / returns.std(ddof=1) * np.sqrt(periods_per_year))
+              if len(returns) > 1 and returns.std(ddof=1) > 0 else None
+          )
+          annualized_return = (
+              float(np.expm1(log_returns.sum() * 252 / sessions)) if sessions and not log_returns.empty else None
+          )
+          prior = pd.Series(dtype=float)
+          turnovers = []
+          for _, group in holdings.groupby('decision_timestamp', sort=True):
+              current = group.set_index('symbol')['target_weight'].astype(float)
+              combined = current.index.union(prior.index)
+              turnovers.append(float(0.5 * (current.reindex(combined, fill_value=0) - prior.reindex(combined, fill_value=0)).abs().sum()))
+              prior = current
+          metrics = {
+              'research_only': True,
+              'universe_requested': int(source['universe_symbols']),
+              'exact_endpoint_rows_cached': int(source['retained_rows']),
+              'raw_one_minute_rows_fetched': int(source['raw_rows_fetched']),
+              'endpoint_data_sha256': source['endpoint_data_sha256'],
+              'evaluation_start': summary['evaluation_start'],
+              'evaluation_end': summary['evaluation_end'],
+              'evaluation_sessions': sessions,
+              'forecast_windows': int(summary['forecast_windows']),
+              'realized_windows': int(summary['realized_windows']),
+              'exact_realized_coverage': summary['exact_realized_coverage'],
+              'compounded_actual_return_before_costs': summary['matched_compounded_actual_return'],
+              'annualized_return_before_costs': annualized_return,
+              'annualized_volatility': annualized_volatility,
+              'annualized_sharpe_zero_cash_rate': annualized_sharpe,
+              'maximum_drawdown': float(drawdown.min()) if not drawdown.empty else None,
+              'five_minute_win_rate': float((returns > 0).mean()) if not returns.empty else None,
+              'mean_five_minute_return': float(returns.mean()) if not returns.empty else None,
+              'median_five_minute_return': float(returns.median()) if not returns.empty else None,
+              'forecast_mae_bps': summary['mean_absolute_error_bps'],
+              'forecast_rmse_bps': summary['root_mean_squared_error_bps'],
+              'forecast_directional_accuracy': summary['directional_accuracy'],
+              'distinct_selected_symbols': int(holdings['symbol'].nunique()) if not holdings.empty else 0,
+              'mean_holdings': float(ledger.loc[ledger['forecast_status'].eq('ok'), 'holding_count'].mean()) if not ledger.empty else None,
+              'mean_target_turnover': float(np.mean(turnovers)) if turnovers else None,
+              'median_target_turnover': float(np.median(turnovers)) if turnovers else None,
+              'total_target_turnover': float(np.sum(turnovers)) if turnovers else None,
+              'transaction_costs_included': False,
+              'data_feed': source['market_data_feed'],
+              'source_bar_interval': source['source_bar_interval'],
+              'exact_endpoint_rule': source['causality'],
+              'universe_caveat': 'The snapshot includes all currently tradable fractionable US-equity assets, including ETFs and similar listed instruments; it is not a historical constituent file and has survivorship bias.',
+          }
+          (output / 'full_universe_metrics.json').write_text(json.dumps(metrics, indent=2) + '\n')
+          def pct(value):
+              return 'n/a' if value is None else f'{float(value):+.4%}'
+          def bps(value):
+              return 'n/a' if value is None else f'{float(value):.2f} bps'
+          lines = [
+              '## Full Alpaca universe causal five-minute backtest',
+              '',
+              f"- Universe: {metrics['universe_requested']:,} currently tradable and fractionable US-equity symbols; {metrics['distinct_selected_symbols']:,} appeared in at least one target.",
+              f"- Data: {metrics['raw_one_minute_rows_fetched']:,} native IEX one-minute bars fetched; {metrics['exact_endpoint_rows_cached']:,} exact Cufolio endpoints cached.",
+              f"- Evaluation: {metrics['evaluation_start']} through {metrics['evaluation_end']} ({metrics['evaluation_sessions']} sessions).",
+              f"- Exact realized windows: {metrics['realized_windows']:,}/{metrics['forecast_windows']:,} ({pct(metrics['exact_realized_coverage'])}).",
+              f"- Compounded actual return before costs: {pct(metrics['compounded_actual_return_before_costs'])}.",
+              f"- Annualized return / volatility / zero-cash-rate Sharpe: {pct(metrics['annualized_return_before_costs'])} / {pct(metrics['annualized_volatility'])} / {metrics['annualized_sharpe_zero_cash_rate'] if metrics['annualized_sharpe_zero_cash_rate'] is not None else 'n/a'}.",
+              f"- Maximum drawdown: {pct(metrics['maximum_drawdown'])}; five-minute win rate: {pct(metrics['five_minute_win_rate'])}.",
+              f"- Forecast MAE / RMSE / directional accuracy: {bps(metrics['forecast_mae_bps'])} / {bps(metrics['forecast_rmse_bps'])} / {pct(metrics['forecast_directional_accuracy'])}.",
+              f"- Mean target turnover: {pct(metrics['mean_target_turnover'])} per decision. Transaction costs, spread, slippage, market impact, and borrow costs are excluded.",
+              '- Caveat: this is a current-universe research backtest, so it has survivorship bias and should not be interpreted as a tradable performance claim.',
+          ]
+          (output / 'github_summary.md').write_text('\n'.join(lines) + '\n')
+          print('\n'.join(lines))
+          PY
+
+      - name: Publish backtest summary
+        run: cat "$OUTPUT_DIR/github_summary.md" >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: full-alpaca-universe-five-minute-${{ github.run_id }}
+          path: |
+            artifacts/full_alpaca_universe_five_minute/
+            var/full_alpaca_universe_five_minute/metadata.json
+            var/full_alpaca_universe_five_minute/alpaca_tradable_fractionable_universe.csv
+            var/full_alpaca_universe_five_minute/download_parts.jsonl
+          if-no-files-found: warn
+          retention-days: 30
