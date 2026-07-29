@@ -212,6 +212,16 @@ def append_rolling_endpoint_cache(
             "rolling endpoint cache does not contain the requested completed session "
             f"{evaluation_end.isoformat()}"
         )
+    session_rows = rolling.loc[rolling_days.eq(evaluation_end)]
+    final_decision_endpoint = (
+        pd.Timestamp.combine(evaluation_end, clock_time(15, 54)).tz_localize(NEW_YORK).tz_convert("UTC")
+    )
+    latest_session_endpoint = session_rows["timestamp"].max()
+    if latest_session_endpoint < final_decision_endpoint:
+        raise RuntimeError(
+            "rolling endpoint cache is not complete through the final five-minute decision: "
+            f"latest={latest_session_endpoint.isoformat()} required={final_decision_endpoint.isoformat()}"
+        )
     combined = (
         pd.concat([historical, rolling], ignore_index=True)
         .drop_duplicates(["timestamp", "symbol"], keep="last")
