@@ -12,6 +12,7 @@ import json
 import os
 import ssl
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation, ROUND_DOWN
@@ -240,11 +241,19 @@ def _position_map(positions: list[dict[str, Any]], targets: dict[str, Decimal]) 
 
 
 def _ensure_fractionable_assets(client: AlpacaTradingClient, targets: dict[str, Decimal]) -> None:
-    ineligible: list[str] = []
-    for symbol in targets:
-        asset = client.get_asset(symbol)
-        if not asset.get("tradable") or not asset.get("fractionable"):
-            ineligible.append(symbol)
+    """Check every target concurrently before submitting an order.
+
+    Each request is independent and the client creates a fresh HTTP request per
+    call.  Keeping this bounded removes serial network latency from every
+    forecast boundary without weakening the live tradable/fractionable guard.
+    """
+    symbols = list(targets)
+    with ThreadPoolExecutor(max_workers=min(8, len(symbols))) as executor:
+        assets = list(executor.map(client.get_asset, symbols))
+    ineligible = [
+        symbol for symbol, asset in zip(symbols, assets, strict=True)
+        if not asset.get("tradable") or not asset.get("fractionable")
+    ]
     if ineligible:
         joined = ", ".join(ineligible)
         raise PaperTradingError(f"refusing partial rebalance: target assets are not tradable and fractionable: {joined}")
@@ -451,7 +460,10 @@ def run_rebalance(
             min_weight_drift=min_weight_drift,
         )
     )
-    intents = sells or _buy_intents(
+    # Use cash already in the account to enter the next target immediately.
+    # Sale proceeds are never assumed available: after the sell phase clears,
+    # the remaining target is recalculated from the refreshed account state.
+    cash_funded_buys = _buy_intents(
         targets,
         positions,
         equity=equity,
@@ -459,11 +471,16 @@ def run_rebalance(
         min_order_notional=min_order_notional,
         min_weight_drift=min_weight_drift,
     )
+    intents = (
+        [*cash_funded_buys, *sells]
+        if sells and complete_rebalance
+        else (sells or cash_funded_buys)
+    )
     report["orders"] = [intent.to_dict() for intent in intents]
     if not intents:
         report["status"] = "within_rebalance_tolerance_or_no_cash"
         return report
-    report["status"] = "sell_orders_planned" if sells else "buy_orders_planned"
+    report["status"] = "buy_then_sell_orders_planned" if sells and cash_funded_buys and complete_rebalance else ("sell_orders_planned" if sells else "buy_orders_planned")
     if not execute:
         return report
 
@@ -546,7 +563,7 @@ def run_rebalance(
             }
         )
     report["submitted_orders"] = submitted
-    report["status"] = "sell_then_buy_orders_submitted"
+    report["status"] = "buy_then_sell_then_buy_orders_submitted" if cash_funded_buys else "sell_then_buy_orders_submitted"
     return report
 
 

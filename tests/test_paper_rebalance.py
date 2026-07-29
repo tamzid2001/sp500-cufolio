@@ -231,7 +231,7 @@ def test_completed_rebalance_retains_overlap_and_updates_it_to_the_new_target() 
     assert result["post_sell_cash"] == "500.00"
 
 
-def test_completed_rebalance_plans_only_the_required_sells_before_their_fill() -> None:
+def test_completed_rebalance_plans_cash_funded_buys_before_required_sells() -> None:
     client = FakePaperClient(
         positions=[{"symbol": "AAA", "side": "long", "market_value": "1000", "qty": "10"}]
     )
@@ -243,8 +243,10 @@ def test_completed_rebalance_plans_only_the_required_sells_before_their_fill() -
         complete_rebalance=True,
     )
 
-    assert result["status"] == "sell_orders_planned"
-    assert [order["symbol"] for order in result["orders"]] == ["AAA"]
+    assert result["status"] == "buy_then_sell_orders_planned"
+    assert [(order["symbol"], order["side"]) for order in result["orders"]] == [
+        ("BBB", "buy"), ("AAA", "sell")
+    ]
     assert client.bulk_close_requests == []
     assert client.submitted == []
 

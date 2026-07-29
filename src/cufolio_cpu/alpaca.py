@@ -207,22 +207,23 @@ class AlpacaMinuteBarStream:
 
 
 def download_minute_bars(
-    symbols: list[str], start: str | datetime, end: str | datetime, *, batch_size: int = 100
+    symbols: list[str], start: str | datetime, end: str | datetime, *, batch_size: int = 100, max_workers: int = 4
 ) -> pd.DataFrame:
     """Download one-minute stock bars using Alpaca's market-data API only."""
     key, secret = _market_data_credentials()
-    if batch_size < 1:
-        raise ValueError("batch_size must be positive")
+    if batch_size < 1 or max_workers < 1:
+        raise ValueError("batch_size and max_workers must be positive")
 
     from alpaca.data.historical import StockHistoricalDataClient
     from alpaca.data.enums import DataFeed
     from alpaca.data.requests import StockBarsRequest
     from alpaca.data.timeframe import TimeFrame
 
-    client = StockHistoricalDataClient(key, secret)
-    frames: list[pd.DataFrame] = []
-    for offset in range(0, len(symbols), batch_size):
-        batch = symbols[offset : offset + batch_size]
+    batches = [symbols[offset : offset + batch_size] for offset in range(0, len(symbols), batch_size)]
+    if not batches:
+        return _empty_minute_bars()
+    def fetch(batch: list[str]) -> pd.DataFrame:
+        client = StockHistoricalDataClient(key, secret)
         request = StockBarsRequest(
             symbol_or_symbols=batch,
             timeframe=TimeFrame.Minute,
@@ -233,10 +234,10 @@ def download_minute_bars(
             # selected for both the bootstrap and any narrow repair request.
             feed=DataFeed.IEX,
         )
-        frame = client.get_stock_bars(request).df
-        if frame.empty:
-            continue
-        frames.append(frame.reset_index().loc[:, ["timestamp", "symbol", "close"]])
+        return client.get_stock_bars(request).df
+    with ThreadPoolExecutor(max_workers=min(max_workers, len(batches))) as executor:
+        raw_frames = list(executor.map(fetch, batches))
+    frames = [frame.reset_index().loc[:, ["timestamp", "symbol", "close"]] for frame in raw_frames if not frame.empty]
     if not frames:
         return _empty_minute_bars()
     result = pd.concat(frames, ignore_index=True)
@@ -304,6 +305,7 @@ def download_minute_endpoint_bars(
     *,
     endpoint_times: Collection[clock_time],
     batch_size: int = 100,
+    max_workers: int = 4,
 ) -> pd.DataFrame:
     """Download IEX minutes but retain only exact New York endpoint closes.
 
@@ -325,10 +327,13 @@ def download_minute_endpoint_bars(
     from alpaca.data.requests import StockBarsRequest
     from alpaca.data.timeframe import TimeFrame
 
-    client = StockHistoricalDataClient(key, secret)
-    frames: list[pd.DataFrame] = []
-    for offset in range(0, len(symbols), batch_size):
-        batch = symbols[offset : offset + batch_size]
+    if max_workers < 1:
+        raise ValueError("max_workers must be positive")
+    batches = [symbols[offset : offset + batch_size] for offset in range(0, len(symbols), batch_size)]
+    if not batches:
+        return _empty_minute_bars()
+    def fetch(batch: list[str]) -> pd.DataFrame:
+        client = StockHistoricalDataClient(key, secret)
         request = StockBarsRequest(
             symbol_or_symbols=batch,
             timeframe=TimeFrame.Minute,
@@ -336,7 +341,11 @@ def download_minute_endpoint_bars(
             end=_utc_datetime(end),
             feed=DataFeed.IEX,
         )
-        frame = client.get_stock_bars(request).df
+        return client.get_stock_bars(request).df
+    with ThreadPoolExecutor(max_workers=min(max_workers, len(batches))) as executor:
+        raw_frames = list(executor.map(fetch, batches))
+    frames: list[pd.DataFrame] = []
+    for frame in raw_frames:
         if frame.empty:
             continue
         normalized = _minute_bar_frame(frame.reset_index().loc[:, ["timestamp", "symbol", "close"]].to_dict("records"))
