@@ -26,6 +26,8 @@ from alpaca.trading.client import TradingClient
 from alpaca.trading.enums import AssetClass
 from alpaca.trading.requests import GetAssetsRequest, GetCalendarRequest
 
+from cufolio_cpu.alpaca import download_minute_endpoint_bars
+
 
 NEW_YORK = ZoneInfo("America/New_York")
 UNIVERSE_FILENAME = "alpaca_tradable_fractionable_universe.csv"
@@ -256,6 +258,65 @@ def append_rolling_endpoint_cache(
     return verify_cache(directory, evaluation_end)
 
 
+def fetch_completed_session_endpoints(
+    directory: Path, output_path: Path, *, evaluation_end: date
+) -> dict[str, Any]:
+    """Fetch only one completed session of exact native IEX endpoints.
+
+    This is a post-close integrity repair when a live handoff has not yet
+    published its rolling file. It is intentionally limited to the missing
+    session; it never substitutes a provider or re-fetches historical cache
+    data.
+    """
+    metadata = _read_metadata(directory / METADATA_FILENAME)
+    if not metadata.get("complete"):
+        raise RuntimeError("a verified historical full-universe cache is required before session repair")
+    universe = pd.read_csv(directory / UNIVERSE_FILENAME, usecols=["symbol"])
+    symbols = universe["symbol"].dropna().astype(str).str.upper().str.strip().drop_duplicates().to_list()
+    if not symbols:
+        raise RuntimeError("full-universe cache has no symbols for endpoint repair")
+    session_start = pd.Timestamp.combine(evaluation_end, clock_time(9, 29)).tz_localize(NEW_YORK).tz_convert("UTC")
+    session_end = pd.Timestamp.combine(evaluation_end, clock_time(16, 0)).tz_localize(NEW_YORK).tz_convert("UTC")
+    endpoints = download_minute_endpoint_bars(
+        symbols,
+        session_start,
+        session_end,
+        endpoint_times=_endpoint_times(),
+        batch_size=100,
+        max_workers=4,
+    )
+    allowed = set(symbols)
+    normalization_input = _write_temporary_endpoint_file(output_path, endpoints)
+    try:
+        clean = _read_exact_endpoints(
+            normalization_input,
+            data_start=session_start,
+            data_end=session_end,
+            allowed_symbols=allowed,
+        )
+    finally:
+        normalization_input.unlink(missing_ok=True)
+    if clean.empty:
+        raise RuntimeError("native IEX session repair returned no exact endpoint rows")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = output_path.with_name(f".{output_path.name}.tmp")
+    clean.to_csv(temporary, index=False, compression="gzip")
+    os.replace(temporary, output_path)
+    print(
+        "FULL-UNIVERSE IEX SESSION REPAIR READY | "
+        f"session={evaluation_end.isoformat()} symbols={clean['symbol'].nunique():,} rows={len(clean):,}",
+        flush=True,
+    )
+    return {"session_date": evaluation_end.isoformat(), "symbols": int(clean["symbol"].nunique()), "rows": int(len(clean))}
+
+
+def _write_temporary_endpoint_file(path: Path, bars: pd.DataFrame) -> Path:
+    """Serialize a provider frame once so the shared strict normalizer can read it."""
+    temporary = path.with_name(f".{path.name}.normalize")
+    bars.to_csv(temporary, index=False, compression="gzip")
+    return temporary
+
+
 def _write_metadata(path: Path, metadata: dict[str, Any]) -> None:
     path.write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
 
@@ -478,6 +539,10 @@ def main() -> None:
         "--rolling-endpoint-cache",
         help="Merge a completed rolling endpoint cache into the verified historical cache",
     )
+    parser.add_argument(
+        "--fetch-completed-session-to",
+        help="Write one completed session of exact native IEX endpoints for a later cache roll-forward",
+    )
     args = parser.parse_args()
     if args.latest_completed_session or args.print_latest_completed_session:
         key = os.environ.get("ALPACA_API_KEY", "")
@@ -490,13 +555,18 @@ def main() -> None:
             return
     else:
         resolved_end = date.fromisoformat(args.evaluation_end)
-    if args.verify_existing and args.rolling_endpoint_cache:
-        parser.error("--verify-existing and --rolling-endpoint-cache cannot be used together")
+    selected_operations = sum(bool(value) for value in (args.verify_existing, args.rolling_endpoint_cache, args.fetch_completed_session_to))
+    if selected_operations > 1:
+        parser.error("choose only one of --verify-existing, --rolling-endpoint-cache, or --fetch-completed-session-to")
     if args.verify_existing:
         metadata = verify_cache(Path(args.cache_dir), resolved_end)
     elif args.rolling_endpoint_cache:
         metadata = append_rolling_endpoint_cache(
             Path(args.cache_dir), Path(args.rolling_endpoint_cache), evaluation_end=resolved_end
+        )
+    elif args.fetch_completed_session_to:
+        metadata = fetch_completed_session_endpoints(
+            Path(args.cache_dir), Path(args.fetch_completed_session_to), evaluation_end=resolved_end
         )
     else:
         metadata = build_cache(
