@@ -27,6 +27,8 @@ jobs:
       ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
       ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
       RUN_SECONDS: ${{ inputs.run_seconds || '20700' }}
+      FULL_UNIVERSE_CACHE_DIR: var/full_alpaca_universe_five_minute
+      LIVE_ENDPOINT_CACHE: var/full_alpaca_universe_live_five_minute_endpoints.csv.gz
     steps:
       - uses: actions/checkout@v4
         with:
@@ -37,32 +39,43 @@ jobs:
           python-version: "3.12"
           cache: pip
 
-      - name: Restore rolling full-minute IEX cache
+      - name: Restore rolling full-universe endpoint cache
         id: minute_cache_restore
         uses: actions/cache/restore@v4
         with:
-          path: var/five_minute_paper_24x7_minute_history.csv.gz
-          key: five-minute-paper-minute-history-${{ github.run_id }}
+          path: var/full_alpaca_universe_live_five_minute_endpoints.csv.gz
+          key: five-minute-paper-full-alpaca-endpoint-history-${{ github.run_id }}
           restore-keys: |
-            five-minute-paper-minute-history-
+            five-minute-paper-full-alpaca-endpoint-history-
+
+      - name: Restore verified full-Alpaca historical endpoint cache
+        id: full_universe_cache_restore
+        uses: actions/cache/restore@v4
+        with:
+          path: var/full_alpaca_universe_five_minute
+          key: full-alpaca-iex-1m-endpoints-2026-07-28-${{ hashFiles('tools/cache_full_alpaca_five_minute_input.py') }}
 
       - name: Report paper-runner handoff configuration
         env:
           CACHE_HIT: ${{ steps.minute_cache_restore.outputs.cache-hit }}
+          FULL_UNIVERSE_CACHE_HIT: ${{ steps.full_universe_cache_restore.outputs.cache-hit }}
         run: |
           cache_status=miss
           if test "$CACHE_HIT" = "true"; then
             cache_status=exact-hit
-          elif test -f var/five_minute_paper_24x7_minute_history.csv.gz; then
+          elif test -f "$LIVE_ENDPOINT_CACHE"; then
             cache_status=rolling-hit
           fi
-          echo "FIVE MINUTE PAPER HANDOFF STARTED | run=${GITHUB_RUN_ID} sha=${GITHUB_SHA} mode=paper slice=${RUN_SECONDS}s cache=${cache_status}"
+          test "$FULL_UNIVERSE_CACHE_HIT" = "true"
+          test -s "$FULL_UNIVERSE_CACHE_DIR/alpaca_tradable_fractionable_universe.csv"
+          test -s "$FULL_UNIVERSE_CACHE_DIR/iex_one_minute_exact_five_minute_endpoints.csv.gz"
+          echo "FIVE MINUTE PAPER HANDOFF STARTED | run=${GITHUB_RUN_ID} sha=${GITHUB_SHA} mode=paper slice=${RUN_SECONDS}s rolling_cache=${cache_status} universe_cache=verified-full-alpaca"
 
       - name: Install five-minute paper-runner dependencies
         run: pip install -r requirements.txt
 
       - name: Verify causal five-minute paper cadence
-        run: pytest -q tests/test_five_minute_paper_session.py tests/test_intraday_forecast_audits.py tests/test_optimization.py
+        run: pytest -q tests/test_alpaca.py tests/test_five_minute_paper_session.py tests/test_intraday_forecast_audits.py tests/test_optimization.py
 
       - name: Run paper-only five-minute session handoff slice
         run: |
@@ -72,8 +85,9 @@ jobs:
           python -m cufolio_cpu.five_minute_paper_daemon \
             --run-seconds "$RUN_SECONDS" \
             --state var/five_minute_paper_24x7_state.json \
-            --minute-cache var/five_minute_paper_24x7_minute_history.csv.gz \
-            --historical-minute-cache var/iex_one_minute_history.csv.gz \
+            --minute-cache "$LIVE_ENDPOINT_CACHE" \
+            --historical-minute-cache "$FULL_UNIVERSE_CACHE_DIR/iex_one_minute_exact_five_minute_endpoints.csv.gz" \
+            --universe-cache "$FULL_UNIVERSE_CACHE_DIR/alpaca_tradable_fractionable_universe.csv" \
             --history-calendar-days 55 \
             --output-dir artifacts/five_minute_paper_24x7 \
             --top-n 20 \
@@ -134,24 +148,24 @@ jobs:
           git push origin HEAD:main
           echo "FIVE MINUTE PAPER STATE PUBLISHED | merged checkpoint changes were published to main."
 
-      - name: Check minute cache for handoff
+      - name: Check full-universe endpoint cache for handoff
         if: always()
         id: minute_cache_present
         run: |
-          if test -f var/five_minute_paper_24x7_minute_history.csv.gz; then
+          if test -f "$LIVE_ENDPOINT_CACHE"; then
             echo "save=true" >> "$GITHUB_OUTPUT"
-            echo "FIVE MINUTE PAPER CACHE HANDOFF READY | bytes=$(wc -c < var/five_minute_paper_24x7_minute_history.csv.gz)"
+            echo "FIVE MINUTE PAPER CACHE HANDOFF READY | bytes=$(wc -c < "$LIVE_ENDPOINT_CACHE")"
           else
             echo "save=false" >> "$GITHUB_OUTPUT"
             echo "FIVE MINUTE PAPER CACHE HANDOFF EMPTY | no cache was created in this slice."
           fi
 
-      - name: Save rolling full-minute IEX cache
+      - name: Save rolling full-universe endpoint cache
         if: always() && steps.minute_cache_present.outputs.save == 'true'
         uses: actions/cache/save@v4
         with:
-          path: var/five_minute_paper_24x7_minute_history.csv.gz
-          key: five-minute-paper-minute-history-${{ github.run_id }}
+          path: var/full_alpaca_universe_live_five_minute_endpoints.csv.gz
+          key: five-minute-paper-full-alpaca-endpoint-history-${{ github.run_id }}
 
       - name: Queue the next 5h45m paper handoff
         if: success()
@@ -167,7 +181,7 @@ jobs:
           name: five-minute-paper-24x7-${{ github.run_id }}
           path: |
             var/five_minute_paper_24x7_state.json
-            var/five_minute_paper_24x7_minute_history.csv.gz
+            var/full_alpaca_universe_live_five_minute_endpoints.csv.gz
             artifacts/five_minute_paper_24x7/
           if-no-files-found: warn
           retention-days: 30

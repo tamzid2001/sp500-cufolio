@@ -6,6 +6,7 @@ import argparse
 import os
 import ssl
 import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections.abc import Collection, Mapping
 from datetime import datetime, time as clock_time
 from pathlib import Path
@@ -84,7 +85,11 @@ class AlpacaMinuteBarStream:
             raise ValueError("at least one symbol is required for the Alpaca minute-bar stream")
         self._symbols = normalized
         self._lock = threading.Lock()
-        self._rows: list[dict[str, object]] = []
+        # A full-Alpaca universe can emit hundreds of thousands of IEX bars
+        # in a session.  Keep only unreleased rows here; the session loop drains
+        # them every completed minute instead of repeatedly materializing the
+        # entire websocket history.
+        self._pending_rows: dict[tuple[pd.Timestamp, str], dict[str, object]] = {}
         self._stream: Any | None = None
         self._thread: threading.Thread | None = None
         self._error: Exception | None = None
@@ -151,8 +156,14 @@ class AlpacaMinuteBarStream:
         else:
             timestamp_at = timestamp_at.tz_convert("UTC")
         with self._lock:
-            self._rows.append({"timestamp": timestamp_at, "symbol": symbol, "close": close})
-            self._last_bar_at = timestamp_at
+            normalized_symbol = str(symbol).upper().strip()
+            self._pending_rows[(timestamp_at, normalized_symbol)] = {
+                "timestamp": timestamp_at,
+                "symbol": normalized_symbol,
+                "close": close,
+            }
+            if self._last_bar_at is None or timestamp_at > self._last_bar_at:
+                self._last_bar_at = timestamp_at
 
     def _run(self) -> None:
         assert self._stream is not None
@@ -162,13 +173,27 @@ class AlpacaMinuteBarStream:
             self._error = error
 
     def completed_bars_through(self, completed_at: pd.Timestamp) -> pd.DataFrame:
-        """Return the stream rows no later than the caller's causal boundary."""
+        """Return a non-destructive snapshot through the causal boundary."""
         with self._lock:
-            rows = list(self._rows)
+            rows = list(self._pending_rows.values())
         result = _minute_bar_frame(rows)
         if result.empty:
             return result
         return result.loc[result["timestamp"] <= pd.Timestamp(completed_at).tz_convert("UTC")].copy()
+
+    def drain_completed_bars_through(self, completed_at: pd.Timestamp) -> pd.DataFrame:
+        """Atomically release newly completed rows and bound websocket memory.
+
+        This is the live-runner path.  ``completed_bars_through`` remains a
+        non-destructive diagnostic/test view, while a five-minute runner only
+        needs each completed minute once.
+        """
+        boundary = pd.Timestamp(completed_at)
+        boundary = boundary.tz_localize("UTC") if boundary.tzinfo is None else boundary.tz_convert("UTC")
+        with self._lock:
+            completed_keys = [key for key in self._pending_rows if key[0] <= boundary]
+            rows = [self._pending_rows.pop(key) for key in completed_keys]
+        return _minute_bar_frame(rows)
 
     def stop(self) -> None:
         """Close the websocket without blocking the paper-session shutdown."""
@@ -217,6 +242,59 @@ def download_minute_bars(
     result = pd.concat(frames, ignore_index=True)
     result["timestamp"] = pd.to_datetime(result["timestamp"], utc=True)
     return result.sort_values(["symbol", "timestamp"]).drop_duplicates(["symbol", "timestamp"])
+
+
+def download_latest_iex_minute_bars(
+    symbols: list[str], *, batch_size: int = 100, max_workers: int = 8
+) -> pd.DataFrame:
+    """Fetch the latest IEX minute bars concurrently without stale-bar substitution.
+
+    Alpaca's Basic paper plan has a small websocket symbol allowance, so the
+    full tradable/fractionable universe is polled in bounded batches instead.
+    Callers must still require the exact completed-minute timestamp they need;
+    this function returns a provider's latest bar, which can legitimately be
+    older for an illiquid instrument.
+    """
+    key, secret = _market_data_credentials()
+    if batch_size < 1 or max_workers < 1:
+        raise ValueError("batch_size and max_workers must be positive")
+    normalized = list(dict.fromkeys(symbol.upper().strip() for symbol in symbols if symbol.strip()))
+    if not normalized:
+        return _empty_minute_bars()
+
+    from alpaca.data.enums import DataFeed
+    from alpaca.data.historical import StockHistoricalDataClient
+    from alpaca.data.requests import StockLatestBarRequest
+
+    batches = [normalized[offset : offset + batch_size] for offset in range(0, len(normalized), batch_size)]
+
+    def fetch(batch: list[str]) -> list[dict[str, object]]:
+        # A client per worker avoids making an undocumented thread-safety
+        # assumption about the SDK transport while retaining a strict cap on
+        # simultaneous requests.
+        client = StockHistoricalDataClient(key, secret)
+        response = client.get_stock_latest_bar(
+            StockLatestBarRequest(symbol_or_symbols=batch, feed=DataFeed.IEX)
+        )
+        if not isinstance(response, Mapping):
+            raise RuntimeError("Alpaca latest-bar response was not symbol-addressable")
+        rows: list[dict[str, object]] = []
+        for symbol, bar in response.items():
+            if isinstance(bar, Mapping):
+                timestamp = bar.get("timestamp")
+                close = bar.get("close")
+            else:
+                timestamp = getattr(bar, "timestamp", None)
+                close = getattr(bar, "close", None)
+            rows.append({"timestamp": timestamp, "symbol": symbol, "close": close})
+        return rows
+
+    rows: list[dict[str, object]] = []
+    with ThreadPoolExecutor(max_workers=min(max_workers, len(batches)), thread_name_prefix="alpaca-iex-latest") as executor:
+        futures = [executor.submit(fetch, batch) for batch in batches]
+        for future in as_completed(futures):
+            rows.extend(future.result())
+    return _minute_bar_frame(rows)
 
 
 def download_minute_endpoint_bars(

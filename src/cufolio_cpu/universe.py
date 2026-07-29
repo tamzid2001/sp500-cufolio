@@ -15,6 +15,34 @@ DATASETS_SP500_URL = (
 USER_AGENT = "sp500-cufolio-research/0.1 (GitHub Actions; non-commercial research)"
 
 
+def cached_alpaca_tradable_fractionable_universe(path: str | Path) -> pd.DataFrame:
+    """Load the exact Alpaca universe snapshot used by the full-universe audit.
+
+    Live paper sessions deliberately consume this immutable snapshot rather than
+    falling back to the S&P 500 or silently taking a new asset snapshot.  That
+    keeps the live eligibility universe aligned with the retained IEX history
+    and makes a missing cache a fail-closed condition.
+    """
+    source = Path(path)
+    if not source.is_file():
+        raise FileNotFoundError(f"full-Alpaca universe cache is unavailable: {source}")
+    universe = pd.read_csv(source)
+    if "symbol" not in universe.columns:
+        raise ValueError(f"full-Alpaca universe cache has no symbol column: {source}")
+    result = universe.copy()
+    result["symbol"] = result["symbol"].astype(str).str.upper().str.strip()
+    result = result.loc[result["symbol"].ne("") & result["symbol"].ne("NAN")].copy()
+    for column in ("tradable", "fractionable"):
+        if column in result.columns:
+            eligible = result[column].astype(str).str.strip().str.lower().isin({"true", "1"})
+            result = result.loc[eligible].copy()
+    result = result.drop_duplicates("symbol").sort_values("symbol").reset_index(drop=True)
+    if result.empty:
+        raise ValueError(f"full-Alpaca universe cache contains no tradable fractionable symbols: {source}")
+    result["universe_source"] = "cached_alpaca_tradable_fractionable_snapshot"
+    return result
+
+
 def current_sp500_universe() -> pd.DataFrame:
     """Fetch the current Wikipedia constituent table for short-horizon research.
 

@@ -1,0 +1,53 @@
+name: Full Alpaca latest-minute benchmark
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: full-alpaca-latest-minute-benchmark
+  cancel-in-progress: false
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      PYTHONPATH: ${{ github.workspace }}/src
+      ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
+      ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
+      FULL_UNIVERSE_CACHE_DIR: var/full_alpaca_universe_five_minute
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Restore verified full-Alpaca universe cache
+        id: cache
+        uses: actions/cache/restore@v4
+        with:
+          path: var/full_alpaca_universe_five_minute
+          key: full-alpaca-iex-1m-endpoints-2026-07-28-${{ hashFiles('tools/cache_full_alpaca_five_minute_input.py') }}
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Verify full-universe live data path
+        run: pytest -q tests/test_alpaca.py tests/test_five_minute_paper_session.py
+      - name: Measure one read-only full-universe refresh
+        run: |
+          set -euo pipefail
+          test "${{ steps.cache.outputs.cache-hit }}" = "true"
+          test -n "$ALPACA_API_KEY"
+          test -n "$ALPACA_SECRET_KEY"
+          python tools/benchmark_full_alpaca_latest_bars.py \
+            --universe-cache "$FULL_UNIVERSE_CACHE_DIR/alpaca_tradable_fractionable_universe.csv" \
+            --output artifacts/full_alpaca_latest_minute_benchmark.json
+          cat artifacts/full_alpaca_latest_minute_benchmark.json >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: full-alpaca-latest-minute-benchmark-${{ github.run_id }}
+          path: artifacts/full_alpaca_latest_minute_benchmark.json
+          if-no-files-found: warn

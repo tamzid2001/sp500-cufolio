@@ -22,8 +22,8 @@ import pandas as pd
 
 from .alpaca import (
     AlpacaMinuteBarStream,
+    download_latest_iex_minute_bars,
     download_minute_bars,
-    download_minute_endpoint_bars,
     download_yfinance_minute_bars,
 )
 from .five_minute_intraday_backtest import (
@@ -36,7 +36,7 @@ from .five_minute_intraday_backtest import (
 )
 from .hourly_paper_session import MinuteCacheHealth
 from .paper_rebalance import AlpacaTradingClient, load_target_weights, run_end_of_day_flatten, run_rebalance
-from .universe import current_sp500_universe
+from .universe import cached_alpaca_tradable_fractionable_universe
 
 # The opening-inclusive five-minute grid provides 78 labels per session, so
 # 780 observations require ten completed sessions. Retaining 16 sessions
@@ -115,8 +115,15 @@ def _handoff_must_wait_for_flatten(
     )
 
 
-def _regular_minute_cache_projection(bars: pd.DataFrame) -> pd.DataFrame:
-    """Normalize a bounded full-minute training cache without endpoint loss."""
+def _regular_minute_cache_projection(bars: pd.DataFrame, *, endpoint_only: bool = False) -> pd.DataFrame:
+    """Normalize a bounded regular-session cache, optionally at decision endpoints.
+
+    The full-Alpaca live runner receives every IEX minute through its websocket,
+    but its five-minute model only consumes the left-labelled :04/:09/.../:59
+    closes (including the 09:29 opening anchor).  Persisting only those exact
+    endpoints keeps the rolling Actions cache small without substituting or
+    fabricating any missing one-minute observations.
+    """
     required = {"timestamp", "symbol", "close"}
     if missing := required.difference(bars.columns):
         raise ValueError(f"minute-bar cache is missing columns: {sorted(missing)}")
@@ -137,6 +144,11 @@ def _regular_minute_cache_projection(bars: pd.DataFrame) -> pd.DataFrame:
     if clean.empty:
         return pd.DataFrame(columns=["timestamp", "symbol", "close"])
     local = clean["timestamp"].dt.tz_convert(NEW_YORK)
+    if endpoint_only:
+        clean = clean.loc[local.dt.minute.mod(FORECAST_CADENCE_MINUTES).eq(FORECAST_CADENCE_MINUTES - 1)].copy()
+        if clean.empty:
+            return pd.DataFrame(columns=["timestamp", "symbol", "close"])
+        local = clean["timestamp"].dt.tz_convert(NEW_YORK)
     retained_days = sorted(local.dt.date.unique())[-MINUTE_CACHE_SESSION_LIMIT:]
     clean = clean.loc[local.dt.date.isin(retained_days)]
     return (
@@ -155,11 +167,11 @@ def _cache_summary(bars: pd.DataFrame) -> str:
     )
 
 
-def _read_minute_cache(path: Path) -> pd.DataFrame:
+def _read_minute_cache(path: Path, *, endpoint_only: bool = False) -> pd.DataFrame:
     if not path.exists():
         return pd.DataFrame(columns=["timestamp", "symbol", "close"])
     try:
-        bars = _regular_minute_cache_projection(pd.read_csv(path, compression="gzip"))
+        bars = _regular_minute_cache_projection(pd.read_csv(path, compression="gzip"), endpoint_only=endpoint_only)
         print(f"FIVE MINUTE CACHE RESTORED | path={path} {_cache_summary(bars)}", flush=True)
         return bars
     except (EOFError, OSError, UnicodeDecodeError, ValueError, pd.errors.EmptyDataError, pd.errors.ParserError) as error:
@@ -167,10 +179,10 @@ def _read_minute_cache(path: Path) -> pd.DataFrame:
         return pd.DataFrame(columns=["timestamp", "symbol", "close"])
 
 
-def _write_minute_cache(path: Path, bars: pd.DataFrame) -> None:
+def _write_minute_cache(path: Path, bars: pd.DataFrame, *, endpoint_only: bool = False) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f".{path.name}.tmp")
-    normalized = _regular_minute_cache_projection(bars)
+    normalized = _regular_minute_cache_projection(bars, endpoint_only=endpoint_only)
     normalized.to_csv(temporary, index=False, compression="gzip")
     os.replace(temporary, path)
 
@@ -198,11 +210,13 @@ def _record_degraded(health: MinuteCacheHealth, source: str, observed_at: pd.Tim
         )
 
 
-def _merge_incremental_minute_bars(existing: pd.DataFrame, incremental: pd.DataFrame) -> pd.DataFrame:
+def _merge_incremental_minute_bars(
+    existing: pd.DataFrame, incremental: pd.DataFrame, *, endpoint_only: bool = False
+) -> pd.DataFrame:
     """Replace only overlapping rows; do not re-sort the full rolling cache."""
     if incremental.empty:
         return existing
-    incoming = _regular_minute_cache_projection(incremental)
+    incoming = _regular_minute_cache_projection(incremental, endpoint_only=endpoint_only)
     if incoming.empty:
         return existing
     if existing.empty:
@@ -226,8 +240,12 @@ def _merge_current_minutes(
     health: MinuteCacheHealth,
     repair_from_rest: bool = True,
     persist: bool = True,
+    endpoint_only: bool = False,
+    allow_rest_repair: bool = True,
+    allow_yfinance_fallback: bool = True,
+    latest_bar_polling: bool = False,
 ) -> MinuteCacheUpdate:
-    """Add only completed IEX minutes, then use bounded Yahoo repair if needed.
+    """Add only completed IEX minutes, then use bounded repair if allowed.
 
     The websocket is always preferred.  REST requests explicitly specify IEX
     in ``download_minute_bars``; no code path asks Alpaca for recent SIP data.
@@ -245,7 +263,7 @@ def _merge_current_minutes(
     # one-minute precomputation path.
     normalized = bars
     if not isinstance(normalized.get("timestamp", pd.Series(dtype="object")).dtype, pd.DatetimeTZDtype):
-        normalized = _regular_minute_cache_projection(normalized)
+        normalized = _regular_minute_cache_projection(normalized, endpoint_only=endpoint_only)
     session_anchor = (
         pd.Timestamp.combine(session_day, OPENING_DECISION_PRICE_TIME)
         .tz_localize(NEW_YORK)
@@ -259,17 +277,27 @@ def _merge_current_minutes(
     if fetch_start > completed:
         fetch_start = completed
     incremental = pd.DataFrame(columns=["timestamp", "symbol", "close"])
+    source = "alpaca_iex_rest"
     if minute_stream is not None:
-        streamed = minute_stream.completed_bars_through(completed)
+        drain = getattr(minute_stream, "drain_completed_bars_through", None)
+        streamed = drain(completed) if callable(drain) else minute_stream.completed_bars_through(completed)
         if not streamed.empty:
             incremental = streamed.loc[
                 pd.to_datetime(streamed["timestamp"], utc=True, errors="coerce") >= fetch_start
             ].copy()
-    source = "alpaca_iex_websocket" if not incremental.empty else "alpaca_iex_rest"
+            if not incremental.empty:
+                source = "alpaca_iex_websocket"
+    elif latest_bar_polling:
+        try:
+            incremental = download_latest_iex_minute_bars(symbols)
+            source = "alpaca_iex_latest_threadpool"
+            health.record_success("alpaca_iex_latest_threadpool", observed_at)
+        except Exception as error:
+            _record_degraded(health, "alpaca_iex_latest_threadpool", observed_at, error)
     # A stream can be connected yet legitimately sparse for IEX.  REST repair
     # fills the same five-minute overlap, so candidates are not based on stale
     # prior-day prices.
-    if (repair_from_rest or incremental.empty) and health.may_attempt("alpaca_iex_rest", observed_at):
+    if allow_rest_repair and (repair_from_rest or incremental.empty) and health.may_attempt("alpaca_iex_rest", observed_at):
         try:
             rest = download_minute_bars(symbols, fetch_start, completed + timedelta(minutes=1))
             if not rest.empty:
@@ -278,7 +306,7 @@ def _merge_current_minutes(
                 health.record_success("alpaca_iex_rest", observed_at)
         except Exception as error:
             _record_degraded(health, "alpaca_iex_rest", observed_at, error)
-    if incremental.empty and health.may_attempt("yfinance_1m_fallback", observed_at):
+    if incremental.empty and allow_yfinance_fallback and health.may_attempt("yfinance_1m_fallback", observed_at):
         try:
             incremental = download_yfinance_minute_bars(symbols, fetch_start, completed + timedelta(minutes=1))
             source = "yfinance_1m_fallback"
@@ -287,13 +315,12 @@ def _merge_current_minutes(
         except Exception as error:
             _record_degraded(health, "yfinance_1m_fallback", observed_at, error)
     if not incremental.empty:
-        incremental = incremental.loc[
-            pd.to_datetime(incremental["timestamp"], utc=True, errors="coerce") <= completed
-        ]
-        incremental = _regular_minute_cache_projection(incremental)
-        normalized = _merge_incremental_minute_bars(normalized, incremental)
+        incremental_timestamps = pd.to_datetime(incremental["timestamp"], utc=True, errors="coerce")
+        incremental = incremental.loc[(incremental_timestamps >= fetch_start) & (incremental_timestamps <= completed)]
+        incremental = _regular_minute_cache_projection(incremental, endpoint_only=endpoint_only)
+        normalized = _merge_incremental_minute_bars(normalized, incremental, endpoint_only=endpoint_only)
         if persist and cache_path is not None:
-            _write_minute_cache(cache_path, normalized)
+            _write_minute_cache(cache_path, normalized, endpoint_only=endpoint_only)
         print(
             "FIVE MINUTE CACHE UPDATED | "
             f"source={source} through={completed.isoformat()} rows={len(incremental):,} "
@@ -364,6 +391,7 @@ def run_five_minute_paper_session(
     session_day: date,
     history_start: str,
     output_dir: str | Path,
+    universe_cache_path: str | Path | None = None,
     top_n: int = 20,
     max_weight: Decimal = Decimal("0.10"),
     risk_aversion: float = 10.0,
@@ -379,65 +407,53 @@ def run_five_minute_paper_session(
     now: Callable[[], pd.Timestamp] = _utc_timestamp,
     sleep: Callable[[float], None] = time.sleep,
 ) -> list[dict[str, object]]:
-    """Submit one fresh target at each five-minute boundary, with no intra-window rebalance."""
+    """Submit paper targets from the cached full-Alpaca universe every five minutes."""
     if mode == "live" and not allow_live_trading:
         raise ValueError("live mode requires allow_live_trading=True")
+    if universe_cache_path is None:
+        raise ValueError("universe_cache_path is required; the S&P 500 fallback is intentionally disabled")
     output = Path(output_dir)
     output.mkdir(parents=True, exist_ok=True)
-    universe = current_sp500_universe()
-    symbol_column = "source_symbol" if "source_symbol" in universe.columns else "symbol"
-    symbols = universe[symbol_column].dropna().astype(str).str.upper().drop_duplicates().to_list()
-    universe.to_csv(output / "current_sp500_universe.csv", index=False)
+    universe = cached_alpaca_tradable_fractionable_universe(universe_cache_path)
+    symbols = universe["symbol"].to_list()
+    universe.to_csv(output / "alpaca_tradable_fractionable_universe.csv", index=False)
     client = AlpacaTradingClient.from_environment(mode=mode)
     state_path = Path(checkpoint_path) if checkpoint_path is not None else None
     checkpoint = _load_checkpoint(state_path, session_day)
     completed = set(str(item) for item in checkpoint["completed_events"])
     ledger = [dict(item) for item in checkpoint["ledger"] if isinstance(item, dict)]
     cache_file = Path(minute_cache_path) if minute_cache_path is not None else None
-    bars = _read_minute_cache(cache_file) if cache_file is not None else pd.DataFrame(columns=["timestamp", "symbol", "close"])
+    bars = (
+        _read_minute_cache(cache_file, endpoint_only=True)
+        if cache_file is not None
+        else pd.DataFrame(columns=["timestamp", "symbol", "close"])
+    )
     if historical_minute_cache_path is not None:
-        seed = _read_minute_cache(Path(historical_minute_cache_path))
+        seed = _read_minute_cache(Path(historical_minute_cache_path), endpoint_only=True)
         if not seed.empty:
-            bars = _regular_minute_cache_projection(pd.concat([seed, bars], ignore_index=True))
+            bars = _regular_minute_cache_projection(pd.concat([seed, bars], ignore_index=True), endpoint_only=True)
     health = MinuteCacheHealth()
+    # Alpaca's default paper data plan allows only 30 websocket symbols. A
+    # 7,484-symbol stream would be rejected, so every completed minute uses a
+    # bounded thread pool of latest-IEX-bar requests instead. Each returned bar
+    # is still screened for the exact completed timestamp below.
     stream: AlpacaMinuteBarStream | None = None
-    try:
-        stream = AlpacaMinuteBarStream(symbols)
-        stream.start()
-        print(f"FIVE MINUTE CACHE WEBSOCKET STARTED | feed=iex symbols={len(symbols)}", flush=True)
-    except Exception as error:
-        _record_degraded(health, "alpaca_iex_websocket", _utc_timestamp(), error)
-        stream = None
+    latest_bar_polling = True
+    print(
+        "FIVE MINUTE FULL-UNIVERSE IEX POLLER STARTED | "
+        f"symbols={len(symbols)} batches={(len(symbols) + 99) // 100} workers=8 cadence=1m",
+        flush=True,
+    )
     if _prior_sessions(bars, session_day) < MINIMUM_HISTORY_SESSIONS:
-        try:
-            historical = download_minute_bars(symbols, history_start, _utc_timestamp())
-            bars = _regular_minute_cache_projection(pd.concat([bars, historical], ignore_index=True))
-            if cache_file is not None:
-                _write_minute_cache(cache_file, bars)
-            print(f"FIVE MINUTE HISTORY BOOTSTRAPPED | {_cache_summary(bars)}", flush=True)
-        except Exception as error:
-            _record_degraded(health, "alpaca_iex_history", _utc_timestamp(), error)
+        raise RuntimeError(
+            "full-universe endpoint cache has fewer than the required ten prior sessions; "
+            "restore the verified full-Alpaca cache instead of downloading a multi-million-row live bootstrap"
+        )
     elif _prior_opening_anchor_sessions(bars, session_day) < MINIMUM_HISTORY_SESSIONS:
-        # Older retained caches began at 09:30.  Fetch only the missing 09:29
-        # endpoints rather than re-downloading the multi-million-row history,
-        # so the opening model has the same causal anchor as a fresh cache.
-        try:
-            opening_anchors = download_minute_endpoint_bars(
-                symbols,
-                history_start,
-                _utc_timestamp(),
-                endpoint_times={OPENING_DECISION_PRICE_TIME},
-            )
-            bars = _regular_minute_cache_projection(pd.concat([bars, opening_anchors], ignore_index=True))
-            if cache_file is not None:
-                _write_minute_cache(cache_file, bars)
-            print(
-                "FIVE MINUTE OPENING ANCHORS BACKFILLED | "
-                f"prior_sessions={_prior_opening_anchor_sessions(bars, session_day)} {_cache_summary(bars)}",
-                flush=True,
-            )
-        except Exception as error:
-            _record_degraded(health, "alpaca_iex_opening_anchor_history", _utc_timestamp(), error)
+        raise RuntimeError(
+            "full-universe endpoint cache is missing required 09:29 opening anchors; "
+            "refusing a non-causal full-universe bootstrap"
+        )
     def build_engine(forecast_horizon_minutes: int) -> RealtimeIntradayForecastEngine:
         return RealtimeIntradayForecastEngine(
             bars,
@@ -471,7 +487,8 @@ def run_five_minute_paper_session(
     print(
         "FIVE MINUTE SESSION STARTED | "
         f"mode={client.mode} session={session_day.isoformat()} symbols={len(symbols)} "
-        f"resume={resume} completed_events={len(completed)} cache={_cache_summary(bars)}",
+        f"universe=cached_alpaca_fractionable endpoint_cache=true resume={resume} "
+        f"completed_events={len(completed)} cache={_cache_summary(bars)}",
         flush=True,
     )
 
@@ -518,6 +535,10 @@ def run_five_minute_paper_session(
                             health=health,
                             repair_from_rest=False,
                             persist=False,
+                            endpoint_only=True,
+                            allow_rest_repair=False,
+                            allow_yfinance_fallback=False,
+                            latest_bar_polling=latest_bar_polling,
                         )
                         bars = update.bars
                         if not update.new_rows.empty:
@@ -585,9 +606,9 @@ def run_five_minute_paper_session(
                 print(f"FIVE MINUTE EVENT SKIPPED | scheduled={due_at.isoformat()} reason=maximum_event_lag_exceeded", flush=True)
                 continue
             if kind == "flatten":
-                # Persist every completed minute through 15:58 before closing
-                # positions.  Tomorrow's new checkpoint starts empty, while
-                # this cache provides its most recent completed-session data.
+                # Drain every IEX minute through 15:58 before closing. The
+                # compact endpoint cache is written once at handoff so a
+                # multi-million-row full-universe CSV never delays a target.
                 try:
                     update = _merge_current_minutes(
                         bars,
@@ -597,8 +618,12 @@ def run_five_minute_paper_session(
                         cache_path=cache_file,
                         minute_stream=stream,
                         health=health,
-                        repair_from_rest=True,
-                        persist=True,
+                        repair_from_rest=False,
+                        persist=False,
+                        endpoint_only=True,
+                        allow_rest_repair=False,
+                        allow_yfinance_fallback=False,
+                        latest_bar_polling=latest_bar_polling,
                     )
                     bars = update.bars
                     if not update.new_rows.empty:
@@ -636,8 +661,12 @@ def run_five_minute_paper_session(
                     cache_path=cache_file,
                     minute_stream=stream,
                     health=health,
-                    repair_from_rest=True,
-                    persist=True,
+                    repair_from_rest=False,
+                    persist=False,
+                    endpoint_only=True,
+                    allow_rest_repair=False,
+                    allow_yfinance_fallback=False,
+                    latest_bar_polling=latest_bar_polling,
                 )
                 bars = update.bars
                 if not update.new_rows.empty:
@@ -692,6 +721,12 @@ def run_five_minute_paper_session(
     finally:
         if stream is not None:
             stream.stop()
+        if cache_file is not None and not bars.empty:
+            try:
+                _write_minute_cache(cache_file, bars, endpoint_only=True)
+                print(f"FIVE MINUTE ENDPOINT CACHE HANDOFF READY | {_cache_summary(bars)}", flush=True)
+            except Exception as error:
+                _record_degraded(health, "endpoint_cache_handoff", _utc_timestamp(), error)
     return ledger
 
 
@@ -700,6 +735,7 @@ def main() -> None:
     parser.add_argument("--session-date", required=True)
     parser.add_argument("--history-start", required=True)
     parser.add_argument("--output-dir", required=True)
+    parser.add_argument("--universe-cache", required=True, help="Cached Alpaca tradable fractionable universe CSV")
     parser.add_argument("--checkpoint")
     parser.add_argument("--minute-cache")
     parser.add_argument("--historical-minute-cache")
@@ -712,7 +748,7 @@ def main() -> None:
         parser.error("--mode live requires --allow-live-trading and ALPACA_LIVE_* credentials")
     run_five_minute_paper_session(
         session_day=date.fromisoformat(args.session_date), history_start=args.history_start,
-        output_dir=args.output_dir, checkpoint_path=args.checkpoint, minute_cache_path=args.minute_cache,
+        output_dir=args.output_dir, universe_cache_path=args.universe_cache, checkpoint_path=args.checkpoint, minute_cache_path=args.minute_cache,
         historical_minute_cache_path=args.historical_minute_cache, top_n=args.top_n,
         max_weight=args.max_weight, mode=args.mode, allow_live_trading=args.allow_live_trading,
     )

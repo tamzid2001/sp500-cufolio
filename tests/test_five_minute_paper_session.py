@@ -54,6 +54,30 @@ def test_five_minute_cache_keeps_full_minutes_for_recent_sessions() -> None:
     ]
 
 
+def test_full_universe_cache_retains_only_exact_five_minute_endpoints() -> None:
+    bars = pd.DataFrame(
+        {
+            "timestamp": [
+                "2026-07-28T13:29:00Z",  # 09:29 opening anchor
+                "2026-07-28T13:30:00Z",
+                "2026-07-28T13:34:00Z",
+                "2026-07-28T13:35:00Z",
+                "2026-07-28T19:59:00Z",
+            ],
+            "symbol": ["AAA"] * 5,
+            "close": [99, 100, 101, 102, 103],
+        }
+    )
+
+    projected = _regular_minute_cache_projection(bars, endpoint_only=True)
+
+    assert projected["timestamp"].tolist() == [
+        pd.Timestamp("2026-07-28T13:29:00Z"),
+        pd.Timestamp("2026-07-28T13:34:00Z"),
+        pd.Timestamp("2026-07-28T19:59:00Z"),
+    ]
+
+
 def test_completed_minute_never_uses_in_progress_bar() -> None:
     assert _completed_bar_at(pd.Timestamp("2026-07-28T13:35:00Z"), date(2026, 7, 28)) == pd.Timestamp("2026-07-28T13:34:00Z")
     assert _completed_bar_at(pd.Timestamp("2026-07-28T13:30:00Z"), date(2026, 7, 28)) == pd.Timestamp("2026-07-28T13:29:00Z")
@@ -122,3 +146,40 @@ def test_websocket_precompute_does_not_issue_redundant_rest_repair(monkeypatch) 
 
     assert list(update.new_rows["timestamp"]) == [pd.Timestamp("2026-07-28T14:33:00Z")]
     assert list(update.bars["close"]) == [100.0, 101.0]
+
+
+def test_full_universe_threaded_latest_poll_keeps_only_exact_completed_endpoint(monkeypatch) -> None:
+    def latest(_symbols):
+        return pd.DataFrame(
+            {
+                "timestamp": ["2026-07-28T14:32:00Z", "2026-07-28T14:34:00Z"],
+                "symbol": ["STALE", "FRESH"],
+                "close": [99.0, 101.0],
+            }
+        )
+
+    def unexpected_rest(*_args, **_kwargs):
+        raise AssertionError("full-universe latest-bar polling must not fan out into historical REST repairs")
+
+    monkeypatch.setattr("cufolio_cpu.five_minute_paper_session.download_latest_iex_minute_bars", latest)
+    monkeypatch.setattr("cufolio_cpu.five_minute_paper_session.download_minute_bars", unexpected_rest)
+    update = _merge_current_minutes(
+        pd.DataFrame({"timestamp": ["2026-07-28T14:29:00Z"], "symbol": ["AAA"], "close": [100.0]}),
+        ["AAA", "FRESH", "STALE"],
+        session_day=date(2026, 7, 28),
+        observed_at=pd.Timestamp("2026-07-28T14:35:00Z"),
+        cache_path=None,
+        minute_stream=None,
+        health=MinuteCacheHealth(),
+        repair_from_rest=False,
+        persist=False,
+        endpoint_only=True,
+        allow_rest_repair=False,
+        allow_yfinance_fallback=False,
+        latest_bar_polling=True,
+    )
+
+    assert update.new_rows.to_dict("records") == [
+        {"timestamp": pd.Timestamp("2026-07-28T14:34:00Z"), "symbol": "FRESH", "close": 101.0}
+    ]
+    assert update.bars["symbol"].tolist() == ["AAA", "FRESH"]

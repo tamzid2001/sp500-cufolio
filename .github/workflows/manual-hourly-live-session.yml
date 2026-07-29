@@ -38,12 +38,19 @@ jobs:
       # Historical minute bars use the same separately scoped live account key.
       ALPACA_API_KEY: ${{ secrets.ALPACA_LIVE_API_KEY }}
       ALPACA_SECRET_KEY: ${{ secrets.ALPACA_LIVE_SECRET_KEY }}
+      FULL_UNIVERSE_CACHE_DIR: var/full_alpaca_universe_five_minute
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
           cache: pip
+      - name: Restore verified full-Alpaca historical endpoint cache
+        id: full_universe_cache_restore
+        uses: actions/cache/restore@v4
+        with:
+          path: var/full_alpaca_universe_five_minute
+          key: full-alpaca-iex-1m-endpoints-2026-07-28-${{ hashFiles('tools/cache_full_alpaca_five_minute_input.py') }}
       - name: Install dependencies
         run: pip install -r requirements.txt
       - name: Verify explicit live authorization and credentials
@@ -51,16 +58,20 @@ jobs:
           test "${{ inputs.live_confirmation }}" = "SUBMIT_LIVE_ORDERS"
           test -n "$ALPACA_LIVE_API_KEY"
           test -n "$ALPACA_LIVE_SECRET_KEY"
+          test "${{ steps.full_universe_cache_restore.outputs.cache-hit }}" = "true"
+          test -s "$FULL_UNIVERSE_CACHE_DIR/alpaca_tradable_fractionable_universe.csv"
+          test -s "$FULL_UNIVERSE_CACHE_DIR/iex_one_minute_exact_five_minute_endpoints.csv.gz"
       - name: Verify five-minute incremental rebalance policy
-        run: pytest -q tests/test_paper_rebalance.py tests/test_five_minute_paper_session.py
+        run: pytest -q tests/test_alpaca.py tests/test_paper_rebalance.py tests/test_five_minute_paper_session.py
       - name: Run live five-minute session
         run: |
           python -m cufolio_cpu.five_minute_paper_session \
             --session-date "${{ inputs.session_date }}" \
             --history-start "${{ inputs.history_start }}" \
             --output-dir artifacts/manual_five_minute_live_session \
-            --minute-cache var/manual_five_minute_live_minute_history.csv.gz \
-            --historical-minute-cache var/iex_one_minute_history.csv.gz \
+            --universe-cache "$FULL_UNIVERSE_CACHE_DIR/alpaca_tradable_fractionable_universe.csv" \
+            --minute-cache var/manual_full_alpaca_live_five_minute_endpoints.csv.gz \
+            --historical-minute-cache "$FULL_UNIVERSE_CACHE_DIR/iex_one_minute_exact_five_minute_endpoints.csv.gz" \
             --mode live \
             --allow-live-trading
       - uses: actions/upload-artifact@v4
