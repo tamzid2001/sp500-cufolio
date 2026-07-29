@@ -139,6 +139,20 @@ jobs:
               combined = current.index.union(prior.index)
               turnovers.append(float(0.5 * (current.reindex(combined, fill_value=0) - prior.reindex(combined, fill_value=0)).abs().sum()))
               prior = current
+          selection_counts = (
+              holdings.groupby('symbol')['decision_timestamp']
+              .nunique()
+              .sort_values(ascending=False)
+          )
+          target_decisions = int(holdings['decision_timestamp'].nunique()) if not holdings.empty else 0
+          most_frequent_targets = [
+              {
+                  'symbol': str(symbol),
+                  'target_decisions': int(count),
+                  'share_of_target_decisions': float(count / target_decisions) if target_decisions else 0.0,
+              }
+              for symbol, count in selection_counts.head(10).items()
+          ]
           metrics = {
               'research_only': True,
               'universe_requested': int(source['universe_symbols']),
@@ -163,6 +177,8 @@ jobs:
               'forecast_rmse_bps': summary['root_mean_squared_error_bps'],
               'forecast_directional_accuracy': summary['directional_accuracy'],
               'distinct_selected_symbols': int(holdings['symbol'].nunique()) if not holdings.empty else 0,
+              'target_decisions': target_decisions,
+              'most_frequent_targets': most_frequent_targets,
               'mean_holdings': float(ledger.loc[ledger['forecast_status'].eq('ok'), 'holding_count'].mean()) if not ledger.empty else None,
               'mean_target_turnover': float(np.mean(turnovers)) if turnovers else None,
               'median_target_turnover': float(np.median(turnovers)) if turnovers else None,
@@ -182,6 +198,12 @@ jobs:
               '## Full Alpaca universe causal five-minute backtest',
               '',
               f"- Universe: {metrics['universe_requested']:,} currently tradable and fractionable US-equity symbols; {metrics['distinct_selected_symbols']:,} appeared in at least one target.",
+              "- Most frequently targeted: " + (
+                  ', '.join(
+                      f"{item['symbol']} ({item['target_decisions']:,}/{metrics['target_decisions']:,} decisions, {item['share_of_target_decisions']:.1%})"
+                      for item in metrics['most_frequent_targets']
+                  ) if metrics['most_frequent_targets'] else 'none.'
+              ),
               f"- Data: {metrics['raw_one_minute_rows_fetched']:,} native IEX one-minute bars fetched; {metrics['exact_endpoint_rows_cached']:,} exact Cufolio endpoints cached.",
               f"- Evaluation: {metrics['evaluation_start']} through {metrics['evaluation_end']} ({metrics['evaluation_sessions']} sessions).",
               f"- Exact realized windows: {metrics['realized_windows']:,}/{metrics['forecast_windows']:,} ({pct(metrics['exact_realized_coverage'])}).",
