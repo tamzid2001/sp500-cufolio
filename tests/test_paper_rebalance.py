@@ -91,6 +91,32 @@ class ImmediatelyFilledPaperClient(FakePaperClient):
         return response
 
 
+class ResidualSellPaperClient(ImmediatelyFilledPaperClient):
+    """Simulates a partial market-order fill that leaves one material residue."""
+
+    def __init__(self, **kwargs: object) -> None:
+        super().__init__(**kwargs)
+        self._first_sell = True
+
+    def submit_order(self, payload: dict[str, str]) -> dict[str, object]:
+        if payload["side"] == "sell" and self._first_sell:
+            self._first_sell = False
+            response = FakePaperClient.submit_order(self, payload)
+            symbol = payload["symbol"]
+            for position in self.positions:
+                if str(position["symbol"]) != symbol:
+                    continue
+                market_value = Decimal(str(position["market_value"]))
+                held = Decimal(str(position["qty"]))
+                residual_value = Decimal("20")
+                position["market_value"] = str(residual_value)
+                position["qty"] = str(held * residual_value / market_value)
+                self.account["cash"] = str(Decimal(str(self.account["cash"])) + market_value - residual_value)
+                break
+            return response
+        return super().submit_order(payload)
+
+
 def test_configured_research_targets_are_fully_invested_and_capped() -> None:
     target_file = Path(__file__).parents[1] / "assets" / "paper_target_weights.csv"
     targets = load_target_weights(target_file)
@@ -231,6 +257,74 @@ def test_completed_rebalance_retains_overlap_and_updates_it_to_the_new_target() 
     assert result["post_sell_cash"] == "500.00"
 
 
+def test_completed_rebalance_retries_a_material_sell_residue_then_buys_the_target() -> None:
+    client = ResidualSellPaperClient(
+        account={"equity": "1000", "cash": "0"},
+        positions=[{"symbol": "OLD", "side": "long", "market_value": "1000", "qty": "10"}],
+    )
+
+    result = run_rebalance(
+        client,
+        {"AAA": Decimal("0.5"), "BBB": Decimal("0.5")},
+        liquidate_non_target_positions=True,
+        complete_rebalance=True,
+        min_weight_drift=Decimal("0"),
+        execute=True,
+    )
+
+    assert result["status"] == "sell_then_buy_orders_submitted"
+    assert result["residual_sell_reconciliation_rounds"] == 1
+    assert [(order["symbol"], order["side"]) for order in client.submitted] == [
+        ("OLD", "sell"), ("OLD", "sell"), ("AAA", "buy"), ("BBB", "buy"),
+    ]
+
+
+def test_completed_rebalance_ignores_untradeable_subdollar_exit_dust() -> None:
+    client = ImmediatelyFilledPaperClient(
+        account={"equity": "1000", "cash": "1000"},
+        positions=[
+            {"symbol": "OLD", "side": "long", "market_value": "0.50", "qty": "0.05"},
+        ],
+    )
+
+    result = run_rebalance(
+        client,
+        {"AAA": Decimal("0.5"), "BBB": Decimal("0.5")},
+        liquidate_non_target_positions=True,
+        complete_rebalance=True,
+        execute=True,
+    )
+
+    assert result["status"] == "buy_orders_submitted"
+    assert [(order["symbol"], order["side"]) for order in client.submitted] == [
+        ("AAA", "buy"), ("BBB", "buy"),
+    ]
+
+
+def test_completed_rebalance_uses_weight_tolerance_for_small_post_fill_drift() -> None:
+    client = ImmediatelyFilledPaperClient(
+        account={"equity": "100000", "cash": "0"},
+        positions=[
+            {"symbol": "AAA", "side": "long", "market_value": "50004", "qty": "500.04"},
+            {"symbol": "OLD", "side": "long", "market_value": "49996", "qty": "499.96"},
+        ],
+    )
+
+    result = run_rebalance(
+        client,
+        {"AAA": Decimal("0.5"), "BBB": Decimal("0.5")},
+        liquidate_non_target_positions=True,
+        complete_rebalance=True,
+        min_weight_drift=Decimal("0.0005"),
+        execute=True,
+    )
+
+    assert result["status"] == "sell_then_buy_orders_submitted"
+    assert [(order["symbol"], order["side"]) for order in client.submitted] == [
+        ("OLD", "sell"), ("BBB", "buy"),
+    ]
+
+
 def test_completed_rebalance_plans_cash_funded_buys_before_required_sells() -> None:
     client = FakePaperClient(
         positions=[{"symbol": "AAA", "side": "long", "market_value": "1000", "qty": "10"}]
@@ -263,6 +357,7 @@ def test_completed_rebalance_never_buys_before_the_required_sell_reconciles() ->
         liquidate_non_target_positions=True,
         complete_rebalance=True,
         sell_fill_timeout_seconds=0,
+        max_residual_sell_rounds=0,
         execute=True,
     )
 
