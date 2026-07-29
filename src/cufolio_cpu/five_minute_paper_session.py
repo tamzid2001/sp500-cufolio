@@ -368,7 +368,7 @@ def run_five_minute_paper_session(
     max_weight: Decimal = Decimal("0.10"),
     risk_aversion: float = 10.0,
     min_order_notional: Decimal = Decimal("1"),
-    min_weight_drift: Decimal = Decimal("0.0025"),
+    min_weight_drift: Decimal = Decimal("0"),
     mode: Literal["paper", "live"] = "paper",
     allow_live_trading: bool = False,
     checkpoint_path: str | Path | None = None,
@@ -661,7 +661,7 @@ def run_five_minute_paper_session(
                 targets = load_target_weights(candidate_path, max_weight=max_weight)
                 report = run_rebalance(
                     client, targets, min_order_notional=min_order_notional, min_weight_drift=min_weight_drift,
-                    liquidate_non_target_positions=True, execute=True,
+                    liquidate_non_target_positions=True, complete_rebalance=True, execute=True,
                 )
                 entry = {
                     "event": "five_minute_forecast_target_order", "scheduled_at": due_at.isoformat(),

@@ -11,6 +11,7 @@ import argparse
 import json
 import os
 import ssl
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation, ROUND_DOWN
@@ -348,6 +349,27 @@ def _client_order_id(intent: OrderIntent) -> str:
     return f"{ORDER_ID_PREFIX}{bucket}-{intent.side}-{intent.symbol}".lower()
 
 
+def _wait_for_open_orders_to_clear(
+    client: AlpacaTradingClient,
+    *,
+    timeout_seconds: float,
+    poll_seconds: float,
+) -> bool:
+    """Wait until the just-submitted sell orders are no longer open.
+
+    The caller validates the refreshed positions afterwards. A short, finite
+    timeout keeps a delayed broker fill from causing an unbounded loop.
+    """
+    deadline = time.monotonic() + timeout_seconds
+    while True:
+        if not client.get_open_orders(None):
+            return True
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        time.sleep(min(poll_seconds, remaining))
+
+
 def run_rebalance(
     client: AlpacaTradingClient,
     targets: dict[str, Decimal],
@@ -355,6 +377,9 @@ def run_rebalance(
     min_order_notional: Decimal = Decimal("1"),
     min_weight_drift: Decimal = Decimal("0.0025"),
     liquidate_non_target_positions: bool = False,
+    complete_rebalance: bool = False,
+    sell_fill_timeout_seconds: float = 30,
+    sell_fill_poll_seconds: float = 0.25,
     execute: bool = False,
 ) -> dict[str, Any]:
     """Plan or execute one guarded long-only rebalance cycle.
@@ -362,11 +387,22 @@ def run_rebalance(
     When ``liquidate_non_target_positions`` is enabled, the account is treated
     as dedicated to this strategy: positions absent from a new daily target are
     sold before any target buys. Existing open orders always stop a new cycle.
+
+    ``complete_rebalance`` is the per-window policy for a dedicated account.
+    It retains overlap symbols, sells only removed or overweight positions,
+    waits for those sells to clear, then refreshes positions, equity, and cash
+    before buying new or underweight symbols to the current target weights.
     """
     if min_order_notional < Decimal("1"):
         raise ValueError("min_order_notional must be at least $1.00")
     if not Decimal("0") <= min_weight_drift < Decimal("1"):
         raise ValueError("min_weight_drift must be between 0 (inclusive) and 1 (exclusive)")
+    if complete_rebalance and not liquidate_non_target_positions:
+        raise ValueError("complete_rebalance requires liquidate_non_target_positions=True")
+    if sell_fill_timeout_seconds < 0:
+        raise ValueError("sell_fill_timeout_seconds must be non-negative")
+    if sell_fill_poll_seconds <= 0:
+        raise ValueError("sell_fill_poll_seconds must be positive")
     account = client.get_account()
     if account.get("account_blocked") or account.get("trading_blocked"):
         raise TradingError(f"{client.mode} account is blocked from trading")
@@ -380,6 +416,7 @@ def run_rebalance(
         "market_open": bool(clock.get("is_open")),
         "min_weight_drift": _as_number(min_weight_drift, Decimal("0.000000001")),
         "liquidate_non_target_positions": liquidate_non_target_positions,
+        "complete_rebalance": complete_rebalance,
         "orders": [],
     }
     if not clock.get("is_open"):
@@ -442,7 +479,74 @@ def run_rebalance(
             }
         )
     report["submitted_orders"] = submitted
-    report["status"] = "sell_orders_submitted_waiting_for_fill" if sells else "buy_orders_submitted"
+    if not sells:
+        report["status"] = "buy_orders_submitted"
+        return report
+    if not complete_rebalance:
+        report["status"] = "sell_orders_submitted_waiting_for_fill"
+        return report
+    if not _wait_for_open_orders_to_clear(
+        client,
+        timeout_seconds=sell_fill_timeout_seconds,
+        poll_seconds=sell_fill_poll_seconds,
+    ):
+        report["status"] = "sell_orders_submitted_waiting_for_fill"
+        return report
+
+    # Reconcile using the same just-generated target, not the next window's
+    # forecast. This keeps overlap names in place while their final allocation
+    # is sized from the post-sale account value.
+    account = client.get_account()
+    if account.get("account_blocked") or account.get("trading_blocked"):
+        raise TradingError(f"{client.mode} account is blocked from trading")
+    equity = _decimal(account.get("equity"), field="equity")
+    cash = _decimal(account.get("cash"), field="cash")
+    if equity <= 0:
+        raise TradingError(f"{client.mode} account equity must be positive after sell fills")
+    if cash < 0:
+        raise TradingError("account cash is negative after sell fills; refusing margin-financed rebalance")
+    all_positions = client.get_positions()
+    positions = _position_map(all_positions, targets)
+    remaining_sells = _non_target_sell_intents(all_positions, targets) if liquidate_non_target_positions else []
+    remaining_sells.extend(
+        _sell_intents(
+            targets,
+            positions,
+            equity=equity,
+            min_order_notional=min_order_notional,
+            min_weight_drift=min_weight_drift,
+        )
+    )
+    if remaining_sells:
+        report["remaining_sell_orders"] = [intent.to_dict() for intent in remaining_sells]
+        report["status"] = "sell_orders_completed_but_target_not_reconciled"
+        return report
+    buys = _buy_intents(
+        targets,
+        positions,
+        equity=equity,
+        cash=cash,
+        min_order_notional=min_order_notional,
+        min_weight_drift=min_weight_drift,
+    )
+    report["post_sell_equity"] = _as_number(equity, CENT)
+    report["post_sell_cash"] = _as_number(cash, CENT)
+    report["orders"] = [*report["orders"], *(intent.to_dict() for intent in buys)]
+    if not buys:
+        report["status"] = "sell_orders_completed_no_buy_orders_required"
+        return report
+    for intent in buys:
+        response = client.submit_order(intent.payload(client_order_id=_client_order_id(intent)))
+        submitted.append(
+            {
+                "symbol": intent.symbol,
+                "side": intent.side,
+                "id": response.get("id"),
+                "status": response.get("status"),
+            }
+        )
+    report["submitted_orders"] = submitted
+    report["status"] = "sell_then_buy_orders_submitted"
     return report
 
 

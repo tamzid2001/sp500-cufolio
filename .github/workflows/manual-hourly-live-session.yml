@@ -51,6 +51,8 @@ jobs:
           test "${{ inputs.live_confirmation }}" = "SUBMIT_LIVE_ORDERS"
           test -n "$ALPACA_LIVE_API_KEY"
           test -n "$ALPACA_LIVE_SECRET_KEY"
+      - name: Verify five-minute incremental rebalance policy
+        run: pytest -q tests/test_paper_rebalance.py tests/test_five_minute_paper_session.py
       - name: Run live five-minute session
         run: |
           python -m cufolio_cpu.five_minute_paper_session \

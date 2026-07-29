@@ -287,6 +287,80 @@ non-overlapping intraday return estimate with a same-clock-time component
 shrunk toward the pooled mean; they are not trading instructions or a claim of
 future performance.
 
+The five-minute session runner incrementally reconciles the portfolio at every
+decision boundary. It retains overlapping tickers, sells only names removed
+from the new target or positions above their new target weight, waits up to 30
+seconds for those sells to clear, then refreshes positions, equity, and cash
+before buying new or underweight names to the current optimized target. If the
+required sells have not completed, it submits no replacement buys. The
+scheduled runner remains paper-only; the same guarded path is used by the
+separately confirmed manual live session.
+
+#### Three-month five-minute execution-slicing research
+
+The manually dispatched [three-month causal five-minute
+backtest](https://github.com/tamzid2001/sp500-cufolio/actions/runs/30401520702)
+evaluated 63 sessions from 2026-04-27 through 2026-07-27. It produced 4,820
+forecast portfolios; 3,763 (78.07%) had exact IEX realization endpoints. The
+published all-in result across those exact realized windows was +31.29%
+arithmetic and +35.88% compounded. Since some windows lack an exact endpoint,
+the compounded figure is a partial, non-contiguous diagnostic—not a complete
+three-month wealth return.
+
+The retained input was also used to test a cost-free execution-only variation:
+keep the signal and target weights fixed, buy 20% of each selected stock's
+target allocation at minutes 0, 1, 2, 3, and 4, then flatten at minute 5. On
+the 1,994 windows in which every selected stock had all five entry prices and
+the exit price, this did **not** improve return:
+
+| Same fully comparable windows | All-in at minute 0 | Five equal 20% entries |
+| --- | ---: | ---: |
+| Compounded return | +22.73% | +11.52% |
+| Mean five-minute return | +1.05 bps | +0.56 bps |
+| Maximum drawdown | -8.90% | -5.33% |
+| Windows with a higher return than all-in | n/a | 47.7% |
+
+The split-entry approach lowered drawdown, but reduced compounded return by
+11.22 percentage points in the matched sample. It also needs five entry orders
+instead of one; commissions, spread, and market impact were not modeled, so
+these results must not be interpreted as executable performance.
+
+At the daily level, the published all-in audit had 43 green days (68.25%) and
+20 red days (31.75%) out of 63 sessions; no day was flat. Each daily return
+compounds only its exact realized five-minute portfolio windows. Exact IEX
+coverage averaged 78.10% of forecast windows per day (59.74%--92.21%), so this
+is also a partial-data daily diagnostic rather than a complete daily P&L.
+
+Each five-minute signal chooses one basket and keeps those ticker targets fixed
+for all five entry clips. Across all 4,820 forecast windows there were 83,556
+target ticker selections: 17.34 tickers per window on average (median 18,
+range 10--20), spanning 210 distinct tickers. The table below shows exact IEX
+price availability for each proposed entry minute. The percentage is of the
+83,556 selected ticker-window positions; the average uses all 4,820 forecast
+windows as its denominator.
+
+| Entry minute | Ticker positions with an exact price | Selection coverage | Average tickers per forecast window | Distinct tickers |
+| --- | ---: | ---: | ---: | ---: |
+| 0 | 83,556 | 100.00% | 17.34 | 210 |
+| 1 | 82,537 | 98.78% | 17.12 | 207 |
+| 2 | 82,423 | 98.64% | 17.10 | 210 |
+| 3 | 82,408 | 98.63% | 17.10 | 208 |
+| 4 | 82,369 | 98.58% | 17.09 | 207 |
+| All five entry minutes and the minute-5 exit | 79,370 | 94.99% | 16.47 | 201 |
+
+For the 3,763 fully realized five-minute portfolios, 32,408 of 64,824 selected
+ticker outcomes closed higher: 49.99%. That is an average of 8.61 higher
+tickers out of 17.23 selected per window; the median is 8 higher out of 18.
+The middle half of windows had 6--11 higher tickers, and 47.0% of windows had
+a majority of their selected names finish higher. Portfolio performance thus
+depends on allocation to individual names, not on a broad majority of picks
+rising in every five-minute interval.
+
+Requiring the whole selected basket to have all six exact prices leaves 1,994
+complete portfolios (41.37% of forecasts), containing 34,180 ticker
+selections, which is the deliberately strict sample used for the all-in versus
+five-entry comparison above.
+
 The hourly runner's 20-session history guard should not be read as a generic
 one-minute-data rule. It is sized for that runner's 120 hourly labels. The
 five-minute audit instead requires at least 10 prior sessions and 500 complete
