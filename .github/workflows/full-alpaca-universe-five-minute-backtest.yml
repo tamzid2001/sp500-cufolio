@@ -8,6 +8,11 @@ on:
         type: string
         required: true
         default: "2026-07-28"
+      evaluation_start:
+        description: "Optional first evaluated New York session (YYYY-MM-DD); blank keeps the three-month audit window."
+        type: string
+        required: false
+        default: ""
       top_n:
         description: "Maximum long-only holdings per five-minute target"
         type: string
@@ -35,6 +40,7 @@ jobs:
       ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
       ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
       EVALUATION_END: ${{ inputs.evaluation_end }}
+      REQUESTED_EVALUATION_START: ${{ inputs.evaluation_start }}
       TOP_N: ${{ inputs.top_n }}
       MAX_WEIGHT: ${{ inputs.max_weight }}
       CACHE_DIR: var/full_alpaca_universe_five_minute
@@ -80,16 +86,28 @@ jobs:
           path: var/full_alpaca_universe_five_minute
           key: full-alpaca-iex-1m-endpoints-${{ inputs.evaluation_end }}-${{ hashFiles('tools/cache_full_alpaca_five_minute_input.py') }}
 
-      - name: Run the causal three-month five-minute portfolio audit
+      - name: Run the causal five-minute portfolio audit
         run: |
           set -euo pipefail
           mkdir -p "$OUTPUT_DIR"
-          EVALUATION_START="$(python - <<'PY'
+          EVALUATION_START="${REQUESTED_EVALUATION_START:-}"
+          if test -z "$EVALUATION_START"; then
+            EVALUATION_START="$(python - <<'PY'
           import os
           import pandas as pd
           print((pd.Timestamp(os.environ['EVALUATION_END']) - pd.DateOffset(months=3)).date().isoformat())
           PY
-          )"
+            )"
+          fi
+          EVALUATION_START="$EVALUATION_START" python - <<'PY'
+          import os
+          import pandas as pd
+
+          start = pd.Timestamp(os.environ['EVALUATION_START']).date()
+          end = pd.Timestamp(os.environ['EVALUATION_END']).date()
+          if start > end:
+              raise ValueError('evaluation_start must be on or before evaluation_end')
+          PY
           python -m cufolio_cpu.five_minute_intraday_backtest \
             --input "$CACHE_DIR/iex_one_minute_exact_five_minute_endpoints.csv.gz" \
             --output-dir "$OUTPUT_DIR" \
