@@ -1,10 +1,11 @@
 name: Refresh full Alpaca universe endpoint cache
 
-# 21:20 UTC is after the New York close in both daylight and standard time.
-# The calendar lookup below makes holidays and early closes safe.
+# 23:30 UTC lets the active 5h45m runner finish and publish its own rolling
+# cache after the close in both daylight and standard time. The calendar lookup
+# below makes holidays and early closes safe.
 on:
   schedule:
-    - cron: "20 21 * * 1-5"
+    - cron: "30 23 * * 1-5"
   workflow_dispatch:
 
 permissions:
@@ -56,15 +57,22 @@ jobs:
           restore-keys: |
             full-alpaca-iex-1m-endpoints-
 
-      - name: Build or replace the exact IEX endpoint cache
+      - name: Restore the latest live rolling endpoint cache
+        id: rolling_cache_restore
+        uses: actions/cache/restore@v4
+        with:
+          path: var/full_alpaca_universe_live_five_minute_endpoints.csv.gz
+          key: five-minute-paper-full-alpaca-endpoint-history-refresh-${{ github.run_id }}
+          restore-keys: |
+            five-minute-paper-full-alpaca-endpoint-history-
+
+      - name: Roll completed live endpoints into the historical cache
         run: |
           set -euo pipefail
           python tools/cache_full_alpaca_five_minute_input.py \
             --cache-dir "$CACHE_DIR" \
             --latest-completed-session \
-            --batch-size 100 \
-            --calendar-window-days 7 \
-            --request-pause-seconds 2.0
+            --rolling-endpoint-cache var/full_alpaca_universe_live_five_minute_endpoints.csv.gz
 
       - name: Verify cache freshness and checksums
         run: |

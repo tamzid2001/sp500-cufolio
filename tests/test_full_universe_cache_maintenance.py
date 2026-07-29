@@ -6,6 +6,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
+import pandas as pd
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -94,6 +95,49 @@ def test_verify_cache_rejects_an_out_of_date_or_tampered_input(tmp_path) -> None
         assert "checksum mismatch" in str(error)
     else:
         raise AssertionError("tampered endpoint data was accepted")
+
+
+def test_rolling_endpoint_cache_advances_verified_history_without_redownload(tmp_path) -> None:
+    cache = _load_tool("full_universe_cache_roll_forward_tool", "tools/cache_full_alpaca_five_minute_input.py")
+    universe = tmp_path / cache.UNIVERSE_FILENAME
+    endpoints = tmp_path / cache.BARS_FILENAME
+    rolling = tmp_path / "live-endpoints.csv.gz"
+    pd.DataFrame({"symbol": ["AAA"], "tradable": [True], "fractionable": [True]}).to_csv(universe, index=False)
+    pd.DataFrame(
+        {
+            "timestamp": ["2026-04-01T13:29:00Z", "2026-07-28T19:54:00Z"],
+            "symbol": ["AAA", "AAA"],
+            "close": [100.0, 101.0],
+        }
+    ).to_csv(endpoints, index=False, compression="gzip")
+    pd.DataFrame(
+        {
+            "timestamp": ["2026-07-29T19:54:00Z"],
+            "symbol": ["AAA"],
+            "close": [102.0],
+        }
+    ).to_csv(rolling, index=False, compression="gzip")
+    metadata = {
+        "complete": True,
+        "evaluation_end": "2026-07-28",
+        "universe_symbols": 1,
+        "retained_rows": 2,
+        "universe_sha256": cache._sha256(universe),
+        "endpoint_data_sha256": cache._sha256(endpoints),
+    }
+    (tmp_path / cache.METADATA_FILENAME).write_text(cache.json.dumps(metadata), encoding="utf-8")
+
+    rolled = cache.append_rolling_endpoint_cache(tmp_path, rolling, evaluation_end=date(2026, 7, 29))
+
+    assert rolled["evaluation_end"] == "2026-07-29"
+    assert rolled["rolled_forward_from_evaluation_end"] == "2026-07-28"
+    assert rolled["rolling_endpoint_rows_merged"] == 1
+    persisted = pd.read_csv(endpoints, compression="gzip")
+    assert persisted["timestamp"].tolist() == [
+        "2026-04-01 13:29:00+00:00",
+        "2026-07-28 19:54:00+00:00",
+        "2026-07-29 19:54:00+00:00",
+    ]
 
 
 def test_checkpoint_merge_is_monotonic_and_deduplicates_events() -> None:

@@ -142,6 +142,110 @@ def verify_cache(directory: Path, evaluation_end: date) -> dict[str, Any]:
     return metadata
 
 
+def _read_exact_endpoints(
+    path: Path,
+    *,
+    data_start: pd.Timestamp,
+    data_end: pd.Timestamp,
+    allowed_symbols: set[str],
+) -> pd.DataFrame:
+    """Load only valid retained endpoints from a historical or rolling cache."""
+    bars = pd.read_csv(path, compression="gzip", usecols=["timestamp", "symbol", "close"])
+    bars["timestamp"] = pd.to_datetime(bars["timestamp"], utc=True, errors="coerce")
+    bars["symbol"] = bars["symbol"].astype(str).str.upper().str.strip()
+    bars["close"] = pd.to_numeric(bars["close"], errors="coerce")
+    bars = bars.dropna(subset=["timestamp", "close"])
+    local_times = bars["timestamp"].dt.tz_convert(NEW_YORK).dt.time
+    return (
+        bars.loc[
+            (bars["timestamp"] >= data_start)
+            & (bars["timestamp"] < data_end)
+            & bars["symbol"].isin(allowed_symbols)
+            & bars["close"].gt(0)
+            & local_times.isin(_endpoint_times()),
+            ["timestamp", "symbol", "close"],
+        ]
+        .drop_duplicates(["timestamp", "symbol"], keep="last")
+        .sort_values(["symbol", "timestamp"])
+        .reset_index(drop=True)
+    )
+
+
+def append_rolling_endpoint_cache(
+    directory: Path, rolling_cache_path: Path, *, evaluation_end: date
+) -> dict[str, Any]:
+    """Atomically roll completed live endpoints into a verified base cache.
+
+    The long historical cache supplies the model warm-up.  The live runner
+    already gathers the current session one minute at a time, so after the
+    close this function adds those retained native endpoints instead of
+    re-downloading three months of history.  Rows that overlap are replaced by
+    the live cache only after exact-timestamp validation.
+    """
+    metadata = _read_metadata(directory / METADATA_FILENAME)
+    previous_end_text = metadata.get("evaluation_end")
+    if not previous_end_text:
+        raise RuntimeError("cannot roll forward a cache without an evaluation_end")
+    previous_end = date.fromisoformat(str(previous_end_text))
+    if evaluation_end < previous_end:
+        raise RuntimeError("cannot roll a full-universe cache backward in time")
+    if evaluation_end == previous_end:
+        return verify_cache(directory, evaluation_end)
+    bars_path = directory / BARS_FILENAME
+    universe_path = directory / UNIVERSE_FILENAME
+    if not rolling_cache_path.is_file():
+        raise RuntimeError(f"rolling endpoint cache is unavailable: {rolling_cache_path}")
+    # Verify the pre-existing base before it is used as merge input.
+    verify_cache(directory, previous_end)
+    universe = pd.read_csv(universe_path, usecols=["symbol"])
+    symbols = set(universe["symbol"].dropna().astype(str).str.upper().str.strip())
+    evaluation_start, data_start, data_end = _data_window(evaluation_end)
+    historical = _read_exact_endpoints(
+        bars_path, data_start=data_start, data_end=data_end, allowed_symbols=symbols
+    )
+    rolling = _read_exact_endpoints(
+        rolling_cache_path, data_start=data_start, data_end=data_end, allowed_symbols=symbols
+    )
+    rolling_days = rolling["timestamp"].dt.tz_convert(NEW_YORK).dt.date if not rolling.empty else pd.Series(dtype="object")
+    if evaluation_end not in set(rolling_days):
+        raise RuntimeError(
+            "rolling endpoint cache does not contain the requested completed session "
+            f"{evaluation_end.isoformat()}"
+        )
+    combined = (
+        pd.concat([historical, rolling], ignore_index=True)
+        .drop_duplicates(["timestamp", "symbol"], keep="last")
+        .sort_values(["symbol", "timestamp"])
+        .reset_index(drop=True)
+    )
+    temporary = bars_path.with_name(f".{bars_path.name}.tmp")
+    combined.to_csv(temporary, index=False, compression="gzip")
+    os.replace(temporary, bars_path)
+    metadata.update(
+        {
+            "complete": True,
+            "evaluation_start": evaluation_start.isoformat(),
+            "evaluation_end": evaluation_end.isoformat(),
+            "data_start": data_start.isoformat(),
+            "data_end_exclusive": data_end.isoformat(),
+            "retained_rows": int(len(combined)),
+            "completed_at": pd.Timestamp.now(tz="UTC").isoformat(),
+            "endpoint_data_sha256": _sha256(bars_path),
+            "rolled_forward_from_evaluation_end": previous_end.isoformat(),
+            "rolling_endpoint_source": rolling_cache_path.name,
+            "rolling_endpoint_rows_merged": int(len(rolling)),
+        }
+    )
+    _write_metadata(directory / METADATA_FILENAME, metadata)
+    print(
+        "FULL-UNIVERSE IEX CACHE ROLLED FORWARD | "
+        f"evaluation_end={evaluation_end.isoformat()} historical_rows={len(historical):,} "
+        f"rolling_rows={len(rolling):,} retained_rows={len(combined):,}",
+        flush=True,
+    )
+    return verify_cache(directory, evaluation_end)
+
+
 def _write_metadata(path: Path, metadata: dict[str, Any]) -> None:
     path.write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
 
@@ -360,6 +464,10 @@ def main() -> None:
         action="store_true",
         help="Verify the expected completed cache and exit without downloading data",
     )
+    parser.add_argument(
+        "--rolling-endpoint-cache",
+        help="Merge a completed rolling endpoint cache into the verified historical cache",
+    )
     args = parser.parse_args()
     if args.latest_completed_session or args.print_latest_completed_session:
         key = os.environ.get("ALPACA_API_KEY", "")
@@ -372,8 +480,14 @@ def main() -> None:
             return
     else:
         resolved_end = date.fromisoformat(args.evaluation_end)
+    if args.verify_existing and args.rolling_endpoint_cache:
+        parser.error("--verify-existing and --rolling-endpoint-cache cannot be used together")
     if args.verify_existing:
         metadata = verify_cache(Path(args.cache_dir), resolved_end)
+    elif args.rolling_endpoint_cache:
+        metadata = append_rolling_endpoint_cache(
+            Path(args.cache_dir), Path(args.rolling_endpoint_cache), evaluation_end=resolved_end
+        )
     else:
         metadata = build_cache(
             Path(args.cache_dir),
