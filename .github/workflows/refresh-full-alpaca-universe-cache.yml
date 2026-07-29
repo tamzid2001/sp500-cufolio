@@ -1,0 +1,82 @@
+name: Refresh full Alpaca universe endpoint cache
+
+# 21:20 UTC is after the New York close in both daylight and standard time.
+# The calendar lookup below makes holidays and early closes safe.
+on:
+  schedule:
+    - cron: "20 21 * * 1-5"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: write
+
+concurrency:
+  group: cufolio-full-alpaca-cache-refresh
+  cancel-in-progress: false
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    env:
+      PYTHONPATH: ${{ github.workspace }}/src
+      ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
+      ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
+      CACHE_DIR: var/full_alpaca_universe_five_minute
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install cache dependencies
+        run: pip install -r requirements.txt
+
+      - name: Resolve the latest completed official session
+        id: session
+        run: |
+          set -euo pipefail
+          test -n "$ALPACA_API_KEY"
+          test -n "$ALPACA_SECRET_KEY"
+          evaluation_end="$(python tools/cache_full_alpaca_five_minute_input.py \
+            --cache-dir "$CACHE_DIR" --print-latest-completed-session)"
+          echo "evaluation_end=$evaluation_end" >> "$GITHUB_OUTPUT"
+          echo "FULL-UNIVERSE CACHE REFRESH TARGET | evaluation_end=$evaluation_end"
+
+      - name: Restore a prior full-universe cache for validation or replacement
+        id: cache_restore
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ env.CACHE_DIR }}
+          key: full-alpaca-iex-1m-endpoints-${{ steps.session.outputs.evaluation_end }}-${{ hashFiles('tools/cache_full_alpaca_five_minute_input.py') }}
+          restore-keys: |
+            full-alpaca-iex-1m-endpoints-
+
+      - name: Build or replace the exact IEX endpoint cache
+        run: |
+          set -euo pipefail
+          python tools/cache_full_alpaca_five_minute_input.py \
+            --cache-dir "$CACHE_DIR" \
+            --latest-completed-session \
+            --batch-size 100 \
+            --calendar-window-days 7 \
+            --request-pause-seconds 2.0
+
+      - name: Verify cache freshness and checksums
+        run: |
+          set -euo pipefail
+          python tools/cache_full_alpaca_five_minute_input.py \
+            --cache-dir "$CACHE_DIR" \
+            --latest-completed-session \
+            --verify-existing
+
+      - name: Save verified full-universe endpoint cache
+        if: steps.cache_restore.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ env.CACHE_DIR }}
+          key: full-alpaca-iex-1m-endpoints-${{ steps.session.outputs.evaluation_end }}-${{ hashFiles('tools/cache_full_alpaca_five_minute_input.py') }}

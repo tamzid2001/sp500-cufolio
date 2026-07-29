@@ -11,6 +11,7 @@ from cufolio_cpu.five_minute_paper_session import (
     _handoff_must_wait_for_flatten,
     _load_checkpoint,
     _merge_current_minutes,
+    _persist_checkpoint,
     _completed_bar_at,
     _regular_minute_cache_projection,
     five_minute_events,
@@ -108,6 +109,23 @@ def test_new_session_discards_old_completed_events_but_not_the_separate_minute_c
         "completed_events": [],
         "ledger": [],
     }
+
+
+def test_five_minute_checkpoint_write_is_atomic_and_immediately_restorable(tmp_path) -> None:
+    checkpoint_path = tmp_path / "state.json"
+    checkpoint = {"format_version": 1, "session_date": "2026-07-29", "completed_events": [], "ledger": []}
+
+    _persist_checkpoint(
+        checkpoint_path,
+        checkpoint,
+        {"forecast_and_order:2026-07-29T13:30:00+00:00"},
+        [{"event": "five_minute_forecast_target_order"}],
+    )
+
+    assert _load_checkpoint(checkpoint_path, date(2026, 7, 29))["completed_events"] == [
+        "forecast_and_order:2026-07-29T13:30:00+00:00"
+    ]
+    assert not list(tmp_path.glob(".state.json.tmp"))
 
 
 def test_five_minute_rolling_history_start_has_model_warmup() -> None:
