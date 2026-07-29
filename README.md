@@ -316,6 +316,12 @@ The split-entry approach lowered drawdown, but reduced compounded return by
 instead of one; commissions, spread, and market impact were not modeled, so
 these results must not be interpreted as executable performance.
 
+At the daily level, the published all-in audit had 43 green days (68.25%) and
+20 red days (31.75%) out of 63 sessions; no day was flat. Each daily return
+compounds only its exact realized five-minute portfolio windows. Exact IEX
+coverage averaged 78.10% of forecast windows per day (59.74%--92.21%), so this
+is also a partial-data daily diagnostic rather than a complete daily P&L.
+
 Each five-minute signal chooses one basket and keeps those ticker targets fixed
 for all five entry clips. Across all 4,820 forecast windows there were 83,556
 target ticker selections: 17.34 tickers per window on average (median 18,
