@@ -398,7 +398,10 @@ def run_five_minute_paper_session(
     max_weight: Decimal = Decimal("0.10"),
     risk_aversion: float = 10.0,
     min_order_notional: Decimal = Decimal("1"),
-    min_weight_drift: Decimal = Decimal("0"),
+    # Five basis points absorbs normal market-order/fractional-share residuals
+    # without allowing meaningful target drift to accumulate.  A zero
+    # tolerance made a few-dollar residue block all new-target buys.
+    min_weight_drift: Decimal = Decimal("0.0005"),
     mode: Literal["paper", "live"] = "paper",
     allow_live_trading: bool = False,
     checkpoint_path: str | Path | None = None,

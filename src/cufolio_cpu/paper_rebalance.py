@@ -260,9 +260,19 @@ def _ensure_fractionable_assets(client: AlpacaTradingClient, targets: dict[str, 
 
 
 def _non_target_sell_intents(
-    positions: list[dict[str, Any]], targets: dict[str, Decimal]
+    positions: list[dict[str, Any]],
+    targets: dict[str, Decimal],
+    *,
+    min_order_notional: Decimal,
 ) -> list[OrderIntent]:
-    """Fully exit any managed long position absent from the new daily target."""
+    """Exit material managed long positions absent from the new target.
+
+    Fractional market orders can leave a sub-dollar dust position even after
+    Alpaca has reported the parent order as filled.  Treating that dust as a
+    mandatory sell on the next reconciliation prevents the strategy from
+    placing any of the new-target buys.  It is below the configured minimum
+    order size and therefore cannot be corrected by this executor anyway.
+    """
     intents: list[OrderIntent] = []
     for position in positions:
         symbol = str(position.get("symbol", "")).upper()
@@ -276,6 +286,8 @@ def _non_target_sell_intents(
         if quantity <= 0:
             continue
         current_notional = _decimal(position.get("market_value", "0"), field=f"{symbol} market_value")
+        if abs(current_notional) < min_order_notional:
+            continue
         intents.append(
             OrderIntent(symbol, "sell", "qty", quantity, Decimal(), current_notional, Decimal())
         )
@@ -389,6 +401,7 @@ def run_rebalance(
     complete_rebalance: bool = False,
     sell_fill_timeout_seconds: float = 30,
     sell_fill_poll_seconds: float = 0.25,
+    max_residual_sell_rounds: int = 2,
     execute: bool = False,
 ) -> dict[str, Any]:
     """Plan or execute one guarded long-only rebalance cycle.
@@ -412,6 +425,8 @@ def run_rebalance(
         raise ValueError("sell_fill_timeout_seconds must be non-negative")
     if sell_fill_poll_seconds <= 0:
         raise ValueError("sell_fill_poll_seconds must be positive")
+    if max_residual_sell_rounds < 0:
+        raise ValueError("max_residual_sell_rounds must be non-negative")
     account = client.get_account()
     if account.get("account_blocked") or account.get("trading_blocked"):
         raise TradingError(f"{client.mode} account is blocked from trading")
@@ -450,7 +465,13 @@ def run_rebalance(
     all_positions = client.get_positions()
     positions = _position_map(all_positions, targets)
 
-    sells = _non_target_sell_intents(all_positions, targets) if liquidate_non_target_positions else []
+    sells = (
+        _non_target_sell_intents(
+            all_positions, targets, min_order_notional=min_order_notional
+        )
+        if liquidate_non_target_positions
+        else []
+    )
     sells.extend(
         _sell_intents(
             targets,
@@ -524,7 +545,13 @@ def run_rebalance(
         raise TradingError("account cash is negative after sell fills; refusing margin-financed rebalance")
     all_positions = client.get_positions()
     positions = _position_map(all_positions, targets)
-    remaining_sells = _non_target_sell_intents(all_positions, targets) if liquidate_non_target_positions else []
+    remaining_sells = (
+        _non_target_sell_intents(
+            all_positions, targets, min_order_notional=min_order_notional
+        )
+        if liquidate_non_target_positions
+        else []
+    )
     remaining_sells.extend(
         _sell_intents(
             targets,
@@ -534,6 +561,56 @@ def run_rebalance(
             min_weight_drift=min_weight_drift,
         )
     )
+
+    # A market order can fill a few dollars away from the price used when the
+    # first sell was sized.  Retry that material residual a bounded number of
+    # times; never abandon the new target merely because the first sell phase
+    # left an executable rounding residue.
+    residual_rounds = 0
+    while remaining_sells and residual_rounds < max_residual_sell_rounds:
+        residual_rounds += 1
+        report["residual_sell_reconciliation_rounds"] = residual_rounds
+        report["remaining_sell_orders"] = [intent.to_dict() for intent in remaining_sells]
+        report["orders"].extend(intent.to_dict() for intent in remaining_sells)
+        for intent in remaining_sells:
+            response = client.submit_order(intent.payload(client_order_id=_client_order_id(intent)))
+            submitted.append(
+                {
+                    "symbol": intent.symbol,
+                    "side": intent.side,
+                    "id": response.get("id"),
+                    "status": response.get("status"),
+                }
+            )
+        report["submitted_orders"] = submitted
+        if not _wait_for_open_orders_to_clear(
+            client,
+            timeout_seconds=sell_fill_timeout_seconds,
+            poll_seconds=sell_fill_poll_seconds,
+        ):
+            report["status"] = "sell_orders_submitted_waiting_for_fill"
+            return report
+        account = client.get_account()
+        equity = _decimal(account.get("equity"), field="equity")
+        cash = _decimal(account.get("cash"), field="cash")
+        all_positions = client.get_positions()
+        positions = _position_map(all_positions, targets)
+        remaining_sells = (
+            _non_target_sell_intents(
+                all_positions, targets, min_order_notional=min_order_notional
+            )
+            if liquidate_non_target_positions
+            else []
+        )
+        remaining_sells.extend(
+            _sell_intents(
+                targets,
+                positions,
+                equity=equity,
+                min_order_notional=min_order_notional,
+                min_weight_drift=min_weight_drift,
+            )
+        )
     if remaining_sells:
         report["remaining_sell_orders"] = [intent.to_dict() for intent in remaining_sells]
         report["status"] = "sell_orders_completed_but_target_not_reconciled"
