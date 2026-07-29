@@ -7,10 +7,6 @@ on:
         description: "New York market session date, YYYY-MM-DD"
         required: true
         type: string
-      history_start:
-        description: "UTC start for completed one-minute training bars (at least 28 calendar days before the session)"
-        required: true
-        type: string
       live_confirmation:
         description: "Type SUBMIT_LIVE_ORDERS to allow live Alpaca orders"
         required: true
@@ -35,6 +31,7 @@ jobs:
       PYTHONPATH: ${{ github.workspace }}/src
       ALPACA_LIVE_API_KEY: ${{ secrets.ALPACA_LIVE_API_KEY }}
       ALPACA_LIVE_SECRET_KEY: ${{ secrets.ALPACA_LIVE_SECRET_KEY }}
+      ALPACA_TRADING_MODE: live
       # Historical minute bars use the same separately scoped live account key.
       ALPACA_API_KEY: ${{ secrets.ALPACA_LIVE_API_KEY }}
       ALPACA_SECRET_KEY: ${{ secrets.ALPACA_LIVE_SECRET_KEY }}
@@ -45,14 +42,24 @@ jobs:
         with:
           python-version: "3.12"
           cache: pip
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Resolve the required completed-session cache date
+        id: completed_session
+        run: |
+          set -euo pipefail
+          test -n "$ALPACA_LIVE_API_KEY"
+          test -n "$ALPACA_LIVE_SECRET_KEY"
+          evaluation_end="$(python tools/cache_full_alpaca_five_minute_input.py \
+            --cache-dir "$FULL_UNIVERSE_CACHE_DIR" --print-latest-completed-session)"
+          echo "evaluation_end=$evaluation_end" >> "$GITHUB_OUTPUT"
+          echo "LIVE FIVE MINUTE CACHE REQUIRED | evaluation_end=$evaluation_end"
       - name: Restore verified full-Alpaca historical endpoint cache
         id: full_universe_cache_restore
         uses: actions/cache/restore@v4
         with:
           path: var/full_alpaca_universe_five_minute
-          key: full-alpaca-iex-1m-endpoints-2026-07-28-${{ hashFiles('tools/cache_full_alpaca_five_minute_input.py') }}
-      - name: Install dependencies
-        run: pip install -r requirements.txt
+          key: full-alpaca-iex-1m-endpoints-${{ steps.completed_session.outputs.evaluation_end }}-${{ hashFiles('tools/cache_full_alpaca_five_minute_input.py') }}
       - name: Verify explicit live authorization and credentials
         run: |
           test "${{ inputs.live_confirmation }}" = "SUBMIT_LIVE_ORDERS"
@@ -61,13 +68,16 @@ jobs:
           test "${{ steps.full_universe_cache_restore.outputs.cache-hit }}" = "true"
           test -s "$FULL_UNIVERSE_CACHE_DIR/alpaca_tradable_fractionable_universe.csv"
           test -s "$FULL_UNIVERSE_CACHE_DIR/iex_one_minute_exact_five_minute_endpoints.csv.gz"
+          python tools/cache_full_alpaca_five_minute_input.py \
+            --cache-dir "$FULL_UNIVERSE_CACHE_DIR" \
+            --evaluation-end "${{ steps.completed_session.outputs.evaluation_end }}" \
+            --verify-existing
       - name: Verify five-minute incremental rebalance policy
         run: pytest -q tests/test_alpaca.py tests/test_paper_rebalance.py tests/test_five_minute_paper_session.py
       - name: Run live five-minute session
         run: |
           python -m cufolio_cpu.five_minute_paper_session \
             --session-date "${{ inputs.session_date }}" \
-            --history-start "${{ inputs.history_start }}" \
             --output-dir artifacts/manual_five_minute_live_session \
             --universe-cache "$FULL_UNIVERSE_CACHE_DIR/alpaca_tradable_fractionable_universe.csv" \
             --minute-cache var/manual_full_alpaca_live_five_minute_endpoints.csv.gz \

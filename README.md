@@ -270,9 +270,10 @@ history for a completed session. Each creates a fresh long-only, capped
 portfolio at every non-overlapping interval and records the exact next-interval
 return without forward-filling a missing endpoint. Because a one-minute bar is
 left-labeled, decisions use the preceding completed close: a completed regular
-session therefore has 77 causal five-minute decisions (09:35–15:55) or 25
-causal fifteen-minute decisions (09:45–15:45), rather than inventing a 16:00
-minute bar.
+session therefore has 78 causal five-minute decisions (09:30–15:55, with the
+opening decision anchored to the completed 09:29 bar) or 25 causal
+fifteen-minute decisions (09:45–15:45), rather than inventing a 16:00 minute
+bar.
 
 The reports include the complete decision ledger, per-holding prediction and
 realization rows, all-forecast expected totals, and an expected-versus-actual
@@ -303,12 +304,16 @@ into the verified historical cache; it does not re-download three months of
 history. Both the universe snapshot and endpoint data are checksum-verified
 before use. Before it starts a market session, the runner independently checks
 that the restored cache has the expected completed-session date; it refuses to
-trade on an older or tampered cache. During the session, completed endpoint
-data is written atomically at each five-minute decision, while the small
-order/event checkpoint is atomically written locally and published to GitHub
-within one minute. The large rolling endpoint cache stays in Actions cache
-storage rather than Git history. This keeps a failed handoff from replaying a
-completed target without committing high-volume market data to the repository.
+trade on an older or tampered cache. During the session, the runner polls IEX
+after every completed minute and atomically persists a freshness receipt with
+the received-minute timestamp and missing/stale-row counts. It retains only
+the exact one-minute endpoints the model consumes, rather than pretending to
+cache every raw full-universe minute. Endpoint data is atomically persisted
+before each decision, while the small order/event checkpoint is atomically
+written locally and published to GitHub within one minute. The large rolling
+endpoint cache stays in Actions cache storage rather than Git history. This
+keeps a failed handoff from replaying a completed target without committing
+high-volume market data to the repository.
 
 #### Three-month five-minute execution-slicing research
 

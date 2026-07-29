@@ -1,16 +1,17 @@
 from __future__ import annotations
 
+import json
 from datetime import date, timedelta
 
 import pandas as pd
 import pytest
 
-from cufolio_cpu.five_minute_paper_daemon import rolling_history_start
 from cufolio_cpu.five_minute_paper_session import (
     _forecast_horizon_for_decision,
     _handoff_must_wait_for_flatten,
     _load_checkpoint,
     _merge_current_minutes,
+    _minute_cache_freshness_path,
     _persist_checkpoint,
     _completed_bar_at,
     _regular_minute_cache_projection,
@@ -88,7 +89,7 @@ def test_completed_minute_never_uses_in_progress_bar() -> None:
 def test_five_minute_session_rejects_live_mode_without_explicit_acknowledgement(tmp_path) -> None:
     with pytest.raises(ValueError, match="allow_live_trading"):
         run_five_minute_paper_session(
-            session_day=date(2026, 7, 28), history_start="2026-06-01T13:30:00Z", output_dir=tmp_path,
+            session_day=date(2026, 7, 28), output_dir=tmp_path,
             mode="live",
         )
 
@@ -126,13 +127,6 @@ def test_five_minute_checkpoint_write_is_atomic_and_immediately_restorable(tmp_p
         "forecast_and_order:2026-07-29T13:30:00+00:00"
     ]
     assert not list(tmp_path.glob(".state.json.tmp"))
-
-
-def test_five_minute_rolling_history_start_has_model_warmup() -> None:
-    reference = pd.Timestamp("2026-07-28T13:35:00Z")
-    assert rolling_history_start(reference, calendar_days=28) == "2026-06-30T13:29:00+00:00"
-    with pytest.raises(ValueError, match="at least 28"):
-        rolling_history_start(reference, calendar_days=27)
 
 
 def test_websocket_precompute_does_not_issue_redundant_rest_repair(monkeypatch) -> None:
@@ -201,3 +195,40 @@ def test_full_universe_threaded_latest_poll_keeps_only_exact_completed_endpoint(
         {"timestamp": pd.Timestamp("2026-07-28T14:34:00Z"), "symbol": "FRESH", "close": 101.0}
     ]
     assert update.bars["symbol"].tolist() == ["AAA", "FRESH"]
+
+
+def test_full_universe_one_minute_poll_writes_a_durable_freshness_receipt(tmp_path, monkeypatch) -> None:
+    def latest(_symbols):
+        return pd.DataFrame(
+            {
+                "timestamp": ["2026-07-28T14:33:00Z", "2026-07-28T14:34:00Z"],
+                "symbol": ["OLDER", "FRESH"],
+                "close": [99.0, 101.0],
+            }
+        )
+
+    cache_path = tmp_path / "live-endpoints.csv.gz"
+    monkeypatch.setattr("cufolio_cpu.five_minute_paper_session.download_latest_iex_minute_bars", latest)
+    update = _merge_current_minutes(
+        pd.DataFrame({"timestamp": ["2026-07-28T14:29:00Z"], "symbol": ["AAA"], "close": [100.0]}),
+        ["AAA", "FRESH", "OLDER"],
+        session_day=date(2026, 7, 28),
+        observed_at=pd.Timestamp("2026-07-28T14:35:00Z"),
+        cache_path=cache_path,
+        minute_stream=None,
+        health=MinuteCacheHealth(),
+        repair_from_rest=False,
+        endpoint_only=True,
+        allow_rest_repair=False,
+        allow_yfinance_fallback=False,
+        latest_bar_polling=True,
+    )
+
+    receipt = json.loads(_minute_cache_freshness_path(cache_path).read_text(encoding="utf-8"))
+    assert update.new_rows["symbol"].tolist() == ["FRESH"]
+    assert receipt["market_data_feed"] == "IEX"
+    assert receipt["latest_completed_minute"] == "2026-07-28T14:34:00+00:00"
+    assert receipt["latest_source_timestamp"] == "2026-07-28T14:34:00+00:00"
+    assert receipt["source_rows_returned"] == 2
+    assert receipt["source_rows_at_completed_minute"] == 1
+    assert receipt["cached_model_endpoint_through"] == "2026-07-28T14:34:00+00:00"

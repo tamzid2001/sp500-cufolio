@@ -55,6 +55,31 @@ def test_latest_completed_market_session_uses_official_close_and_calendar(monkey
     assert requested[0].end == date(2026, 7, 29)
 
 
+def test_live_cache_calendar_uses_the_live_trading_endpoint(monkeypatch) -> None:
+    cache = _load_tool("full_universe_live_calendar_tool", "tools/cache_full_alpaca_five_minute_input.py")
+    client_modes = []
+
+    class FakeTradingClient:
+        def __init__(self, *_args, **kwargs) -> None:
+            client_modes.append(kwargs["paper"])
+
+        def get_calendar(self, _filters):
+            return [
+                SimpleNamespace(
+                    date=date(2026, 7, 29),
+                    close=datetime(2026, 7, 29, 16, 0, tzinfo=ZoneInfo("America/New_York")),
+                )
+            ]
+
+    monkeypatch.setattr(cache, "TradingClient", FakeTradingClient)
+    monkeypatch.setenv("ALPACA_TRADING_MODE", "live")
+
+    assert cache.latest_completed_market_session(
+        "live-key", "live-secret", now=cache.pd.Timestamp("2026-07-29T20:01:00Z")
+    ) == date(2026, 7, 29)
+    assert client_modes == [False]
+
+
 def test_stale_cache_reset_is_limited_to_known_cache_files(tmp_path) -> None:
     cache = _load_tool("full_universe_cache_reset_tool", "tools/cache_full_alpaca_five_minute_input.py")
     known = [cache.UNIVERSE_FILENAME, cache.BARS_FILENAME, cache.PARTS_FILENAME, cache.METADATA_FILENAME]
