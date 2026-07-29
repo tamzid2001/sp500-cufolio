@@ -65,6 +65,32 @@ class FakePaperClient:
         return [{"id": f"close-{symbol}", "status": 200} for symbol in self.closed_positions]
 
 
+class ImmediatelyFilledPaperClient(FakePaperClient):
+    """Paper broker double that immediately applies submitted sell fills."""
+
+    def submit_order(self, payload: dict[str, str]) -> dict[str, object]:
+        response = super().submit_order(payload)
+        if payload["side"] != "sell":
+            return response
+        symbol = payload["symbol"]
+        quantity = Decimal(payload["qty"])
+        for index, position in enumerate(self.positions):
+            if str(position["symbol"]) != symbol:
+                continue
+            held = Decimal(str(position["qty"]))
+            market_value = Decimal(str(position["market_value"]))
+            proceeds = market_value * quantity / held
+            remaining = held - quantity
+            if remaining <= 0:
+                self.positions.pop(index)
+            else:
+                position["qty"] = str(remaining)
+                position["market_value"] = str(market_value - proceeds)
+            self.account["cash"] = str(Decimal(str(self.account["cash"])) + proceeds)
+            break
+        return response
+
+
 def test_configured_research_targets_are_fully_invested_and_capped() -> None:
     target_file = Path(__file__).parents[1] / "assets" / "paper_target_weights.csv"
     targets = load_target_weights(target_file)
@@ -168,6 +194,78 @@ def test_daily_target_change_exits_non_target_positions_before_any_buys() -> Non
     )
     assert result["status"] == "sell_orders_submitted_waiting_for_fill"
     assert [order["symbol"] for order in result["orders"]] == ["OLD"]
+    assert [order["side"] for order in client.submitted] == ["sell"]
+
+
+def test_completed_rebalance_retains_overlap_and_updates_it_to_the_new_target() -> None:
+    client = ImmediatelyFilledPaperClient(
+        account={"equity": "1000", "cash": "0"},
+        positions=[
+            {"symbol": "AAA", "side": "long", "market_value": "500", "qty": "5"},
+            {"symbol": "OLD", "side": "long", "market_value": "500", "qty": "10"},
+        ],
+    )
+
+    result = run_rebalance(
+        client,
+        {"AAA": Decimal("0.6"), "BBB": Decimal("0.4")},
+        liquidate_non_target_positions=True,
+        complete_rebalance=True,
+        min_weight_drift=Decimal("0"),
+        execute=True,
+    )
+
+    assert result["status"] == "sell_then_buy_orders_submitted"
+    assert client.bulk_close_requests == []
+    assert client.closed_positions == []
+    assert [(order["symbol"], order["side"]) for order in client.submitted] == [
+        ("OLD", "sell"),
+        ("AAA", "buy"),
+        ("BBB", "buy"),
+    ]
+    assert [(order["symbol"], order.get("notional")) for order in client.submitted[1:]] == [
+        ("AAA", "100.00"),
+        ("BBB", "400.00"),
+    ]
+    assert result["post_sell_equity"] == "1000.00"
+    assert result["post_sell_cash"] == "500.00"
+
+
+def test_completed_rebalance_plans_only_the_required_sells_before_their_fill() -> None:
+    client = FakePaperClient(
+        positions=[{"symbol": "AAA", "side": "long", "market_value": "1000", "qty": "10"}]
+    )
+
+    result = run_rebalance(
+        client,
+        {"AAA": Decimal("0.5"), "BBB": Decimal("0.5")},
+        liquidate_non_target_positions=True,
+        complete_rebalance=True,
+    )
+
+    assert result["status"] == "sell_orders_planned"
+    assert [order["symbol"] for order in result["orders"]] == ["AAA"]
+    assert client.bulk_close_requests == []
+    assert client.submitted == []
+
+
+def test_completed_rebalance_never_buys_before_the_required_sell_reconciles() -> None:
+    client = FakePaperClient(
+        account={"equity": "1000", "cash": "0"},
+        positions=[{"symbol": "AAA", "side": "long", "market_value": "1000", "qty": "10"}],
+    )
+
+    result = run_rebalance(
+        client,
+        {"AAA": Decimal("0.5"), "BBB": Decimal("0.5")},
+        liquidate_non_target_positions=True,
+        complete_rebalance=True,
+        sell_fill_timeout_seconds=0,
+        execute=True,
+    )
+
+    assert result["status"] == "sell_orders_completed_but_target_not_reconciled"
+    assert client.bulk_close_requests == []
     assert [order["side"] for order in client.submitted] == ["sell"]
 
 

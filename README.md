@@ -287,6 +287,15 @@ non-overlapping intraday return estimate with a same-clock-time component
 shrunk toward the pooled mean; they are not trading instructions or a claim of
 future performance.
 
+The five-minute session runner incrementally reconciles the portfolio at every
+decision boundary. It retains overlapping tickers, sells only names removed
+from the new target or positions above their new target weight, waits up to 30
+seconds for those sells to clear, then refreshes positions, equity, and cash
+before buying new or underweight names to the current optimized target. If the
+required sells have not completed, it submits no replacement buys. The
+scheduled runner remains paper-only; the same guarded path is used by the
+separately confirmed manual live session.
+
 #### Three-month five-minute execution-slicing research
 
 The manually dispatched [three-month causal five-minute
