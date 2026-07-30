@@ -54,6 +54,12 @@ MAPPING_COLUMNS = {
 }
 
 
+def _progress(stage: str, **values: object) -> None:
+    """Emit a compact, flushed line suitable for live GitHub Actions logs."""
+    details = " | ".join(f"{key}={value}" for key, value in values.items())
+    print(f"FTMO US PROXY AUDIT {stage} | {details}", flush=True)
+
+
 @dataclass(frozen=True)
 class DownloadResult:
     """The parsed result of one native Dukascopy BID or ASK daily file."""
@@ -212,7 +218,9 @@ def _parse_native_m1_close(
         if raw_values == previous:
             continue
         previous = raw_values
-        timestamp = base + pd.Timedelta(seconds=int(offset))
+        # Pass the seconds unit explicitly.  With newer NumPy/Pandas versions,
+        # the keyword form can still route through a deprecated generic unit.
+        timestamp = base + pd.Timedelta(int(offset), unit="s")
         records.append((timestamp, float(closing / price_divisor)))
     return records
 
@@ -263,6 +271,7 @@ def download_dukascopy_ftmo_us_m1(
     timeout_seconds: int = 30,
     on_m1_chunk: Callable[[pd.DataFrame], None] | None = None,
     collect_m1: bool = True,
+    progress_every_files: int = 0,
 ) -> tuple[pd.DataFrame, dict[str, Any]]:
     """Download native M1 BID/ASK closes for an FTMO US proxy asset set.
 
@@ -276,16 +285,29 @@ def download_dukascopy_ftmo_us_m1(
         raise ValueError("workers must be between 1 and 24")
     if retries < 1:
         raise ValueError("retries must be positive")
+    if progress_every_files < 0:
+        raise ValueError("progress_every_files must be non-negative")
     days = [value.date() for value in pd.date_range(start_day, end_day, freq="D")]
     status_counts: dict[str, int] = {}
     failures: list[dict[str, str | None]] = []
     m1_bid_ask_rows = 0
     symbols_with_data: set[str] = set()
     collected_frames: list[pd.DataFrame] = []
+    total_files = len(days) * len(assets) * 2
+    completed_files = 0
+    download_started = time.monotonic()
+    if progress_every_files:
+        _progress(
+            "DOWNLOAD START",
+            assets=len(assets),
+            calendar_days=len(days),
+            files=total_files,
+            workers=workers,
+        )
     # Process each calendar day independently. A full 49-asset three-month
     # input has millions of M1 closes, so holding all parsed Python tuples
     # until the final request would needlessly exhaust an Actions runner.
-    for source_day in days:
+    for day_number, source_day in enumerate(days, start=1):
         day_jobs = [
             (row.ftmo_symbol, row.dukascopy_symbol, float(row.price_divisor), side, source_day)
             for row in assets.itertuples(index=False)
@@ -303,18 +325,35 @@ def download_dukascopy_ftmo_us_m1(
                 for job in day_jobs
             ]
             for future in as_completed(futures):
-                day_results.append(future.result())
-        for result in day_results:
-            status_counts[result.status] = status_counts.get(result.status, 0) + 1
-            if result.status == "error":
-                failures.append(
-                    {
-                        "ftmo_symbol": result.ftmo_symbol,
-                        "side": result.side,
-                        "date": result.day.isoformat(),
-                        "detail": result.detail,
-                    }
-                )
+                result = future.result()
+                day_results.append(result)
+                completed_files += 1
+                status_counts[result.status] = status_counts.get(result.status, 0) + 1
+                if result.status == "error":
+                    failures.append(
+                        {
+                            "ftmo_symbol": result.ftmo_symbol,
+                            "side": result.side,
+                            "date": result.day.isoformat(),
+                            "detail": result.detail,
+                        }
+                    )
+                if (
+                    progress_every_files
+                    and len(day_results) % progress_every_files == 0
+                    and len(day_results) < len(day_jobs)
+                ):
+                    _progress(
+                        "DOWNLOAD PROGRESS",
+                        day=f"{day_number}/{len(days)}",
+                        date=source_day.isoformat(),
+                        day_files=f"{len(day_results)}/{len(day_jobs)}",
+                        total_files=f"{completed_files}/{total_files}",
+                        ok=status_counts.get("ok", 0),
+                        missing=status_counts.get("missing", 0),
+                        errors=status_counts.get("error", 0),
+                        elapsed=f"{time.monotonic() - download_started:.1f}s",
+                    )
         close_rows = [
             {"timestamp": timestamp, "ftmo_symbol": result.ftmo_symbol, "side": result.side, "close": close}
             for result in day_results
@@ -339,13 +378,27 @@ def download_dukascopy_ftmo_us_m1(
             day_merged["mid_close"] = (day_merged["bid_close"] + day_merged["ask_close"]) / 2.0
             day_merged = day_merged.sort_values(["timestamp", "ftmo_symbol"]).reset_index(drop=True)
         valid = day_merged[["bid_close", "ask_close"]].notna().all(axis=1) if not day_merged.empty else pd.Series(dtype=bool)
-        m1_bid_ask_rows += int(valid.sum())
+        valid_rows = int(valid.sum())
+        m1_bid_ask_rows += valid_rows
         if not day_merged.empty:
             symbols_with_data.update(day_merged.loc[valid, "ftmo_symbol"].unique())
             if on_m1_chunk is not None:
                 on_m1_chunk(day_merged)
             if collect_m1:
                 collected_frames.append(day_merged)
+        if progress_every_files:
+            _progress(
+                "DOWNLOAD DAY COMPLETE",
+                day=f"{day_number}/{len(days)}",
+                date=source_day.isoformat(),
+                total_files=f"{completed_files}/{total_files}",
+                ok=status_counts.get("ok", 0),
+                missing=status_counts.get("missing", 0),
+                errors=status_counts.get("error", 0),
+                day_exact_bid_ask_rows=valid_rows,
+                total_exact_bid_ask_rows=m1_bid_ask_rows,
+                elapsed=f"{time.monotonic() - download_started:.1f}s",
+            )
     merged = (
         pd.concat(collected_frames, ignore_index=True).sort_values(["timestamp", "ftmo_symbol"]).reset_index(drop=True)
         if collected_frames
@@ -370,6 +423,17 @@ def download_dukascopy_ftmo_us_m1(
             "FTMO simulated quotes, fills, rollovers, limits, commissions, swaps, or slippage."
         ),
     }
+    if progress_every_files:
+        _progress(
+            "DOWNLOAD COMPLETE",
+            files=f"{completed_files}/{total_files}",
+            ok=status_counts.get("ok", 0),
+            missing=status_counts.get("missing", 0),
+            errors=status_counts.get("error", 0),
+            exact_bid_ask_rows=m1_bid_ask_rows,
+            symbols_with_data=len(symbols_with_data),
+            elapsed=f"{time.monotonic() - download_started:.1f}s",
+        )
     return merged, metadata
 
 
@@ -496,6 +560,7 @@ def run_ftmo_us_five_minute_audit(
     risk_aversion: float = 10.0,
     lookback_windows: int = 720,
     min_training_windows: int = 250,
+    progress_every_decisions: int = 0,
 ) -> FtmoUsAuditResult:
     """Run a causal, non-overlapping five-minute cross-asset forecast audit."""
     if not 0 < max_weight <= 1:
@@ -504,6 +569,8 @@ def run_ftmo_us_five_minute_audit(
         raise ValueError("top_n cannot satisfy the configured maximum weight cap")
     if lookback_windows < min_training_windows or min_training_windows < 2:
         raise ValueError("lookback_windows must be at least min_training_windows, which must be >= 2")
+    if progress_every_decisions < 0:
+        raise ValueError("progress_every_decisions must be non-negative")
     required = {"timestamp", "ftmo_symbol", "bid_close", "ask_close", "mid_close"}
     missing = required.difference(five_minute_quotes.columns)
     if missing:
@@ -536,7 +603,17 @@ def run_ftmo_us_five_minute_audit(
     decisions = mid.index[(mid.index >= start_timestamp) & (mid.index < end_exclusive)]
     ledger_rows: list[dict[str, Any]] = []
     holdings_rows: list[dict[str, Any]] = []
-    for decision in decisions:
+    forecast_windows = 0
+    realized_windows = 0
+    audit_started = time.monotonic()
+    if progress_every_decisions:
+        _progress(
+            "PREDICTION START",
+            decisions=len(decisions),
+            evaluation_start=start_day.isoformat(),
+            evaluation_end=end_day.isoformat(),
+        )
+    for decision_number, decision in enumerate(decisions, start=1):
         current_mid = mid.loc[decision]
         weights, expected, diagnostic = _select_causal_portfolio(
             rolling_expected.loc[decision],
@@ -606,6 +683,18 @@ def run_ftmo_us_five_minute_audit(
                     }
                 )
         ledger_rows.append(row)
+        forecast_windows += int(row["forecast_status"] == "ok")
+        realized_windows += int(row["realized_status"] == "ok")
+        if progress_every_decisions and (
+            decision_number % progress_every_decisions == 0 or decision_number == len(decisions)
+        ):
+            _progress(
+                "PREDICTION PROGRESS",
+                decisions=f"{decision_number}/{len(decisions)}",
+                forecasts=forecast_windows,
+                realized=realized_windows,
+                elapsed=f"{time.monotonic() - audit_started:.1f}s",
+            )
     ledger = pd.DataFrame(ledger_rows)
     holdings = pd.DataFrame(holdings_rows)
     realized = ledger.loc[ledger["realized_status"].eq("ok")].copy() if not ledger.empty else pd.DataFrame()
@@ -728,11 +817,20 @@ def run_download_and_audit(
     risk_aversion: float = 10.0,
     lookback_windows: int = 720,
     min_training_windows: int = 250,
+    progress_every_files: int = 25,
+    progress_every_decisions: int = 250,
 ) -> FtmoUsAuditResult:
     """Verify the FTMO US universe, download proxy quotes, and audit predictions."""
     mapping = load_ftmo_us_mapping(mapping_path)
     manifest, manifest_metadata = fetch_ftmo_us_manifest(timeout_seconds=timeout_seconds)
     assets = select_verified_assets(mapping, manifest, requested_symbols)
+    _progress(
+        "UNIVERSE VERIFIED",
+        active_ftmo_us_assets=len(manifest),
+        mapped_assets=len(assets),
+        download_start=_date(download_start).isoformat(),
+        evaluation_end=_date(evaluation_end).isoformat(),
+    )
     five_minute_chunks: list[pd.DataFrame] = []
 
     def _reduce_m1_chunk(minute_chunk: pd.DataFrame) -> None:
@@ -749,6 +847,7 @@ def run_download_and_audit(
         timeout_seconds=timeout_seconds,
         on_m1_chunk=_reduce_m1_chunk,
         collect_m1=False,
+        progress_every_files=progress_every_files,
     )
     if not five_minute_chunks:
         raise ValueError("Dukascopy returned no exact M1 BID/ASK endpoints for the selected FTMO US proxy assets")
@@ -764,6 +863,7 @@ def run_download_and_audit(
         risk_aversion=risk_aversion,
         lookback_windows=lookback_windows,
         min_training_windows=min_training_windows,
+        progress_every_decisions=progress_every_decisions,
     )
     write_ftmo_us_audit(
         output_dir,
@@ -774,6 +874,12 @@ def run_download_and_audit(
         manifest_metadata=manifest_metadata,
         download_metadata=download_metadata,
         result=result,
+    )
+    _progress(
+        "ARTIFACT WRITTEN",
+        forecasts=result.summary["forecast_windows"],
+        realized=result.summary["realized_windows"],
+        output_dir=output_dir,
     )
     return result
 
@@ -796,6 +902,8 @@ def _parse_args() -> argparse.Namespace:
     run.add_argument("--risk-aversion", type=float, default=10.0)
     run.add_argument("--lookback-windows", type=int, default=720)
     run.add_argument("--min-training-windows", type=int, default=250)
+    run.add_argument("--progress-every-files", type=int, default=25)
+    run.add_argument("--progress-every-decisions", type=int, default=250)
     return parser.parse_args()
 
 
@@ -817,6 +925,8 @@ def main() -> None:
             risk_aversion=args.risk_aversion,
             lookback_windows=args.lookback_windows,
             min_training_windows=args.min_training_windows,
+            progress_every_files=args.progress_every_files,
+            progress_every_decisions=args.progress_every_decisions,
         )
         print(
             "FTMO US PROXY AUDIT COMPLETE | "

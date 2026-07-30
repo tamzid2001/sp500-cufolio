@@ -1,9 +1,15 @@
 from __future__ import annotations
 
+import lzma
+import warnings
+from datetime import date
+
 import numpy as np
 import pandas as pd
 
 from cufolio_cpu.ftmo_us_five_minute_audit import (
+    M1_CANDLE_STRUCT,
+    _parse_native_m1_close,
     load_ftmo_us_mapping,
     native_m1_to_five_minute_quotes,
     run_ftmo_us_five_minute_audit,
@@ -48,6 +54,15 @@ def test_native_endpoint_conversion_requires_the_exact_final_m1_close() -> None:
     assert converted.loc[0, "timestamp"] == pd.Timestamp("2026-01-01T00:05:00Z")
     assert converted.loc[0, "bid_close"] == 1.2
     assert converted.loc[0, "ask_close"] == 1.2001
+
+
+def test_native_m1_offset_uses_explicit_seconds_without_a_deprecation_warning() -> None:
+    raw = M1_CANDLE_STRUCT.pack(60, 110_000, 110_025, 109_990, 110_030, 1.0)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", DeprecationWarning)
+        rows = _parse_native_m1_close(lzma.compress(raw), source_day=date(2026, 7, 1), price_divisor=100_000)
+
+    assert rows == [(pd.Timestamp("2026-07-01T00:01:00Z"), 1.10025)]
 
 
 def test_ftmo_us_mapping_matches_the_current_us_universe_shape() -> None:

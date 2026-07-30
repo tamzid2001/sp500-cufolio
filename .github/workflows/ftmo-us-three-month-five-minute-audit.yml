@@ -37,6 +37,7 @@ jobs:
     timeout-minutes: 360
     env:
       PYTHONPATH: ${{ github.workspace }}/src
+      PYTHONUNBUFFERED: "1"
       REQUESTED_EVALUATION_END: ${{ github.event.inputs.evaluation_end || '' }}
       REQUESTED_SYMBOLS: ${{ github.event.inputs.symbols || 'all' }}
       DOWNLOAD_WORKERS: ${{ github.event.inputs.workers || '8' }}
@@ -90,7 +91,9 @@ jobs:
             --top-n 10 \
             --max-weight 0.20 \
             --lookback-windows 720 \
-            --min-training-windows 250
+            --min-training-windows 250 \
+            --progress-every-files 25 \
+            --progress-every-decisions 250
 
       - name: Publish audited result and limitations
         run: cat "$OUTPUT_DIR/ftmo_us_five_minute_audit_report.md" >> "$GITHUB_STEP_SUMMARY"
