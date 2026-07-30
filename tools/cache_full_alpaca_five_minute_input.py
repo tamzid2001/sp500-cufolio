@@ -44,6 +44,14 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _trading_client(key: str, secret: str) -> TradingClient:
+    """Use the credential mode explicitly selected by the invoking workflow."""
+    mode = os.environ.get("ALPACA_TRADING_MODE", "paper").strip().lower()
+    if mode not in {"paper", "live"}:
+        raise ValueError("ALPACA_TRADING_MODE must be 'paper' or 'live'")
+    return TradingClient(key, secret, paper=mode == "paper")
+
+
 def _endpoint_times() -> frozenset[clock_time]:
     first = datetime.combine(date(2000, 1, 1), clock_time(9, 34))
     return frozenset(
@@ -322,7 +330,7 @@ def _write_metadata(path: Path, metadata: dict[str, Any]) -> None:
 
 
 def _snapshot_universe(key: str, secret: str) -> pd.DataFrame:
-    client = TradingClient(key, secret, paper=True)
+    client = _trading_client(key, secret)
     assets = client.get_all_assets(GetAssetsRequest(asset_class=AssetClass.US_EQUITY))
     selected = sorted((asset for asset in assets if asset.tradable and asset.fractionable), key=lambda asset: asset.symbol)
     return pd.DataFrame(
@@ -352,7 +360,7 @@ def latest_completed_market_session(
     current = pd.Timestamp(now if now is not None else pd.Timestamp.now(tz="UTC"))
     current = current.tz_localize("UTC") if current.tzinfo is None else current.tz_convert("UTC")
     local_today = current.tz_convert(NEW_YORK).date()
-    calendar = TradingClient(key, secret, paper=True).get_calendar(
+    calendar = _trading_client(key, secret).get_calendar(
         GetCalendarRequest(start=local_today - timedelta(days=14), end=local_today)
     )
     completed: list[date] = []

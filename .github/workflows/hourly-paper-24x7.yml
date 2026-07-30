@@ -57,7 +57,9 @@ jobs:
         id: minute_cache_restore
         uses: actions/cache/restore@v4
         with:
-          path: var/full_alpaca_universe_live_five_minute_endpoints.csv.gz
+          path: |
+            var/full_alpaca_universe_live_five_minute_endpoints.csv.gz
+            var/full_alpaca_universe_live_five_minute_endpoints.csv.gz.freshness.json
           key: five-minute-paper-full-alpaca-endpoint-history-${{ github.run_id }}
           restore-keys: |
             five-minute-paper-full-alpaca-endpoint-history-
@@ -133,7 +135,6 @@ jobs:
             --minute-cache "$LIVE_ENDPOINT_CACHE" \
             --historical-minute-cache "$FULL_UNIVERSE_CACHE_DIR/iex_one_minute_exact_five_minute_endpoints.csv.gz" \
             --universe-cache "$FULL_UNIVERSE_CACHE_DIR/alpaca_tradable_fractionable_universe.csv" \
-            --history-calendar-days 55 \
             --output-dir artifacts/five_minute_paper_24x7 \
             --top-n 20 \
             --max-weight 0.10
@@ -151,19 +152,22 @@ jobs:
         if: always()
         id: minute_cache_present
         run: |
-          if test -f "$LIVE_ENDPOINT_CACHE"; then
+          freshness_receipt="${LIVE_ENDPOINT_CACHE}.freshness.json"
+          if test -f "$LIVE_ENDPOINT_CACHE" && test -s "$freshness_receipt"; then
             echo "save=true" >> "$GITHUB_OUTPUT"
-            echo "FIVE MINUTE PAPER CACHE HANDOFF READY | bytes=$(wc -c < "$LIVE_ENDPOINT_CACHE")"
+            echo "FIVE MINUTE PAPER CACHE HANDOFF READY | bytes=$(wc -c < "$LIVE_ENDPOINT_CACHE") receipt=$(jq -r '.latest_completed_minute // "missing"' "$freshness_receipt")"
           else
             echo "save=false" >> "$GITHUB_OUTPUT"
-            echo "FIVE MINUTE PAPER CACHE HANDOFF EMPTY | no cache was created in this slice."
+            echo "FIVE MINUTE PAPER CACHE HANDOFF INCOMPLETE | missing endpoint cache or one-minute freshness receipt."
           fi
 
       - name: Save rolling full-universe endpoint cache
         if: always() && steps.minute_cache_present.outputs.save == 'true'
         uses: actions/cache/save@v4
         with:
-          path: var/full_alpaca_universe_live_five_minute_endpoints.csv.gz
+          path: |
+            var/full_alpaca_universe_live_five_minute_endpoints.csv.gz
+            var/full_alpaca_universe_live_five_minute_endpoints.csv.gz.freshness.json
           key: five-minute-paper-full-alpaca-endpoint-history-${{ github.run_id }}
 
       - name: Queue the next 5h45m paper handoff
@@ -181,6 +185,7 @@ jobs:
           path: |
             var/five_minute_paper_24x7_state.json
             var/full_alpaca_universe_live_five_minute_endpoints.csv.gz
+            var/full_alpaca_universe_live_five_minute_endpoints.csv.gz.freshness.json
             artifacts/five_minute_paper_24x7/
           if-no-files-found: warn
           retention-days: 30

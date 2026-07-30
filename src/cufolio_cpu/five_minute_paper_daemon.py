@@ -4,35 +4,21 @@ from __future__ import annotations
 
 import argparse
 import time
-from datetime import datetime, timedelta
+from datetime import datetime
 from decimal import Decimal
 from pathlib import Path
 
 import pandas as pd
 
-from .five_minute_intraday_backtest import NEW_YORK, OPENING_DECISION_PRICE_TIME
+from .five_minute_intraday_backtest import NEW_YORK
 from .five_minute_paper_session import run_five_minute_paper_session
 
-DEFAULT_HISTORY_CALENDAR_DAYS = 55
 DEFAULT_FULL_UNIVERSE_CACHE_DIR = "var/full_alpaca_universe_five_minute"
 DEFAULT_LIVE_ENDPOINT_CACHE = "var/full_alpaca_universe_live_five_minute_endpoints.csv.gz"
 
 
 def utc_now() -> pd.Timestamp:
     return pd.Timestamp(datetime.now(tz=NEW_YORK)).tz_convert("UTC")
-
-
-def rolling_history_start(reference: pd.Timestamp, *, calendar_days: int) -> str:
-    """Return enough completed sessions for the ten-session five-minute model."""
-    if calendar_days < 28:
-        raise ValueError("history_calendar_days must be at least 28")
-    local_day = reference.tz_convert(NEW_YORK).date() - timedelta(days=calendar_days)
-    return (
-        pd.Timestamp.combine(local_day, OPENING_DECISION_PRICE_TIME)
-        .tz_localize(NEW_YORK)
-        .tz_convert("UTC")
-        .isoformat()
-    )
 
 
 def run_five_minute_paper_daemon(
@@ -43,8 +29,6 @@ def run_five_minute_paper_daemon(
     universe_cache_path: str | Path,
     top_n: int,
     max_weight: str,
-    history_start: str | None = None,
-    history_calendar_days: int = DEFAULT_HISTORY_CALENDAR_DAYS,
     minute_cache_path: str | Path = DEFAULT_LIVE_ENDPOINT_CACHE,
     historical_minute_cache_path: str | Path | None = f"{DEFAULT_FULL_UNIVERSE_CACHE_DIR}/iex_one_minute_exact_five_minute_endpoints.csv.gz",
 ) -> None:
@@ -62,11 +46,8 @@ def run_five_minute_paper_daemon(
         local = current.tz_convert(NEW_YORK)
         if local.weekday() < 5 and local.time().isoformat() < "16:01:00":
             try:
-                session_history_start = history_start or rolling_history_start(
-                    current, calendar_days=history_calendar_days
-                )
                 ledger = run_five_minute_paper_session(
-                    session_day=local.date(), history_start=session_history_start, output_dir=output_dir,
+                    session_day=local.date(), output_dir=output_dir,
                     universe_cache_path=universe_cache_path,
                     top_n=top_n, max_weight=Decimal(max_weight), checkpoint_path=state_path,
                     minute_cache_path=minute_cache_path,
@@ -99,8 +80,6 @@ def main() -> None:
         "--historical-minute-cache",
         default=f"{DEFAULT_FULL_UNIVERSE_CACHE_DIR}/iex_one_minute_exact_five_minute_endpoints.csv.gz",
     )
-    parser.add_argument("--history-start")
-    parser.add_argument("--history-calendar-days", type=int, default=DEFAULT_HISTORY_CALENDAR_DAYS)
     parser.add_argument("--output-dir", default="artifacts/five_minute_paper_24x7")
     parser.add_argument("--universe-cache", required=True)
     parser.add_argument("--top-n", type=int, default=20)
@@ -110,8 +89,7 @@ def main() -> None:
         run_seconds=args.run_seconds, state_path=args.state, minute_cache_path=args.minute_cache,
         historical_minute_cache_path=args.historical_minute_cache, output_dir=args.output_dir,
         universe_cache_path=args.universe_cache,
-        top_n=args.top_n, max_weight=args.max_weight, history_start=args.history_start,
-        history_calendar_days=args.history_calendar_days,
+        top_n=args.top_n, max_weight=args.max_weight,
     )
 
 

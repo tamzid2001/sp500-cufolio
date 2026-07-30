@@ -51,6 +51,7 @@ EVENT_PRIORITY_GUARD = timedelta(seconds=45)
 END_OF_DAY_HANDOFF_GUARD = timedelta(minutes=2)
 FORECAST_CADENCE_MINUTES = 5
 CLOSING_FORECAST_HORIZON_MINUTES = 4
+MINUTE_CACHE_FRESHNESS_FORMAT_VERSION = 1
 
 
 @dataclass(frozen=True)
@@ -187,6 +188,67 @@ def _write_minute_cache(path: Path, bars: pd.DataFrame, *, endpoint_only: bool =
     os.replace(temporary, path)
 
 
+def _minute_cache_freshness_path(path: Path) -> Path:
+    """Return the atomic one-minute poll receipt paired with a cache file."""
+    return path.with_name(f"{path.name}.freshness.json")
+
+
+def _write_minute_cache_freshness(
+    path: Path,
+    *,
+    session_day: date,
+    observed_at: pd.Timestamp,
+    completed_minute: pd.Timestamp,
+    source: str,
+    source_rows_returned: int,
+    source_rows_at_completed_minute: int,
+    latest_source_timestamp: pd.Timestamp | None,
+    cached_endpoint_through: pd.Timestamp | None,
+    cached_endpoint_rows_for_session: int,
+    endpoint_only: bool,
+) -> None:
+    """Persist an auditable receipt for every successful completed-minute poll.
+
+    The five-minute model consumes only exact native one-minute endpoints, so
+    retaining every raw full-universe minute would multiply the cache size
+    without changing a candidate.  This receipt makes the one-minute polling
+    cadence and its observed freshness durable across Actions handoffs instead
+    of incorrectly implying that a five-minute endpoint file contains every
+    raw minute.
+    """
+    receipt_path = _minute_cache_freshness_path(path)
+    receipt_path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "format_version": MINUTE_CACHE_FRESHNESS_FORMAT_VERSION,
+        "cache_representation": (
+            "exact_native_one_minute_model_endpoints"
+            if endpoint_only
+            else "native_one_minute_bars"
+        ),
+        "market_data_feed": "IEX",
+        "session_date": session_day.isoformat(),
+        "observed_at": _utc_timestamp(observed_at).isoformat(),
+        "latest_completed_minute": completed_minute.isoformat(),
+        "source": source,
+        "source_rows_returned": source_rows_returned,
+        "source_rows_at_completed_minute": source_rows_at_completed_minute,
+        "latest_source_timestamp": (
+            latest_source_timestamp.isoformat() if latest_source_timestamp is not None else None
+        ),
+        "cached_model_endpoint_through": (
+            cached_endpoint_through.isoformat() if cached_endpoint_through is not None else None
+        ),
+        "cached_model_endpoint_rows_for_session": cached_endpoint_rows_for_session,
+        "freshness_rule": (
+            "A receipt is written after every successful IEX poll of a completed minute. "
+            "Missing or stale symbols are counted explicitly and never substituted."
+        ),
+    }
+    temporary = receipt_path.with_name(f".{receipt_path.name}.tmp")
+    temporary.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    os.replace(temporary, receipt_path)
+
+
 def _completed_bar_at(observed_at: pd.Timestamp, session_day: date) -> pd.Timestamp | None:
     completed = _utc_timestamp(observed_at).floor("min") - timedelta(minutes=1)
     opening_anchor = (
@@ -278,9 +340,11 @@ def _merge_current_minutes(
         fetch_start = completed
     incremental = pd.DataFrame(columns=["timestamp", "symbol", "close"])
     source = "alpaca_iex_rest"
+    source_poll_succeeded = False
     if minute_stream is not None:
         drain = getattr(minute_stream, "drain_completed_bars_through", None)
         streamed = drain(completed) if callable(drain) else minute_stream.completed_bars_through(completed)
+        source_poll_succeeded = True
         if not streamed.empty:
             incremental = streamed.loc[
                 pd.to_datetime(streamed["timestamp"], utc=True, errors="coerce") >= fetch_start
@@ -291,6 +355,7 @@ def _merge_current_minutes(
         try:
             incremental = download_latest_iex_minute_bars(symbols)
             source = "alpaca_iex_latest_threadpool"
+            source_poll_succeeded = True
             health.record_success("alpaca_iex_latest_threadpool", observed_at)
         except Exception as error:
             _record_degraded(health, "alpaca_iex_latest_threadpool", observed_at, error)
@@ -303,19 +368,28 @@ def _merge_current_minutes(
             if not rest.empty:
                 incremental = pd.concat([incremental, rest], ignore_index=True)
                 source = "alpaca_iex_websocket+rest"
-                health.record_success("alpaca_iex_rest", observed_at)
+            source_poll_succeeded = True
+            health.record_success("alpaca_iex_rest", observed_at)
         except Exception as error:
             _record_degraded(health, "alpaca_iex_rest", observed_at, error)
     if incremental.empty and allow_yfinance_fallback and health.may_attempt("yfinance_1m_fallback", observed_at):
         try:
             incremental = download_yfinance_minute_bars(symbols, fetch_start, completed + timedelta(minutes=1))
             source = "yfinance_1m_fallback"
+            source_poll_succeeded = True
             if not incremental.empty:
                 health.record_success("yfinance_1m_fallback", observed_at)
         except Exception as error:
             _record_degraded(health, "yfinance_1m_fallback", observed_at, error)
+    source_rows_returned = int(len(incremental))
+    source_rows_at_completed_minute = 0
+    latest_source_timestamp: pd.Timestamp | None = None
     if not incremental.empty:
         incremental_timestamps = pd.to_datetime(incremental["timestamp"], utc=True, errors="coerce")
+        valid_source_timestamps = incremental_timestamps.dropna()
+        if not valid_source_timestamps.empty:
+            latest_source_timestamp = valid_source_timestamps.max()
+            source_rows_at_completed_minute = int(incremental_timestamps.eq(completed).sum())
         incremental = incremental.loc[(incremental_timestamps >= fetch_start) & (incremental_timestamps <= completed)]
         incremental = _regular_minute_cache_projection(incremental, endpoint_only=endpoint_only)
         normalized = _merge_incremental_minute_bars(normalized, incremental, endpoint_only=endpoint_only)
@@ -326,6 +400,26 @@ def _merge_current_minutes(
             f"source={source} through={completed.isoformat()} rows={len(incremental):,} "
             f"elapsed={time.monotonic() - refresh_started:.3f}s {_cache_summary(normalized)}",
             flush=True,
+        )
+    if cache_path is not None and source_poll_succeeded:
+        cached_today = normalized.loc[
+            pd.to_datetime(normalized["timestamp"], utc=True).dt.tz_convert(NEW_YORK).dt.date.eq(session_day)
+        ]
+        cached_endpoint_through = (
+            pd.to_datetime(cached_today["timestamp"], utc=True).max() if not cached_today.empty else None
+        )
+        _write_minute_cache_freshness(
+            cache_path,
+            session_day=session_day,
+            observed_at=observed_at,
+            completed_minute=completed,
+            source=source,
+            source_rows_returned=source_rows_returned,
+            source_rows_at_completed_minute=source_rows_at_completed_minute,
+            latest_source_timestamp=latest_source_timestamp,
+            cached_endpoint_through=cached_endpoint_through,
+            cached_endpoint_rows_for_session=int(len(cached_today)),
+            endpoint_only=endpoint_only,
         )
     return MinuteCacheUpdate(normalized, incremental, time.monotonic() - refresh_started)
 
@@ -391,7 +485,6 @@ def _execution_summary(report: dict[str, object]) -> str:
 def run_five_minute_paper_session(
     *,
     session_day: date,
-    history_start: str,
     output_dir: str | Path,
     universe_cache_path: str | Path | None = None,
     top_n: int = 20,
@@ -521,9 +614,10 @@ def run_five_minute_paper_session(
             while now() < due_at:
                 current = now()
                 completed_minute = _completed_bar_at(current, session_day)
-                # Keep websocket bars flowing into the in-memory engine while
-                # reserving the final 45 seconds for the exact decision-time
-                # IEX REST repair and order submission.
+                # Poll each completed minute and persist the endpoint cache
+                # plus its one-minute freshness receipt before the decision.
+                # The final 45 seconds remain reserved for the exact
+                # decision-time IEX check and order submission.
                 if (
                     completed_minute is not None
                     and completed_minute != last_minute_refresh
@@ -539,7 +633,7 @@ def run_five_minute_paper_session(
                             minute_stream=stream,
                             health=health,
                             repair_from_rest=False,
-                            persist=False,
+                            persist=True,
                             endpoint_only=True,
                             allow_rest_repair=False,
                             allow_yfinance_fallback=False,
@@ -743,7 +837,6 @@ def run_five_minute_paper_session(
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run one causal five-minute Alpaca portfolio session.")
     parser.add_argument("--session-date", required=True)
-    parser.add_argument("--history-start", required=True)
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--universe-cache", required=True, help="Cached Alpaca tradable fractionable universe CSV")
     parser.add_argument("--checkpoint")
@@ -757,7 +850,7 @@ def main() -> None:
     if args.mode == "live" and not args.allow_live_trading:
         parser.error("--mode live requires --allow-live-trading and ALPACA_LIVE_* credentials")
     run_five_minute_paper_session(
-        session_day=date.fromisoformat(args.session_date), history_start=args.history_start,
+        session_day=date.fromisoformat(args.session_date),
         output_dir=args.output_dir, universe_cache_path=args.universe_cache, checkpoint_path=args.checkpoint, minute_cache_path=args.minute_cache,
         historical_minute_cache_path=args.historical_minute_cache, top_n=args.top_n,
         max_weight=args.max_weight, mode=args.mode, allow_live_trading=args.allow_live_trading,
