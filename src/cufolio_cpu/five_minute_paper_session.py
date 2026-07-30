@@ -474,6 +474,37 @@ def _persist_checkpoint(path: Path | None, checkpoint: dict[str, object], comple
     os.replace(temporary, path)
 
 
+def _previous_target_weights(ledger: list[dict[str, object]]) -> dict[str, Decimal] | None:
+    """Load the newest complete target from the durable session ledger.
+
+    Old checkpoints lack this field. Treat that case as unavailable so the
+    next target rebuilds from flat rather than reusing an unverified weight.
+    """
+    for entry in reversed(ledger):
+        event = entry.get("event")
+        if event == "skipped_unavailable_five_minute_target":
+            # The immediately preceding five-minute prediction was unavailable,
+            # so no older allocation is eligible for reuse.
+            return None
+        if event != "five_minute_forecast_target_order":
+            continue
+        raw_targets = entry.get("target_weights")
+        if not isinstance(raw_targets, dict):
+            return None
+        parsed: dict[str, Decimal] = {}
+        try:
+            for raw_symbol, raw_weight in raw_targets.items():
+                symbol = str(raw_symbol).upper().strip()
+                weight = Decimal(str(raw_weight))
+                if not symbol or not weight.is_finite() or weight <= 0:
+                    return None
+                parsed[symbol] = weight
+        except Exception:
+            return None
+        return parsed or None
+    return None
+
+
 def _execution_summary(report: dict[str, object]) -> str:
     submitted = report.get("submitted_orders", [])
     return (
@@ -792,9 +823,12 @@ def run_five_minute_paper_session(
                 candidate_path = output / f"candidate_{due_at.strftime('%Y%m%dT%H%MZ')}.csv"
                 candidate.weights.to_csv(candidate_path, index=False)
                 targets = load_target_weights(candidate_path, max_weight=max_weight)
+                previous_targets = _previous_target_weights(ledger)
                 report = run_rebalance(
                     client, targets, min_order_notional=min_order_notional, min_weight_drift=min_weight_drift,
-                    liquidate_non_target_positions=True, complete_rebalance=True, execute=True,
+                    liquidate_non_target_positions=True, complete_rebalance=True,
+                    cancel_stale_open_orders=True, previous_targets=previous_targets,
+                    retain_only_unchanged_targets=True, execute=True,
                 )
                 entry = {
                     "event": "five_minute_forecast_target_order", "scheduled_at": due_at.isoformat(),
@@ -802,6 +836,7 @@ def run_five_minute_paper_session(
                     "forecast_horizon_minutes": forecast_horizon_minutes,
                     "cache_refresh_seconds": update.elapsed_seconds,
                     "candidate_file": candidate_path.name, "forecast_status": candidate.status,
+                    "target_weights": {symbol: str(weight) for symbol, weight in targets.items()},
                     "paper_rebalance": report,
                 }
                 ledger.append(entry)

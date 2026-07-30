@@ -289,13 +289,15 @@ shrunk toward the pooled mean; they are not trading instructions or a claim of
 future performance.
 
 The five-minute session runner incrementally reconciles the portfolio at every
-decision boundary. It retains overlapping tickers, sells only names removed
-from the new target or positions above their new target weight, waits up to 30
-seconds for those sells to clear, then refreshes positions, equity, and cash
-before buying new or underweight names to the current optimized target. If the
-required sells have not completed, it submits no replacement buys. The
-scheduled runner remains paper-only; the same guarded path is used by the
-separately confirmed manual live session.
+decision boundary. It retains an overlapping ticker only when its allocation
+is identical to the immediately preceding five-minute target (within a
+one-billionth serialization tolerance). A newly added ticker or a ticker whose
+weight changed is fully exited first, then bought to the new allocation after
+the sales clear. Before this reconciliation it cancels and confirms clearance
+of any prior-window open orders. If those cancellations or required sells have
+not completed, it submits no replacement buys. The scheduled runner remains
+paper-only; the same guarded path is used by the separately confirmed manual
+live session.
 
 The full-Alpaca-universe paper runner is fail-closed on cache freshness. An
 after-close workflow resolves Alpaca's official latest completed session and
