@@ -242,8 +242,8 @@ oil, and BTCUSD. The reviewed mapping is in
 `assets/ftmo_us_dukascopy_mapping.csv` and uses native Dukascopy one-minute
 BID/ASK candles, reduced only when the exact final M1 endpoint exists.
 
-It fits a new capped long-only mean-variance forecast every five minutes with
-labels that end strictly before its decision. Forecast accuracy is measured
+It forms a new capped long-only equal-weight allocation of the highest trailing
+five-minute forecasts, using labels that end strictly before its decision. Forecast accuracy is measured
 against proxy mid returns; the separate executable-proxy series enters at a
 Dukascopy ASK endpoint and exits at the next BID endpoint. The workflow uploads
 the exact five-minute proxy endpoints used by the model, official manifest snapshot, selected-symbol mapping,
