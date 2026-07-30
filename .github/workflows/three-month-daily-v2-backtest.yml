@@ -1,0 +1,163 @@
+name: Three-month daily V2 forward-return backtest
+
+on:
+  workflow_dispatch:
+    inputs:
+      evaluation_end:
+        description: "Last V2 decision date (YYYY-MM-DD). Default is conservatively two business days before today."
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cufolio-three-month-daily-v2-backtest
+  cancel-in-progress: false
+
+jobs:
+  backtest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      PYTHONPATH: ${{ github.workspace }}/src
+      ALPACA_PAPER_API_KEY: ${{ secrets.ALPACA_PAPER_API_KEY || secrets.ALPACA_API_KEY }}
+      ALPACA_PAPER_SECRET_KEY: ${{ secrets.ALPACA_PAPER_SECRET_KEY || secrets.ALPACA_SECRET_KEY }}
+      REQUESTED_EVALUATION_END: ${{ inputs.evaluation_end }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install project and dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+          python -m pip install -e . --no-deps
+
+      - name: Verify the causal V2 backtest implementation
+        run: python -m pytest -q tests/test_intraday_forward_v2.py tests/test_intraday_forward_v2_backtest.py
+
+      - name: Download IEX 15-minute input with V2 warm-up
+        run: |
+          set -euo pipefail
+          test -n "$ALPACA_PAPER_API_KEY"
+          test -n "$ALPACA_PAPER_SECRET_KEY"
+          python - <<'PY'
+          import math
+          import os
+          from pathlib import Path
+
+          import pandas as pd
+
+          from cufolio_cpu.intraday_selection import NEW_YORK, download_fifteen_minute_bars
+          from cufolio_cpu.universe import current_sp500_universe
+
+          requested = os.environ.get("REQUESTED_EVALUATION_END", "").strip()
+          if requested:
+              evaluation_end = pd.Timestamp(requested).date()
+          else:
+              # V2's 34 bars span more than one following session. Two
+              # business days keeps the final realized endpoint conservative
+              # when this workflow runs during the current market session.
+              evaluation_end = (pd.Timestamp.now(tz=NEW_YORK).normalize() - pd.offsets.BDay(2)).date()
+          evaluation_start = (pd.Timestamp(evaluation_end) - pd.DateOffset(months=3)).date()
+          data_start = pd.Timestamp(evaluation_start, tz=NEW_YORK) - pd.Timedelta(days=120)
+          # Alpaca returns completed bars through the present even if the end
+          # is later; the extra calendar days provide the final 34-bar outcome.
+          data_end = pd.Timestamp(evaluation_end, tz=NEW_YORK) + pd.Timedelta(days=8)
+          universe = current_sp500_universe()
+          symbol_column = "source_symbol" if "source_symbol" in universe.columns else "symbol"
+          symbols = universe[symbol_column].astype(str).str.upper().drop_duplicates().to_list()
+          bars = download_fifteen_minute_bars(
+              symbols,
+              api_key=os.environ["ALPACA_PAPER_API_KEY"],
+              secret_key=os.environ["ALPACA_PAPER_SECRET_KEY"],
+              end=data_end,
+              lookback_calendar_days=math.ceil((data_end - data_start).total_seconds() / 86400),
+          )
+          if bars.empty:
+              raise RuntimeError("Alpaca IEX returned no 15-minute bars; no backtest was calculated")
+          output = Path("artifacts/three_month_daily_v2")
+          output.mkdir(parents=True, exist_ok=True)
+          bars.to_csv(output / "iex_v2_fifteen_minute_input.csv.gz", index=False, compression="gzip")
+          universe.to_csv(output / "current_sp500_universe.csv", index=False)
+          status = {
+              "market_data_feed": "Alpaca IEX",
+              "bar_interval": "15m",
+              "input_rows": int(len(bars)),
+              "input_symbols": int(bars["symbol"].nunique()),
+              "input_start": bars["timestamp"].min().isoformat(),
+              "input_end": bars["timestamp"].max().isoformat(),
+              "evaluation_start": evaluation_start.isoformat(),
+              "evaluation_end": evaluation_end.isoformat(),
+              "universe_symbols_requested": int(len(symbols)),
+              "universe_source": str(universe["universe_source"].iloc[0]),
+          }
+          (output / "input_status.json").write_text(__import__("json").dumps(status, indent=2) + "\n")
+          with Path(os.environ["GITHUB_ENV"]).open("a", encoding="utf-8") as handle:
+              handle.write(f"EVALUATION_START={evaluation_start.isoformat()}\n")
+              handle.write(f"EVALUATION_END={evaluation_end.isoformat()}\n")
+          print(
+              "IEX 15-MINUTE INPUT READY | "
+              f"rows={len(bars):,} symbols={bars['symbol'].nunique()} "
+              f"evaluation={evaluation_start}..{evaluation_end}"
+          )
+          PY
+
+      - name: Run causal daily V2 backtest
+        run: |
+          python -m cufolio_cpu.intraday_forward_v2_backtest \
+            --input artifacts/three_month_daily_v2/iex_v2_fifteen_minute_input.csv.gz \
+            --output-dir artifacts/three_month_daily_v2 \
+            --evaluation-start "$EVALUATION_START" \
+            --evaluation-end "$EVALUATION_END" \
+            --horizon-minutes 500 \
+            --top-n 20 \
+            --max-weight 0.10 \
+            --min-sessions 20 \
+            --lookback-calendar-days 120
+
+      - name: Publish research summary
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          output = Path("artifacts/three_month_daily_v2")
+          summary = json.loads((output / "v2_daily_backtest_summary.json").read_text())
+          source = json.loads((output / "input_status.json").read_text())
+          def pct(value):
+              return "n/a" if value is None else f"{float(value):+.2%}"
+          lines = [
+              "## Three-month daily V2 forward-return backtest",
+              "",
+              f"- Evaluation: `{summary['evaluation_start']}` through `{summary['evaluation_end']}` ({summary['evaluation_sessions']} daily decision opportunities).",
+              f"- Input: {source['input_rows']:,} Alpaca-IEX 15-minute bars across {source['input_symbols']} symbols; data ends `{source['input_end']}`.",
+              f"- Exactly realized V2 signals: {summary['realized_daily_signals']}/{summary['daily_signals']} ({pct(summary['exact_realized_coverage'])}).",
+              f"- Mean / median daily-signal return: {pct(summary['mean_daily_signal_return'])} / {pct(summary['median_daily_signal_return'])}; win rate: {pct(summary['daily_signal_win_rate'])}.",
+              f"- Non-overlapping, compoundable 510-minute cohort return: {pct(summary['non_overlapping_compounded_return'])} across {summary['non_overlapping_signals']} signals.",
+              f"- Mean target turnover: {pct(summary['mean_target_turnover'])}; distinct selected symbols: {summary['distinct_selected_symbols']}.",
+              "- Each daily signal is trained on labels completed strictly before its decision close and uses exact 34-bar realized endpoints; no prices are forward-filled.",
+              "- Consecutive daily V2 signals overlap, so their all-signal outcomes are not compounded as one fully invested strategy. Transaction costs, spreads, slippage, and market impact are excluded.",
+              "- Caveat: the current S&P 500 universe is not point-in-time membership, so the research result has survivorship bias and is not a tradable performance claim.",
+          ]
+          report = "\n".join(lines) + "\n"
+          (output / "github_summary.md").write_text(report)
+          print(report)
+          with Path(os.environ["GITHUB_STEP_SUMMARY"]).open("a", encoding="utf-8") as handle:
+              handle.write(report)
+          PY
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: three-month-daily-v2-${{ github.run_id }}
+          path: artifacts/three_month_daily_v2/
+          if-no-files-found: warn
+          retention-days: 30
