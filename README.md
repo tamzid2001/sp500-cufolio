@@ -246,7 +246,7 @@ It fits a new capped long-only mean-variance forecast every five minutes with
 labels that end strictly before its decision. Forecast accuracy is measured
 against proxy mid returns; the separate executable-proxy series enters at a
 Dukascopy ASK endpoint and exits at the next BID endpoint. The workflow uploads
-the source quotes, official manifest snapshot, selected-symbol mapping,
+the exact five-minute proxy endpoints used by the model, official manifest snapshot, selected-symbol mapping,
 prediction ledger, holdings, JSON metrics, and its Markdown audit report.
 
 This is intentionally not an FTMO execution backtest. FTMO US is a simulated

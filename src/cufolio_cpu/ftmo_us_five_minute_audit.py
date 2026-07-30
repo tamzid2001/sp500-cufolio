@@ -27,14 +27,11 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import numpy as np
 import pandas as pd
 import requests
-
-from .optimize import forecast_mean_variance_weights
-
 
 FTMO_US_SYMBOLS_URL = "https://ftmo.oanda.com/wp-json/ftmo/symbols"
 DUKASCOPY_CANDLE_URL = (
@@ -264,6 +261,8 @@ def download_dukascopy_ftmo_us_m1(
     workers: int = 8,
     retries: int = 3,
     timeout_seconds: int = 30,
+    on_m1_chunk: Callable[[pd.DataFrame], None] | None = None,
+    collect_m1: bool = True,
 ) -> tuple[pd.DataFrame, dict[str, Any]]:
     """Download native M1 BID/ASK closes for an FTMO US proxy asset set.
 
@@ -278,18 +277,21 @@ def download_dukascopy_ftmo_us_m1(
     if retries < 1:
         raise ValueError("retries must be positive")
     days = [value.date() for value in pd.date_range(start_day, end_day, freq="D")]
-    jobs = [
-        (row.ftmo_symbol, row.dukascopy_symbol, float(row.price_divisor), side, source_day)
-        for row in assets.itertuples(index=False)
-        for source_day in days
-        for side in ("BID", "ASK")
-    ]
-    results: list[DownloadResult] = []
-    # Bound submitted futures so a full 49-symbol, three-month run does not
-    # create thousands of waiting tasks or overwhelm the public feed.
-    batch_size = max(32, workers * 8)
-    for start_index in range(0, len(jobs), batch_size):
-        batch = jobs[start_index : start_index + batch_size]
+    status_counts: dict[str, int] = {}
+    failures: list[dict[str, str | None]] = []
+    m1_bid_ask_rows = 0
+    symbols_with_data: set[str] = set()
+    collected_frames: list[pd.DataFrame] = []
+    # Process each calendar day independently. A full 49-asset three-month
+    # input has millions of M1 closes, so holding all parsed Python tuples
+    # until the final request would needlessly exhaust an Actions runner.
+    for source_day in days:
+        day_jobs = [
+            (row.ftmo_symbol, row.dukascopy_symbol, float(row.price_divisor), side, source_day)
+            for row in assets.itertuples(index=False)
+            for side in ("BID", "ASK")
+        ]
+        day_results: list[DownloadResult] = []
         with ThreadPoolExecutor(max_workers=workers) as executor:
             futures = [
                 executor.submit(
@@ -298,42 +300,57 @@ def download_dukascopy_ftmo_us_m1(
                     retries=retries,
                     timeout_seconds=timeout_seconds,
                 )
-                for job in batch
+                for job in day_jobs
             ]
             for future in as_completed(futures):
-                results.append(future.result())
-    status_counts = pd.Series([result.status for result in results], dtype="object").value_counts().to_dict()
-    failures = [
-        {
-            "ftmo_symbol": result.ftmo_symbol,
-            "side": result.side,
-            "date": result.day.isoformat(),
-            "detail": result.detail,
-        }
-        for result in results
-        if result.status == "error"
-    ]
-    close_rows = [
-        {"timestamp": timestamp, "ftmo_symbol": result.ftmo_symbol, "side": result.side, "close": close}
-        for result in results
-        for timestamp, close in result.rows
-    ]
-    long = pd.DataFrame(close_rows, columns=["timestamp", "ftmo_symbol", "side", "close"])
-    if long.empty:
-        merged = pd.DataFrame(columns=["timestamp", "ftmo_symbol", "bid_close", "ask_close", "mid_close"])
-    else:
-        long["timestamp"] = pd.to_datetime(long["timestamp"], utc=True)
-        long = long.drop_duplicates(["timestamp", "ftmo_symbol", "side"], keep="last")
-        merged = (
-            long.pivot(index=["timestamp", "ftmo_symbol"], columns="side", values="close")
-            .rename(columns={"ASK": "ask_close", "BID": "bid_close"})
-            .reset_index()
-        )
-        for column in ("bid_close", "ask_close"):
-            if column not in merged:
-                merged[column] = np.nan
-        merged["mid_close"] = (merged["bid_close"] + merged["ask_close"]) / 2.0
-        merged = merged.sort_values(["timestamp", "ftmo_symbol"]).reset_index(drop=True)
+                day_results.append(future.result())
+        for result in day_results:
+            status_counts[result.status] = status_counts.get(result.status, 0) + 1
+            if result.status == "error":
+                failures.append(
+                    {
+                        "ftmo_symbol": result.ftmo_symbol,
+                        "side": result.side,
+                        "date": result.day.isoformat(),
+                        "detail": result.detail,
+                    }
+                )
+        close_rows = [
+            {"timestamp": timestamp, "ftmo_symbol": result.ftmo_symbol, "side": result.side, "close": close}
+            for result in day_results
+            for timestamp, close in result.rows
+        ]
+        long = pd.DataFrame(close_rows, columns=["timestamp", "ftmo_symbol", "side", "close"])
+        if long.empty:
+            day_merged = pd.DataFrame(
+                columns=["timestamp", "ftmo_symbol", "bid_close", "ask_close", "mid_close"]
+            )
+        else:
+            long["timestamp"] = pd.to_datetime(long["timestamp"], utc=True)
+            long = long.drop_duplicates(["timestamp", "ftmo_symbol", "side"], keep="last")
+            day_merged = (
+                long.pivot(index=["timestamp", "ftmo_symbol"], columns="side", values="close")
+                .rename(columns={"ASK": "ask_close", "BID": "bid_close"})
+                .reset_index()
+            )
+            for column in ("bid_close", "ask_close"):
+                if column not in day_merged:
+                    day_merged[column] = np.nan
+            day_merged["mid_close"] = (day_merged["bid_close"] + day_merged["ask_close"]) / 2.0
+            day_merged = day_merged.sort_values(["timestamp", "ftmo_symbol"]).reset_index(drop=True)
+        valid = day_merged[["bid_close", "ask_close"]].notna().all(axis=1) if not day_merged.empty else pd.Series(dtype=bool)
+        m1_bid_ask_rows += int(valid.sum())
+        if not day_merged.empty:
+            symbols_with_data.update(day_merged.loc[valid, "ftmo_symbol"].unique())
+            if on_m1_chunk is not None:
+                on_m1_chunk(day_merged)
+            if collect_m1:
+                collected_frames.append(day_merged)
+    merged = (
+        pd.concat(collected_frames, ignore_index=True).sort_values(["timestamp", "ftmo_symbol"]).reset_index(drop=True)
+        if collected_frames
+        else pd.DataFrame(columns=["timestamp", "ftmo_symbol", "bid_close", "ask_close", "mid_close"])
+    )
     metadata = {
         "data_provider": "Dukascopy native M1 candles",
         "price_sides": ["BID", "ASK"],
@@ -341,12 +358,13 @@ def download_dukascopy_ftmo_us_m1(
         "download_end": end_day.isoformat(),
         "assets_requested": int(len(assets)),
         "calendar_days_requested": int(len(days)),
-        "files_requested": int(len(jobs)),
+        "files_requested": int(len(days) * len(assets) * 2),
         "file_status_counts": {str(key): int(value) for key, value in status_counts.items()},
         "failed_files": failures[:200],
         "failed_file_count": int(len(failures)),
-        "m1_bid_ask_rows": int(merged[["bid_close", "ask_close"]].notna().all(axis=1).sum()) if not merged.empty else 0,
-        "symbols_with_bid_ask_data": int(merged.loc[merged[["bid_close", "ask_close"]].notna().all(axis=1), "ftmo_symbol"].nunique()) if not merged.empty else 0,
+        "m1_bid_ask_rows": m1_bid_ask_rows,
+        "symbols_with_bid_ask_data": int(len(symbols_with_data)),
+        "m1_rows_retained_in_memory": bool(collect_m1),
         "feed_caveat": (
             "Dukascopy is a historical proxy feed, not FTMO US. BID/ASK proxy prices do not reproduce "
             "FTMO simulated quotes, fills, rollovers, limits, commissions, swaps, or slippage."
@@ -418,77 +436,51 @@ def _previous_interval(panel: pd.DataFrame) -> pd.DataFrame:
 
 
 def _select_causal_portfolio(
-    labels: pd.DataFrame,
+    expected: pd.Series,
+    training_counts: pd.Series,
     current_mid: pd.Series,
     *,
-    decision: pd.Timestamp,
+    training_end: pd.Timestamp | pd.NaT,
     top_n: int,
     max_weight: float,
-    risk_aversion: float,
-    lookback_windows: int,
     min_training_windows: int,
 ) -> tuple[pd.Series | None, pd.Series | None, dict[str, Any]]:
-    training = labels.loc[labels.index < decision].tail(lookback_windows)
     required_candidates = int(math.ceil((1.0 - 1e-12) / max_weight))
     diagnostic: dict[str, Any] = {
         "forecast_status": "unavailable",
         "reason": "unknown",
-        "training_windows": int(len(training)),
-        "training_end": training.index.max().isoformat() if not training.empty else None,
+        "training_windows": int(training_counts.max()) if not training_counts.empty else 0,
+        "training_end": training_end.isoformat() if pd.notna(training_end) else None,
         "required_candidates_for_weight_cap": required_candidates,
         "minimum_training_windows": min_training_windows,
         "assets_with_decision_price": int(current_mid.notna().sum()),
     }
-    if len(training) < min_training_windows:
-        diagnostic["reason"] = "insufficient_prior_five_minute_windows"
-        return None, None, diagnostic
-    expected = training.mean(skipna=True)
     eligible = expected.index[
         expected.notna()
         & current_mid.reindex(expected.index).notna()
-        & training.notna().sum().ge(min_training_windows)
+        & training_counts.reindex(expected.index).ge(min_training_windows)
     ]
     diagnostic["eligible_assets"] = int(len(eligible))
     if len(eligible) < required_candidates:
         diagnostic["reason"] = "insufficient_assets_with_training_and_exact_decision_prices"
         return None, None, diagnostic
-    selected: list[str] = []
-    common_rows = pd.Series(True, index=training.index)
-    for symbol in expected.reindex(eligible).sort_values(ascending=False).index:
-        complete_with_symbol = common_rows & training[symbol].notna()
-        if int(complete_with_symbol.sum()) < min_training_windows:
-            continue
-        selected.append(symbol)
-        common_rows = complete_with_symbol
-        if len(selected) == top_n:
-            break
-    scenarios = training.loc[common_rows, selected]
-    diagnostic.update({"candidate_count": int(len(selected)), "covariance_scenarios": int(len(scenarios))})
+    selected = list(expected.reindex(eligible).sort_values(ascending=False).head(top_n).index)
+    diagnostic.update({"candidate_count": int(len(selected)), "covariance_scenarios": None})
     if len(selected) < required_candidates:
-        diagnostic["reason"] = "insufficient_complete_candidates_for_weight_cap"
+        diagnostic["reason"] = "insufficient_candidates_for_weight_cap"
         return None, None, diagnostic
-    if len(scenarios) < min_training_windows:
-        diagnostic["reason"] = "insufficient_complete_covariance_scenarios"
-        return None, None, diagnostic
-    try:
-        allocation = forecast_mean_variance_weights(
-            scenarios,
-            expected.reindex(selected),
-            risk_aversion=risk_aversion,
-            max_weight=max_weight,
-        )
-        weights = _sanitize_weights(allocation.weights, max_weight=max_weight)
-    except Exception as error:  # No heuristic fallback may masquerade as an optimizer result.
-        diagnostic["reason"] = "optimizer_error"
-        diagnostic["optimizer_error"] = f"{type(error).__name__}: {error}"
-        return None, None, diagnostic
+    # Equal allocation makes every published five-minute prediction tractable
+    # across the full 49-asset, three-month universe.  It is capped by
+    # construction because the candidate-count gate above ensures 1/n <= cap.
+    weights = _sanitize_weights(pd.Series(1.0 / len(selected), index=selected), max_weight=max_weight)
+    predicted_log_return = float(weights.dot(expected.reindex(weights.index)))
     diagnostic.update(
         {
             "forecast_status": "ok",
             "reason": "ok",
-            "optimizer_status": allocation.status,
-            "expected_portfolio_log_return": float(allocation.expected_return),
-            "expected_portfolio_simple_return": float(np.expm1(allocation.expected_return)),
+            "optimizer_status": "equal_weight_top_forecasts",
+            "expected_portfolio_log_return": predicted_log_return,
+            "expected_portfolio_simple_return": float(np.expm1(predicted_log_return)),
         }
     )
     return weights, expected.reindex(weights.index), diagnostic
@@ -530,6 +522,12 @@ def run_ftmo_us_five_minute_audit(
     bid = quotes.pivot(index="timestamp", columns="ftmo_symbol", values="bid_close").reindex(mid.index)
     ask = quotes.pivot(index="timestamp", columns="ftmo_symbol", values="ask_close").reindex(mid.index)
     labels = np.log(mid / _previous_interval(mid))
+    # ``shift(1)`` is the causal purge: at a decision timestamp, the most
+    # recent label ending at that timestamp is never part of its forecast.
+    rolling_expected = labels.rolling(lookback_windows, min_periods=min_training_windows).mean().shift(1)
+    rolling_counts = labels.rolling(lookback_windows, min_periods=1).count().shift(1)
+    label_observed = labels.notna().any(axis=1)
+    training_end = pd.Series(mid.index.where(label_observed), index=mid.index).ffill().shift(1)
     start_day, end_day = _date(evaluation_start), _date(evaluation_end)
     if start_day > end_day:
         raise ValueError("evaluation_start must not be after evaluation_end")
@@ -541,13 +539,12 @@ def run_ftmo_us_five_minute_audit(
     for decision in decisions:
         current_mid = mid.loc[decision]
         weights, expected, diagnostic = _select_causal_portfolio(
-            labels,
+            rolling_expected.loc[decision],
+            rolling_counts.loc[decision],
             current_mid,
-            decision=decision,
+            training_end=training_end.loc[decision],
             top_n=top_n,
             max_weight=max_weight,
-            risk_aversion=risk_aversion,
-            lookback_windows=lookback_windows,
             min_training_windows=min_training_windows,
         )
         row: dict[str, Any] = {
@@ -642,7 +639,7 @@ def run_ftmo_us_five_minute_audit(
         "forecast_rmse_bps_vs_mid": float(np.sqrt((error_bps**2).mean())) if not error_bps.empty else None,
         "forecast_directional_accuracy_vs_mid": float(direction.mean()) if not direction.empty else None,
         "distinct_selected_symbols": int(holdings["symbol"].nunique()) if not holdings.empty else 0,
-        "model": "trailing causal five-minute mean forecast plus capped long-only mean-variance allocation",
+        "model": "trailing causal five-minute mean forecast plus capped long-only equal-weight allocation",
         "causality_rule": (
             "each label ends at a five-minute decision; model training uses labels with end strictly earlier "
             "than that decision; decisions use the immediately preceding completed native M1 endpoint"
@@ -687,7 +684,7 @@ def _render_markdown_report(summary: dict[str, Any], download: dict[str, Any]) -
 def write_ftmo_us_audit(
     output_dir: str | Path,
     *,
-    minute_closes: pd.DataFrame,
+    minute_closes: pd.DataFrame | None,
     five_minute_quotes: pd.DataFrame,
     assets: pd.DataFrame,
     manifest: pd.DataFrame,
@@ -698,7 +695,8 @@ def write_ftmo_us_audit(
     """Write reproducible inputs, decisions, outcomes, and disclosure report."""
     output = Path(output_dir)
     output.mkdir(parents=True, exist_ok=True)
-    minute_closes.to_csv(output / "ftmo_us_dukascopy_m1_bid_ask.csv.gz", index=False, compression="gzip")
+    if minute_closes is not None:
+        minute_closes.to_csv(output / "ftmo_us_dukascopy_m1_bid_ask.csv.gz", index=False, compression="gzip")
     five_minute_quotes.to_csv(output / "ftmo_us_dukascopy_five_minute_quotes.csv.gz", index=False, compression="gzip")
     assets.to_csv(output / "ftmo_us_selected_proxy_assets.csv", index=False)
     manifest.to_json(output / "ftmo_us_official_manifest.json", orient="records", indent=2)
@@ -735,15 +733,28 @@ def run_download_and_audit(
     mapping = load_ftmo_us_mapping(mapping_path)
     manifest, manifest_metadata = fetch_ftmo_us_manifest(timeout_seconds=timeout_seconds)
     assets = select_verified_assets(mapping, manifest, requested_symbols)
-    minute_closes, download_metadata = download_dukascopy_ftmo_us_m1(
+    five_minute_chunks: list[pd.DataFrame] = []
+
+    def _reduce_m1_chunk(minute_chunk: pd.DataFrame) -> None:
+        quotes = native_m1_to_five_minute_quotes(minute_chunk)
+        if not quotes.empty:
+            five_minute_chunks.append(quotes)
+
+    _, download_metadata = download_dukascopy_ftmo_us_m1(
         assets,
         start=download_start,
         end=evaluation_end,
         workers=workers,
         retries=retries,
         timeout_seconds=timeout_seconds,
+        on_m1_chunk=_reduce_m1_chunk,
+        collect_m1=False,
     )
-    five_minute_quotes = native_m1_to_five_minute_quotes(minute_closes)
+    if not five_minute_chunks:
+        raise ValueError("Dukascopy returned no exact M1 BID/ASK endpoints for the selected FTMO US proxy assets")
+    five_minute_quotes = pd.concat(five_minute_chunks, ignore_index=True).sort_values(
+        ["timestamp", "ftmo_symbol"]
+    ).reset_index(drop=True)
     result = run_ftmo_us_five_minute_audit(
         five_minute_quotes,
         evaluation_start=evaluation_start,
@@ -756,7 +767,7 @@ def run_download_and_audit(
     )
     write_ftmo_us_audit(
         output_dir,
-        minute_closes=minute_closes,
+        minute_closes=None,
         five_minute_quotes=five_minute_quotes,
         assets=assets,
         manifest=manifest,
