@@ -15,6 +15,15 @@ on:
         description: Maximum weight per stock
         required: false
         default: "0.10"
+      run_daily_v2_backtest:
+        description: Run the three-month daily V2 backtest instead of generating tomorrow's portfolio
+        required: false
+        type: boolean
+        default: false
+      evaluation_end:
+        description: Last V2 decision date for the backtest (YYYY-MM-DD); optional
+        required: false
+        type: string
   push:
     branches:
       - improve-forward-ml-metrics
@@ -30,6 +39,7 @@ permissions:
 
 jobs:
   generate:
+    if: ${{ inputs.run_daily_v2_backtest != true }}
     runs-on: ubuntu-latest
     timeout-minutes: 45
     env:
@@ -85,3 +95,10 @@ jobs:
           path: artifacts/tomorrow_portfolio_v2
           if-no-files-found: error
           retention-days: 30
+
+  daily-v2-backtest:
+    if: ${{ inputs.run_daily_v2_backtest == true }}
+    uses: ./.github/workflows/three-month-daily-v2-backtest.yml
+    with:
+      evaluation_end: ${{ inputs.evaluation_end }}
+    secrets: inherit
