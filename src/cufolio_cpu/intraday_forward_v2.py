@@ -21,6 +21,7 @@ from .optimize import forecast_mean_variance_weights
 
 NEW_YORK = ZoneInfo("America/New_York")
 INTERVAL_MINUTES = {"1m": 1, "15m": 15}
+MIN_COVARIANCE_SCENARIOS = 5
 FEATURE_COLUMNS = (
     "return_1", "return_2", "return_4", "return_8", "return_13", "return_26",
     "volatility_4", "volatility_13", "volatility_26", "volatility_ratio",
@@ -153,6 +154,67 @@ def _purged_walk_forward(dataset: pd.DataFrame, *, validation_blocks: int = 5) -
     return pd.DataFrame(rows, columns=columns)
 
 
+def _select_covariance_scenarios(
+    history: pd.DataFrame,
+    prediction: pd.Series,
+    *,
+    top_n: int,
+    max_weight: float,
+) -> tuple[pd.DataFrame, pd.Index]:
+    """Keep the highest-ranked cohort with enough shared observed outcomes.
+
+    IEX bars are legitimately sparse for some constituents.  Covariance is
+    therefore estimated only from observed, same-session forward returns; the
+    function never fills missing returns merely to make an optimizer run.
+    """
+    if top_n < 2:
+        raise ValueError("top_n must be at least two")
+    if max_weight <= 0:
+        raise ValueError("max_weight must be positive")
+    if max_weight * top_n < 1 - 1e-12:
+        raise ValueError("top_n and max_weight cannot form a fully invested portfolio")
+
+    ranked = prediction.dropna().sort_values(ascending=False)
+    panel = history.pivot_table(
+        index="session_date",
+        columns="symbol",
+        values="target_excess_return",
+        aggfunc="last",
+    ).sort_index()
+    available_symbols = ranked.index.intersection(panel.columns, sort=False)
+    ranked = ranked.reindex(available_symbols)
+    panel = panel.reindex(columns=ranked.index)
+    availability = panel.notna().to_numpy()
+    minimum_assets = max(2, int(np.ceil((1 - 1e-12) / max_weight)))
+
+    best_symbols: list[str] = []
+    best_mask: np.ndarray | None = None
+    best_score: tuple[int, float] = (0, float("-inf"))
+    for seed_index in range(len(ranked)):
+        shared = availability[:, seed_index].copy()
+        if int(shared.sum()) < MIN_COVARIANCE_SCENARIOS:
+            continue
+        selected_indices = [seed_index]
+        candidate_order = [seed_index, *range(seed_index), *range(seed_index + 1, len(ranked))]
+        for candidate_index in candidate_order[1:]:
+            expanded = shared & availability[:, candidate_index]
+            if int(expanded.sum()) >= MIN_COVARIANCE_SCENARIOS:
+                selected_indices.append(candidate_index)
+                shared = expanded
+                if len(selected_indices) == top_n:
+                    break
+        score = (len(selected_indices), float(ranked.iloc[selected_indices].sum()))
+        if score > best_score:
+            best_score = score
+            best_symbols = ranked.index[selected_indices].tolist()
+            best_mask = shared
+
+    if len(best_symbols) < minimum_assets or best_mask is None:
+        return pd.DataFrame(), pd.Index([], dtype="object")
+    scenarios = panel.loc[best_mask, best_symbols].dropna(axis=0, how="any")
+    return scenarios, pd.Index(best_symbols)
+
+
 def run_forward_research(bars: pd.DataFrame, *, interval: str, horizon_minutes: int = 500, top_n: int = 20, max_weight: float = 0.10, min_sessions: int = 20) -> ForwardModelResult:
     dataset, horizon_bars, effective_minutes = build_forward_dataset(bars, interval=interval, horizon_minutes=horizon_minutes)
     validation = _purged_walk_forward(dataset)
@@ -179,11 +241,16 @@ def run_forward_research(bars: pd.DataFrame, *, interval: str, horizon_minutes: 
         status["reason"] = "insufficient current features or completed labels"
         return ForwardModelResult(validation, pd.DataFrame(columns=["symbol", "target_weight"]), status)
     prediction = pd.Series(_fit_predict(history, current), index=current["symbol"], name="predicted_forward_excess_return")
-    selected = prediction.nlargest(top_n)
-    if len(selected) < 2 or max_weight * len(selected) < 1 - 1e-12:
-        raise ValueError("top_n and max_weight cannot form a fully invested portfolio")
-    scenarios = history.pivot(index="timestamp", columns="symbol", values="target_excess_return").reindex(columns=selected.index)
-    scenarios = scenarios.dropna(axis=0, how="any")
+    scenarios, selected_symbols = _select_covariance_scenarios(
+        history,
+        prediction,
+        top_n=top_n,
+        max_weight=max_weight,
+    )
+    if scenarios.empty:
+        status["reason"] = "insufficient complete forward-return scenarios for a capped covariance portfolio"
+        return ForwardModelResult(validation, pd.DataFrame(columns=["symbol", "target_weight"]), status)
+    selected = prediction.reindex(selected_symbols)
     allocation = forecast_mean_variance_weights(scenarios, selected, risk_aversion=10.0, max_weight=max_weight)
     portfolio = pd.DataFrame({"symbol": allocation.weights.index, "target_weight": allocation.weights.values})
     portfolio["predicted_forward_excess_return"] = portfolio["symbol"].map(prediction)
@@ -191,6 +258,8 @@ def run_forward_research(bars: pd.DataFrame, *, interval: str, horizon_minutes: 
     status.update({
         "model_run": True, "reason": "research_only", "optimizer_status": allocation.status,
         "portfolio_predicted_forward_excess_return": allocation.expected_return,
-        "forward_return_scenarios": int(len(scenarios)), "latest_feature_timestamp": latest_timestamp.isoformat(),
+        "forward_return_scenarios": int(len(scenarios)),
+        "covariance_assets": int(len(selected_symbols)),
+        "latest_feature_timestamp": latest_timestamp.isoformat(),
     })
     return ForwardModelResult(validation, portfolio, status)
