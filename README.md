@@ -255,6 +255,15 @@ swaps, rollover contracts, volume limits, slippage, or account rules. The
 report names all omitted costs and must not be treated as an FTMO return,
 pass-probability, or order recommendation.
 
+The separate **FTMO US three-month H1 H4 D1 proxy audit** Action downloads the
+same M1 BID/ASK proxy data once, then requires each hourly, four-hour, or daily
+decision to have its exact final M1 endpoint. It evaluates three months with a
+90-day warm-up: H1 uses 720/250 trailing/minimum windows, H4 uses 360/100, and
+D1 uses 60/20. Each timeframe receives two reproducible ledgers and reports:
+one portfolio rebalances at every decision; the other selects its first eligible
+causal portfolio and holds that basket unchanged through the final common exact
+endpoint. They are proxy-feed research comparisons, not FTMO execution results.
+
 ### One-hour targets with 15-minute rebalancing
 
 `cufolio_cpu.hourly_intraday_backtest` is a separate, research-only historical

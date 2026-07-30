@@ -45,6 +45,23 @@ DUKASCOPY_HEADERS = {
 M1_CANDLE_STRUCT = struct.Struct("!IIIIIf")
 FIVE_MINUTES = pd.Timedelta(5, unit="min")
 ONE_MINUTE = pd.Timedelta(1, unit="min")
+TIMEFRAME_INTERVALS = {
+    "M5": FIVE_MINUTES,
+    "H1": pd.Timedelta(1, unit="h"),
+    "H4": pd.Timedelta(4, unit="h"),
+    "D1": pd.Timedelta(1, unit="D"),
+}
+TIMEFRAME_FREQUENCIES = {
+    "M5": "5min",
+    "H1": "1h",
+    "H4": "4h",
+    "D1": "1D",
+}
+MULTI_TIMEFRAME_PARAMETERS = {
+    "H1": {"lookback_windows": 720, "min_training_windows": 250},
+    "H4": {"lookback_windows": 360, "min_training_windows": 100},
+    "D1": {"lookback_windows": 60, "min_training_windows": 20},
+}
 MAPPING_COLUMNS = {
     "ftmo_symbol",
     "asset_class",
@@ -89,6 +106,13 @@ def _date(value: str | date | datetime | pd.Timestamp) -> date:
     if isinstance(value, date) and not isinstance(value, datetime):
         return value
     return pd.Timestamp(value).date()
+
+
+def _timeframe(value: str) -> str:
+    timeframe = str(value).upper().strip()
+    if timeframe not in TIMEFRAME_INTERVALS:
+        raise ValueError(f"unsupported timeframe {value!r}; expected one of {sorted(TIMEFRAME_INTERVALS)}")
+    return timeframe
 
 
 def load_ftmo_us_mapping(path: str | Path | None = None) -> pd.DataFrame:
@@ -437,13 +461,16 @@ def download_dukascopy_ftmo_us_m1(
     return merged, metadata
 
 
-def native_m1_to_five_minute_quotes(minute_closes: pd.DataFrame) -> pd.DataFrame:
-    """Retain only five-minute buckets with exact final M1 BID and ASK endpoints.
+def native_m1_to_timeframe_quotes(minute_closes: pd.DataFrame, *, timeframe: str) -> pd.DataFrame:
+    """Retain timeframe buckets with exact final M1 BID and ASK endpoints.
 
     Minute bars are left-labelled.  Thus the close of the 00:04 M1 bar is the
-    first five-minute decision price, timestamped 00:05.  A missing 00:04 bar
-    cannot be quietly replaced by an earlier price.
+    first M5 decision price, timestamped 00:05.  The same rule applies to H1,
+    H4, and D1: missing final M1 endpoints cannot be quietly replaced.
     """
+    normalized_timeframe = _timeframe(timeframe)
+    interval = TIMEFRAME_INTERVALS[normalized_timeframe]
+    frequency = TIMEFRAME_FREQUENCIES[normalized_timeframe]
     required = {"timestamp", "ftmo_symbol", "bid_close", "ask_close"}
     missing = required.difference(minute_closes.columns)
     if missing:
@@ -460,7 +487,7 @@ def native_m1_to_five_minute_quotes(minute_closes: pd.DataFrame) -> pd.DataFrame
     )
     if clean.empty:
         return pd.DataFrame(columns=["timestamp", "ftmo_symbol", "bid_close", "ask_close", "mid_close"])
-    clean["decision_timestamp"] = clean["timestamp"].dt.floor("5min") + FIVE_MINUTES
+    clean["decision_timestamp"] = clean["timestamp"].dt.floor(frequency) + interval
     last = clean.groupby(["ftmo_symbol", "decision_timestamp"], as_index=False).tail(1).copy()
     exact_endpoint = last["timestamp"].eq(last["decision_timestamp"] - ONE_MINUTE)
     quotes = last.loc[exact_endpoint, ["decision_timestamp", "ftmo_symbol", "bid_close", "ask_close"]].rename(
@@ -468,6 +495,11 @@ def native_m1_to_five_minute_quotes(minute_closes: pd.DataFrame) -> pd.DataFrame
     )
     quotes["mid_close"] = (quotes["bid_close"] + quotes["ask_close"]) / 2.0
     return quotes.sort_values(["timestamp", "ftmo_symbol"]).reset_index(drop=True)
+
+
+def native_m1_to_five_minute_quotes(minute_closes: pd.DataFrame) -> pd.DataFrame:
+    """Backward-compatible M5 wrapper for ``native_m1_to_timeframe_quotes``."""
+    return native_m1_to_timeframe_quotes(minute_closes, timeframe="M5")
 
 
 def _sanitize_weights(weights: pd.Series, *, max_weight: float) -> pd.Series:
@@ -493,9 +525,9 @@ def _sanitize_weights(weights: pd.Series, *, max_weight: float) -> pd.Series:
     return clean[clean > 0]
 
 
-def _previous_interval(panel: pd.DataFrame) -> pd.DataFrame:
+def _previous_interval(panel: pd.DataFrame, interval: pd.Timedelta) -> pd.DataFrame:
     previous = panel.copy()
-    previous.index = previous.index + FIVE_MINUTES
+    previous.index = previous.index + interval
     return previous.reindex(panel.index)
 
 
@@ -510,10 +542,11 @@ def _select_causal_portfolio(
     min_training_windows: int,
 ) -> tuple[pd.Series | None, pd.Series | None, dict[str, Any]]:
     required_candidates = int(math.ceil((1.0 - 1e-12) / max_weight))
+    observed_training_windows = training_counts.max() if not training_counts.empty else np.nan
     diagnostic: dict[str, Any] = {
         "forecast_status": "unavailable",
         "reason": "unknown",
-        "training_windows": int(training_counts.max()) if not training_counts.empty else 0,
+        "training_windows": int(observed_training_windows) if pd.notna(observed_training_windows) else 0,
         "training_end": training_end.isoformat() if pd.notna(training_end) else None,
         "required_candidates_for_weight_cap": required_candidates,
         "minimum_training_windows": min_training_windows,
@@ -550,11 +583,12 @@ def _select_causal_portfolio(
     return weights, expected.reindex(weights.index), diagnostic
 
 
-def run_ftmo_us_five_minute_audit(
-    five_minute_quotes: pd.DataFrame,
+def run_ftmo_us_timeframe_audit(
+    timeframe_quotes: pd.DataFrame,
     *,
     evaluation_start: str | date,
     evaluation_end: str | date,
+    timeframe: str = "M5",
     top_n: int = 10,
     max_weight: float = 0.20,
     risk_aversion: float = 10.0,
@@ -562,7 +596,9 @@ def run_ftmo_us_five_minute_audit(
     min_training_windows: int = 250,
     progress_every_decisions: int = 0,
 ) -> FtmoUsAuditResult:
-    """Run a causal, non-overlapping five-minute cross-asset forecast audit."""
+    """Run a causal, non-overlapping cross-asset forecast audit at one timeframe."""
+    normalized_timeframe = _timeframe(timeframe)
+    interval = TIMEFRAME_INTERVALS[normalized_timeframe]
     if not 0 < max_weight <= 1:
         raise ValueError("max_weight must be in (0, 1]")
     if top_n < math.ceil((1.0 - 1e-12) / max_weight):
@@ -572,10 +608,10 @@ def run_ftmo_us_five_minute_audit(
     if progress_every_decisions < 0:
         raise ValueError("progress_every_decisions must be non-negative")
     required = {"timestamp", "ftmo_symbol", "bid_close", "ask_close", "mid_close"}
-    missing = required.difference(five_minute_quotes.columns)
+    missing = required.difference(timeframe_quotes.columns)
     if missing:
         raise ValueError(f"five-minute quotes are missing required columns: {sorted(missing)}")
-    quotes = five_minute_quotes.loc[:, sorted(required)].copy()
+    quotes = timeframe_quotes.loc[:, sorted(required)].copy()
     quotes["timestamp"] = pd.to_datetime(quotes["timestamp"], utc=True, errors="coerce")
     quotes["ftmo_symbol"] = quotes["ftmo_symbol"].astype(str).str.upper().str.strip()
     for column in ("bid_close", "ask_close", "mid_close"):
@@ -588,7 +624,7 @@ def run_ftmo_us_five_minute_audit(
     mid = quotes.pivot(index="timestamp", columns="ftmo_symbol", values="mid_close").sort_index()
     bid = quotes.pivot(index="timestamp", columns="ftmo_symbol", values="bid_close").reindex(mid.index)
     ask = quotes.pivot(index="timestamp", columns="ftmo_symbol", values="ask_close").reindex(mid.index)
-    labels = np.log(mid / _previous_interval(mid))
+    labels = np.log(mid / _previous_interval(mid, interval))
     # ``shift(1)`` is the causal purge: at a decision timestamp, the most
     # recent label ending at that timestamp is never part of its forecast.
     rolling_expected = labels.rolling(lookback_windows, min_periods=min_training_windows).mean().shift(1)
@@ -609,6 +645,7 @@ def run_ftmo_us_five_minute_audit(
     if progress_every_decisions:
         _progress(
             "PREDICTION START",
+            timeframe=normalized_timeframe,
             decisions=len(decisions),
             evaluation_start=start_day.isoformat(),
             evaluation_end=end_day.isoformat(),
@@ -645,7 +682,7 @@ def run_ftmo_us_five_minute_audit(
             "actual_executable_proxy_simple_return": None,
         }
         if weights is not None and expected is not None:
-            target = decision + FIVE_MINUTES
+            target = decision + interval
             target_mid = mid.reindex([target]).iloc[0]
             target_bid = bid.reindex([target]).iloc[0]
             entry_ask = ask.loc[decision]
@@ -715,9 +752,12 @@ def run_ftmo_us_five_minute_audit(
     )
     summary: dict[str, Any] = {
         "research_only": True,
+        "timeframe": normalized_timeframe,
+        "portfolio_mode": "rebalanced_each_decision",
         "evaluation_start": start_day.isoformat(),
         "evaluation_end": end_day.isoformat(),
-        "five_minute_decision_points": int(len(decisions)),
+        "decision_points": int(len(decisions)),
+        "five_minute_decision_points": int(len(decisions)) if normalized_timeframe == "M5" else None,
         "forecast_windows": int(ledger["forecast_status"].eq("ok").sum()) if not ledger.empty else 0,
         "realized_windows": int(len(realized)),
         "exact_bid_ask_realized_coverage": float(len(realized) / max(1, int(ledger["forecast_status"].eq("ok").sum())) if not ledger.empty else 0.0),
@@ -728,9 +768,9 @@ def run_ftmo_us_five_minute_audit(
         "forecast_rmse_bps_vs_mid": float(np.sqrt((error_bps**2).mean())) if not error_bps.empty else None,
         "forecast_directional_accuracy_vs_mid": float(direction.mean()) if not direction.empty else None,
         "distinct_selected_symbols": int(holdings["symbol"].nunique()) if not holdings.empty else 0,
-        "model": "trailing causal five-minute mean forecast plus capped long-only equal-weight allocation",
+        "model": f"trailing causal {normalized_timeframe} mean forecast plus capped long-only equal-weight allocation",
         "causality_rule": (
-            "each label ends at a five-minute decision; model training uses labels with end strictly earlier "
+            f"each label ends at a {normalized_timeframe} decision; model training uses labels with end strictly earlier "
             "than that decision; decisions use the immediately preceding completed native M1 endpoint"
         ),
         "price_basis": "forecast target: proxy mid; executable proxy: enter ASK and exit next BID",
@@ -745,6 +785,170 @@ def run_ftmo_us_five_minute_audit(
     return FtmoUsAuditResult(ledger=ledger, holdings=holdings, summary=summary)
 
 
+def run_ftmo_us_no_rebalance_audit(
+    timeframe_quotes: pd.DataFrame,
+    rebalanced_result: FtmoUsAuditResult,
+    *,
+    evaluation_start: str | date,
+    evaluation_end: str | date,
+    timeframe: str,
+) -> FtmoUsAuditResult:
+    """Hold the first causal portfolio unchanged through the evaluation end.
+
+    This is a buy-and-hold comparison against the same timeframe's repeatedly
+    rebalanced portfolio.  It intentionally makes only one selection, using
+    the first forecast that was eligible under the rebalanced audit's causal
+    training rules.
+    """
+    normalized_timeframe = _timeframe(timeframe)
+    eligible = rebalanced_result.ledger.loc[rebalanced_result.ledger["forecast_status"].eq("ok")].copy()
+    if eligible.empty:
+        raise ValueError(f"{normalized_timeframe} has no causal portfolio eligible for the no-rebalance audit")
+    first = eligible.iloc[0]
+    entry_timestamp = pd.Timestamp(first["decision_timestamp"])
+    selected = rebalanced_result.holdings.loc[
+        rebalanced_result.holdings["decision_timestamp"].eq(first["decision_timestamp"])
+    ].copy()
+    if selected.empty:
+        raise ValueError("first causal portfolio has no holdings")
+    weights = selected.set_index("symbol")["target_weight"].astype(float)
+    quotes = timeframe_quotes.copy()
+    quotes["timestamp"] = pd.to_datetime(quotes["timestamp"], utc=True, errors="coerce")
+    quotes["ftmo_symbol"] = quotes["ftmo_symbol"].astype(str).str.upper().str.strip()
+    for column in ("bid_close", "ask_close", "mid_close"):
+        quotes[column] = pd.to_numeric(quotes[column], errors="coerce")
+    quotes = quotes.dropna(subset=["timestamp", "ftmo_symbol", "bid_close", "ask_close", "mid_close"])
+    quotes = quotes.drop_duplicates(["timestamp", "ftmo_symbol"], keep="last")
+    mid = quotes.pivot(index="timestamp", columns="ftmo_symbol", values="mid_close").sort_index()
+    bid = quotes.pivot(index="timestamp", columns="ftmo_symbol", values="bid_close").reindex(mid.index)
+    ask = quotes.pivot(index="timestamp", columns="ftmo_symbol", values="ask_close").reindex(mid.index)
+    end_exclusive = pd.Timestamp(_date(evaluation_end) + timedelta(days=1), tz="UTC")
+    candidate_times = mid.index[(mid.index > entry_timestamp) & (mid.index <= end_exclusive)]
+    exit_timestamp: pd.Timestamp | None = None
+    for candidate in reversed(candidate_times):
+        if mid.loc[candidate].reindex(weights.index).notna().all() and bid.loc[candidate].reindex(weights.index).notna().all():
+            exit_timestamp = candidate
+            break
+    if exit_timestamp is None:
+        raise ValueError("no common exact BID/mid endpoint is available for the no-rebalance exit")
+    entry_mid = mid.loc[entry_timestamp].reindex(weights.index)
+    entry_ask = ask.loc[entry_timestamp].reindex(weights.index)
+    exit_mid = mid.loc[exit_timestamp].reindex(weights.index)
+    exit_bid = bid.loc[exit_timestamp].reindex(weights.index)
+    if entry_mid.isna().any() or entry_ask.isna().any():
+        raise ValueError("first causal portfolio is missing an exact entry quote")
+    expected = selected.set_index("symbol")["predicted_asset_log_return"].astype(float).reindex(weights.index)
+    mid_returns = np.log(exit_mid / entry_mid)
+    executable_returns = np.log(exit_bid / entry_ask)
+    expected_log = float(weights.dot(expected))
+    mid_log = float(weights.dot(mid_returns))
+    executable_log = float(weights.dot(executable_returns))
+    no_rebalance_holdings = pd.DataFrame(
+        {
+            "decision_timestamp": entry_timestamp.isoformat(),
+            "target_end": exit_timestamp.isoformat(),
+            "symbol": weights.index,
+            "target_weight": weights.to_numpy(),
+            "predicted_asset_log_return": expected.to_numpy(),
+            "entry_mid_close": entry_mid.to_numpy(),
+            "entry_ask_close": entry_ask.to_numpy(),
+            "target_mid_close": exit_mid.to_numpy(),
+            "target_bid_close": exit_bid.to_numpy(),
+            "realized_mid_asset_log_return": mid_returns.to_numpy(),
+            "realized_executable_proxy_asset_log_return": executable_returns.to_numpy(),
+        }
+    )
+    ledger = pd.DataFrame(
+        [
+            {
+                "decision_timestamp": entry_timestamp.isoformat(),
+                "decision_price_timestamp": (entry_timestamp - ONE_MINUTE).isoformat(),
+                "target_end": exit_timestamp.isoformat(),
+                "forecast_status": "ok",
+                "reason": "first_causal_portfolio_held_without_rebalancing",
+                "training_windows": int(first["training_windows"]),
+                "training_end": first["training_end"],
+                "eligible_assets": int(first["eligible_assets"]),
+                "candidate_count": int(first["candidate_count"]),
+                "holding_count": int(len(weights)),
+                "predicted_portfolio_log_return": expected_log,
+                "predicted_portfolio_simple_return": float(np.expm1(expected_log)),
+                "realized_status": "ok",
+                "actual_mid_portfolio_log_return": mid_log,
+                "actual_mid_portfolio_simple_return": float(np.expm1(mid_log)),
+                "actual_executable_proxy_log_return": executable_log,
+                "actual_executable_proxy_simple_return": float(np.expm1(executable_log)),
+            }
+        ]
+    )
+    summary: dict[str, Any] = {
+        "research_only": True,
+        "timeframe": normalized_timeframe,
+        "portfolio_mode": "no_rebalance_buy_and_hold",
+        "evaluation_start": _date(evaluation_start).isoformat(),
+        "evaluation_end": _date(evaluation_end).isoformat(),
+        "hold_entry_timestamp": entry_timestamp.isoformat(),
+        "hold_exit_timestamp": exit_timestamp.isoformat(),
+        "decision_points": 1,
+        "five_minute_decision_points": 1 if normalized_timeframe == "M5" else None,
+        "forecast_windows": 1,
+        "realized_windows": 1,
+        "exact_bid_ask_realized_coverage": 1.0,
+        # The forecast only covers the first interval.  It selected the static
+        # basket, but it is not a three-month expected return and must not be
+        # compared to the full holding-period outcome below.
+        "matched_compounded_expected_return": None,
+        "initial_selection_expected_one_interval_return": float(np.expm1(expected_log)),
+        "matched_compounded_mid_return": float(np.expm1(mid_log)),
+        "matched_compounded_executable_proxy_return": float(np.expm1(executable_log)),
+        "forecast_mae_bps_vs_mid": None,
+        "forecast_rmse_bps_vs_mid": None,
+        "forecast_directional_accuracy_vs_mid": None,
+        "distinct_selected_symbols": int(len(weights)),
+        "model": f"first causal {normalized_timeframe} forecast held without rebalancing",
+        "causality_rule": (
+            f"the first eligible {normalized_timeframe} portfolio is selected using only labels ending before its entry "
+            "and is held unchanged to the last common exact endpoint at or before evaluation end"
+        ),
+        "price_basis": "forecast target: proxy mid; executable proxy: enter ASK and exit BID at the static hold exit",
+        "costs_included": "Dukascopy proxy BID/ASK spread only",
+        "costs_excluded": "FTMO commissions, swaps, contract rolls, slippage, market impact, and all account-rule effects",
+        "ftmo_execution_claim": False,
+        "feed_caveat": (
+            "Dukascopy is not FTMO US. Results are a proxy-feed research audit and cannot be represented as "
+            "FTMO US fills, returns, or a pass/fail expectation."
+        ),
+    }
+    return FtmoUsAuditResult(ledger=ledger, holdings=no_rebalance_holdings, summary=summary)
+
+
+def run_ftmo_us_five_minute_audit(
+    five_minute_quotes: pd.DataFrame,
+    *,
+    evaluation_start: str | date,
+    evaluation_end: str | date,
+    top_n: int = 10,
+    max_weight: float = 0.20,
+    risk_aversion: float = 10.0,
+    lookback_windows: int = 720,
+    min_training_windows: int = 250,
+    progress_every_decisions: int = 0,
+) -> FtmoUsAuditResult:
+    """Backward-compatible M5 wrapper for ``run_ftmo_us_timeframe_audit``."""
+    return run_ftmo_us_timeframe_audit(
+        five_minute_quotes,
+        evaluation_start=evaluation_start,
+        evaluation_end=evaluation_end,
+        timeframe="M5",
+        top_n=top_n,
+        max_weight=max_weight,
+        risk_aversion=risk_aversion,
+        lookback_windows=lookback_windows,
+        min_training_windows=min_training_windows,
+        progress_every_decisions=progress_every_decisions,
+    )
+
+
 def _pct(value: object) -> str:
     return "n/a" if value is None or pd.isna(value) else f"{float(value):+.4%}"
 
@@ -754,13 +958,14 @@ def _bps(value: object) -> str:
 
 
 def _render_markdown_report(summary: dict[str, Any], download: dict[str, Any]) -> str:
+    portfolio_mode = str(summary.get("portfolio_mode", "unspecified")).replace("_", " ")
     return "\n".join(
         [
-            "## FTMO US proxy-feed causal five-minute audit",
+            f"## FTMO US proxy-feed causal {summary['timeframe']} audit ({portfolio_mode})",
             "",
             f"- FTMO US assets verified at run time: {download.get('verified_ftmo_us_assets', 'n/a')}; mapped assets requested: {download['assets_requested']:,}.",
             f"- Proxy data: {download['m1_bid_ask_rows']:,} native Dukascopy M1 BID/ASK rows across {download['symbols_with_bid_ask_data']:,} symbols.",
-            f"- Evaluation: {summary['evaluation_start']} through {summary['evaluation_end']}; decisions: {summary['five_minute_decision_points']:,}.",
+            f"- Evaluation: {summary['evaluation_start']} through {summary['evaluation_end']}; decisions: {summary['decision_points']:,}.",
             f"- Forecasts / exact proxy outcomes: {summary['forecast_windows']:,} / {summary['realized_windows']:,} ({_pct(summary['exact_bid_ask_realized_coverage'])}).",
             f"- Matched compounded expected / mid realized / executable-proxy realized: {_pct(summary['matched_compounded_expected_return'])} / {_pct(summary['matched_compounded_mid_return'])} / {_pct(summary['matched_compounded_executable_proxy_return'])}.",
             f"- Forecast MAE / RMSE / direction accuracy versus proxy mid: {_bps(summary['forecast_mae_bps_vs_mid'])} / {_bps(summary['forecast_rmse_bps_vs_mid'])} / {_pct(summary['forecast_directional_accuracy_vs_mid'])}.",
@@ -819,8 +1024,10 @@ def run_download_and_audit(
     min_training_windows: int = 250,
     progress_every_files: int = 25,
     progress_every_decisions: int = 250,
+    timeframe: str = "M5",
 ) -> FtmoUsAuditResult:
-    """Verify the FTMO US universe, download proxy quotes, and audit predictions."""
+    """Verify the FTMO US universe, download proxy quotes, and audit one timeframe."""
+    normalized_timeframe = _timeframe(timeframe)
     mapping = load_ftmo_us_mapping(mapping_path)
     manifest, manifest_metadata = fetch_ftmo_us_manifest(timeout_seconds=timeout_seconds)
     assets = select_verified_assets(mapping, manifest, requested_symbols)
@@ -834,7 +1041,7 @@ def run_download_and_audit(
     five_minute_chunks: list[pd.DataFrame] = []
 
     def _reduce_m1_chunk(minute_chunk: pd.DataFrame) -> None:
-        quotes = native_m1_to_five_minute_quotes(minute_chunk)
+        quotes = native_m1_to_timeframe_quotes(minute_chunk, timeframe=normalized_timeframe)
         if not quotes.empty:
             five_minute_chunks.append(quotes)
 
@@ -854,10 +1061,11 @@ def run_download_and_audit(
     five_minute_quotes = pd.concat(five_minute_chunks, ignore_index=True).sort_values(
         ["timestamp", "ftmo_symbol"]
     ).reset_index(drop=True)
-    result = run_ftmo_us_five_minute_audit(
+    result = run_ftmo_us_timeframe_audit(
         five_minute_quotes,
         evaluation_start=evaluation_start,
         evaluation_end=evaluation_end,
+        timeframe=normalized_timeframe,
         top_n=top_n,
         max_weight=max_weight,
         risk_aversion=risk_aversion,
@@ -884,26 +1092,147 @@ def run_download_and_audit(
     return result
 
 
+def run_download_and_multi_timeframe_audit(
+    *,
+    output_dir: str | Path,
+    download_start: str | date,
+    evaluation_start: str | date,
+    evaluation_end: str | date,
+    requested_symbols: str = "all",
+    mapping_path: str | Path | None = None,
+    workers: int = 8,
+    retries: int = 3,
+    timeout_seconds: int = 30,
+    top_n: int = 10,
+    max_weight: float = 0.20,
+    risk_aversion: float = 10.0,
+    progress_every_files: int = 25,
+    progress_every_decisions: int = 250,
+) -> dict[str, FtmoUsAuditResult]:
+    """Download M1 proxy data once, then audit H1, H4, and D1 causally."""
+    mapping = load_ftmo_us_mapping(mapping_path)
+    manifest, manifest_metadata = fetch_ftmo_us_manifest(timeout_seconds=timeout_seconds)
+    assets = select_verified_assets(mapping, manifest, requested_symbols)
+    _progress(
+        "MULTI-TIMEFRAME UNIVERSE VERIFIED",
+        active_ftmo_us_assets=len(manifest),
+        mapped_assets=len(assets),
+        download_start=_date(download_start).isoformat(),
+        evaluation_end=_date(evaluation_end).isoformat(),
+        timeframes=",".join(MULTI_TIMEFRAME_PARAMETERS),
+    )
+    quote_chunks: dict[str, list[pd.DataFrame]] = {timeframe: [] for timeframe in MULTI_TIMEFRAME_PARAMETERS}
+
+    def _reduce_m1_chunk(minute_chunk: pd.DataFrame) -> None:
+        for timeframe, chunks in quote_chunks.items():
+            quotes = native_m1_to_timeframe_quotes(minute_chunk, timeframe=timeframe)
+            if not quotes.empty:
+                chunks.append(quotes)
+
+    _, download_metadata = download_dukascopy_ftmo_us_m1(
+        assets,
+        start=download_start,
+        end=evaluation_end,
+        workers=workers,
+        retries=retries,
+        timeout_seconds=timeout_seconds,
+        on_m1_chunk=_reduce_m1_chunk,
+        collect_m1=False,
+        progress_every_files=progress_every_files,
+    )
+    results: dict[str, FtmoUsAuditResult] = {}
+    root = Path(output_dir)
+    for timeframe, parameters in MULTI_TIMEFRAME_PARAMETERS.items():
+        if not quote_chunks[timeframe]:
+            raise ValueError(f"Dukascopy returned no exact M1 endpoints for {timeframe}")
+        quotes = pd.concat(quote_chunks[timeframe], ignore_index=True).sort_values(
+            ["timestamp", "ftmo_symbol"]
+        ).reset_index(drop=True)
+        _progress("TIMEFRAME AUDIT START", timeframe=timeframe, quote_rows=len(quotes))
+        result = run_ftmo_us_timeframe_audit(
+            quotes,
+            evaluation_start=evaluation_start,
+            evaluation_end=evaluation_end,
+            timeframe=timeframe,
+            top_n=top_n,
+            max_weight=max_weight,
+            risk_aversion=risk_aversion,
+            progress_every_decisions=progress_every_decisions,
+            **parameters,
+        )
+        write_ftmo_us_audit(
+            root / timeframe.lower() / "rebalanced",
+            minute_closes=None,
+            five_minute_quotes=quotes,
+            assets=assets,
+            manifest=manifest,
+            manifest_metadata=manifest_metadata,
+            download_metadata=download_metadata,
+            result=result,
+        )
+        _progress(
+            "TIMEFRAME AUDIT COMPLETE",
+            timeframe=timeframe,
+            forecasts=result.summary["forecast_windows"],
+            realized=result.summary["realized_windows"],
+            executable_proxy_return=_pct(result.summary["matched_compounded_executable_proxy_return"]),
+        )
+        no_rebalance = run_ftmo_us_no_rebalance_audit(
+            quotes,
+            result,
+            evaluation_start=evaluation_start,
+            evaluation_end=evaluation_end,
+            timeframe=timeframe,
+        )
+        write_ftmo_us_audit(
+            root / timeframe.lower() / "no_rebalance",
+            minute_closes=None,
+            five_minute_quotes=quotes,
+            assets=assets,
+            manifest=manifest,
+            manifest_metadata=manifest_metadata,
+            download_metadata=download_metadata,
+            result=no_rebalance,
+        )
+        _progress(
+            "NO-REBALANCE AUDIT COMPLETE",
+            timeframe=timeframe,
+            entry=no_rebalance.summary["hold_entry_timestamp"],
+            exit=no_rebalance.summary["hold_exit_timestamp"],
+            executable_proxy_return=_pct(no_rebalance.summary["matched_compounded_executable_proxy_return"]),
+        )
+        results[f"{timeframe}_rebalanced"] = result
+        results[f"{timeframe}_no_rebalance"] = no_rebalance
+    return results
+
+
 def _parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Run a causal FTMO US proxy-feed five-minute research audit.")
+    parser = argparse.ArgumentParser(description="Run causal FTMO US proxy-feed research audits.")
     subparsers = parser.add_subparsers(dest="command", required=True)
     run = subparsers.add_parser("run", help="verify FTMO US assets, download Dukascopy proxy candles, and audit")
-    run.add_argument("--output-dir", required=True)
-    run.add_argument("--download-start", required=True, help="inclusive UTC date YYYY-MM-DD for model warm-up")
-    run.add_argument("--evaluation-start", required=True, help="inclusive UTC date YYYY-MM-DD")
-    run.add_argument("--evaluation-end", required=True, help="inclusive UTC date YYYY-MM-DD")
-    run.add_argument("--symbols", default="all", help="all or comma-separated active FTMO US .sim symbols")
-    run.add_argument("--mapping", default=str(_default_mapping_path()))
-    run.add_argument("--workers", type=int, default=8)
-    run.add_argument("--retries", type=int, default=3)
-    run.add_argument("--timeout-seconds", type=int, default=30)
-    run.add_argument("--top-n", type=int, default=10)
-    run.add_argument("--max-weight", type=float, default=0.20)
-    run.add_argument("--risk-aversion", type=float, default=10.0)
+    multi = subparsers.add_parser("multi", help="download once and audit H1, H4, and D1")
+
+    def add_shared_arguments(command: argparse.ArgumentParser) -> None:
+        command.add_argument("--output-dir", required=True)
+        command.add_argument("--download-start", required=True, help="inclusive UTC date YYYY-MM-DD for model warm-up")
+        command.add_argument("--evaluation-start", required=True, help="inclusive UTC date YYYY-MM-DD")
+        command.add_argument("--evaluation-end", required=True, help="inclusive UTC date YYYY-MM-DD")
+        command.add_argument("--symbols", default="all", help="all or comma-separated active FTMO US .sim symbols")
+        command.add_argument("--mapping", default=str(_default_mapping_path()))
+        command.add_argument("--workers", type=int, default=8)
+        command.add_argument("--retries", type=int, default=3)
+        command.add_argument("--timeout-seconds", type=int, default=30)
+        command.add_argument("--top-n", type=int, default=10)
+        command.add_argument("--max-weight", type=float, default=0.20)
+        command.add_argument("--risk-aversion", type=float, default=10.0)
+        command.add_argument("--progress-every-files", type=int, default=25)
+        command.add_argument("--progress-every-decisions", type=int, default=250)
+
+    add_shared_arguments(run)
+    run.add_argument("--timeframe", default="M5", choices=sorted(TIMEFRAME_INTERVALS))
     run.add_argument("--lookback-windows", type=int, default=720)
     run.add_argument("--min-training-windows", type=int, default=250)
-    run.add_argument("--progress-every-files", type=int, default=25)
-    run.add_argument("--progress-every-decisions", type=int, default=250)
+    add_shared_arguments(multi)
     return parser.parse_args()
 
 
@@ -927,10 +1256,35 @@ def main() -> None:
             min_training_windows=args.min_training_windows,
             progress_every_files=args.progress_every_files,
             progress_every_decisions=args.progress_every_decisions,
+            timeframe=args.timeframe,
         )
         print(
             "FTMO US PROXY AUDIT COMPLETE | "
             f"forecasts={result.summary['forecast_windows']} realized={result.summary['realized_windows']}"
+        )
+    if args.command == "multi":
+        results = run_download_and_multi_timeframe_audit(
+            output_dir=args.output_dir,
+            download_start=args.download_start,
+            evaluation_start=args.evaluation_start,
+            evaluation_end=args.evaluation_end,
+            requested_symbols=args.symbols,
+            mapping_path=args.mapping,
+            workers=args.workers,
+            retries=args.retries,
+            timeout_seconds=args.timeout_seconds,
+            top_n=args.top_n,
+            max_weight=args.max_weight,
+            risk_aversion=args.risk_aversion,
+            progress_every_files=args.progress_every_files,
+            progress_every_decisions=args.progress_every_decisions,
+        )
+        print(
+            "FTMO US MULTI-TIMEFRAME PROXY AUDIT COMPLETE | "
+            + " | ".join(
+                f"{timeframe}: forecasts={result.summary['forecast_windows']} realized={result.summary['realized_windows']}"
+                for timeframe, result in results.items()
+            )
         )
 
 
