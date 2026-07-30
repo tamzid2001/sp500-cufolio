@@ -17,7 +17,10 @@ from sklearn.linear_model import Ridge
 from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
 
-from .optimize import forecast_mean_variance_weights
+from .optimize import (
+    forecast_diagonal_mean_variance_weights,
+    forecast_mean_variance_weights,
+)
 
 NEW_YORK = ZoneInfo("America/New_York")
 INTERVAL_MINUTES = {"1m": 1, "15m": 15}
@@ -215,6 +218,25 @@ def _select_covariance_scenarios(
     return scenarios, pd.Index(best_symbols)
 
 
+def _select_diagonal_covariance_assets(
+    history: pd.DataFrame,
+    prediction: pd.Series,
+    *,
+    top_n: int,
+    max_weight: float,
+) -> tuple[pd.Series, pd.Series, int]:
+    """Select forecast leaders with enough individual observed returns."""
+    minimum_assets = max(2, int(np.ceil((1 - 1e-12) / max_weight)))
+    summary = history.groupby("symbol")["target_excess_return"].agg(["count", "var"])
+    eligible = summary[(summary["count"] >= MIN_COVARIANCE_SCENARIOS) & summary["var"].notna()]
+    selected = prediction.dropna().reindex(prediction.dropna().index.intersection(eligible.index, sort=False))
+    selected = selected.nlargest(top_n)
+    if len(selected) < minimum_assets:
+        return pd.Series(dtype=float), pd.Series(dtype=float), 0
+    variances = eligible.loc[selected.index, "var"].clip(lower=0.0)
+    return selected, variances, int(eligible.loc[selected.index, "count"].min())
+
+
 def run_forward_research(bars: pd.DataFrame, *, interval: str, horizon_minutes: int = 500, top_n: int = 20, max_weight: float = 0.10, min_sessions: int = 20) -> ForwardModelResult:
     dataset, horizon_bars, effective_minutes = build_forward_dataset(bars, interval=interval, horizon_minutes=horizon_minutes)
     validation = _purged_walk_forward(dataset)
@@ -247,19 +269,38 @@ def run_forward_research(bars: pd.DataFrame, *, interval: str, horizon_minutes: 
         top_n=top_n,
         max_weight=max_weight,
     )
+    covariance_estimator = "complete_case_forward_returns"
     if scenarios.empty:
-        status["reason"] = "insufficient complete forward-return scenarios for a capped covariance portfolio"
-        return ForwardModelResult(validation, pd.DataFrame(columns=["symbol", "target_weight"]), status)
-    selected = prediction.reindex(selected_symbols)
-    allocation = forecast_mean_variance_weights(scenarios, selected, risk_aversion=10.0, max_weight=max_weight)
+        selected, variances, minimum_asset_scenarios = _select_diagonal_covariance_assets(
+            history,
+            prediction,
+            top_n=top_n,
+            max_weight=max_weight,
+        )
+        if selected.empty:
+            status["reason"] = "insufficient observed forward-return scenarios for a capped covariance portfolio"
+            return ForwardModelResult(validation, pd.DataFrame(columns=["symbol", "target_weight"]), status)
+        allocation = forecast_diagonal_mean_variance_weights(
+            selected,
+            variances,
+            risk_aversion=10.0,
+            max_weight=max_weight,
+        )
+        covariance_estimator = "diagonal_unpaired_forward_returns"
+        forward_return_scenarios = minimum_asset_scenarios
+    else:
+        selected = prediction.reindex(selected_symbols)
+        allocation = forecast_mean_variance_weights(scenarios, selected, risk_aversion=10.0, max_weight=max_weight)
+        forward_return_scenarios = int(len(scenarios))
     portfolio = pd.DataFrame({"symbol": allocation.weights.index, "target_weight": allocation.weights.values})
     portfolio["predicted_forward_excess_return"] = portfolio["symbol"].map(prediction)
     portfolio = portfolio.sort_values("target_weight", ascending=False).reset_index(drop=True)
     status.update({
         "model_run": True, "reason": "research_only", "optimizer_status": allocation.status,
         "portfolio_predicted_forward_excess_return": allocation.expected_return,
-        "forward_return_scenarios": int(len(scenarios)),
-        "covariance_assets": int(len(selected_symbols)),
+        "forward_return_scenarios": forward_return_scenarios,
+        "covariance_assets": int(len(selected)),
+        "covariance_estimator": covariance_estimator,
         "latest_feature_timestamp": latest_timestamp.isoformat(),
     })
     return ForwardModelResult(validation, portfolio, status)

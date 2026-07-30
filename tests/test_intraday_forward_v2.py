@@ -3,6 +3,7 @@ import pandas as pd
 import pytest
 
 from cufolio_cpu.intraday_forward_v2 import (
+    _select_diagonal_covariance_assets,
     _select_covariance_scenarios,
     build_forward_dataset,
     run_forward_research,
@@ -88,3 +89,24 @@ def test_v2_uses_a_ranked_cohort_with_complete_covariance_scenarios() -> None:
 
     assert selected.tolist() == viable
     assert scenarios.shape == (6, 10)
+
+
+def test_v2_uses_individual_return_histories_when_no_complete_cohort_exists() -> None:
+    sessions = pd.date_range("2026-01-02", periods=6, freq="B")
+    symbols = [f"SPARSE{number:02d}" for number in range(10)]
+    history = pd.DataFrame(
+        {
+            "session_date": [session for _ in symbols for session in sessions],
+            "symbol": [symbol for symbol in symbols for _ in sessions],
+            "target_excess_return": [0.001 * (number + 1) for number in range(60)],
+        }
+    )
+    prediction = pd.Series(range(10, 0, -1), index=symbols, dtype=float)
+
+    selected, variances, minimum_observations = _select_diagonal_covariance_assets(
+        history, prediction, top_n=10, max_weight=0.10
+    )
+
+    assert selected.index.tolist() == symbols
+    assert variances.index.tolist() == symbols
+    assert minimum_observations == 6

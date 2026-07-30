@@ -166,6 +166,51 @@ def forecast_mean_variance_weights(
     )
 
 
+def forecast_diagonal_mean_variance_weights(
+    expected_returns: pd.Series,
+    variances: pd.Series,
+    *,
+    risk_aversion: float = 10.0,
+    max_weight: float = 0.10,
+) -> OptimizationResult:
+    """Allocate from forecasts when cross-asset return histories do not overlap.
+
+    The covariance matrix is diagonal by design. This is for sparse panels in
+    which each asset has observed forward returns but too few shared timestamps
+    to estimate cross-asset covariance without imputing missing returns.
+    """
+    forecast = expected_returns.astype(float)
+    diagonal = variances.reindex(forecast.index).astype(float)
+    if len(forecast) < 2:
+        raise ValueError("at least two assets are required")
+    if forecast.isna().any() or diagonal.isna().any():
+        raise ValueError("forecasts and variances must cover every selected asset")
+    if not np.isfinite(forecast.to_numpy()).all() or not np.isfinite(diagonal.to_numpy()).all():
+        raise ValueError("forecasts and variances must be finite")
+    if (diagonal < 0).any():
+        raise ValueError("variances must be non-negative")
+    if max_weight * len(forecast) < 1 - 1e-12:
+        raise ValueError("max_weight is too small to construct a fully invested portfolio")
+
+    values = forecast.to_numpy()
+    covariance = np.diag(np.maximum(diagonal.to_numpy(), 1e-12))
+    weights = cp.Variable(len(forecast))
+    problem = cp.Problem(
+        cp.Maximize(values @ weights - risk_aversion * cp.quad_form(weights, cp.psd_wrap(covariance))),
+        [cp.sum(weights) == 1, weights >= 0, weights <= max_weight],
+    )
+    problem.solve(solver=cp.CLARABEL)
+    if problem.status not in {cp.OPTIMAL, cp.OPTIMAL_INACCURATE} or weights.value is None:
+        raise RuntimeError(f"forecast diagonal Mean–variance solve failed with status {problem.status}")
+    vector = np.asarray(weights.value).ravel()
+    return OptimizationResult(
+        weights=pd.Series(vector, index=forecast.index),
+        expected_return=float(values @ vector),
+        cvar=None,
+        status=str(problem.status),
+    )
+
+
 def efficient_frontier(
     returns: pd.DataFrame, risk_aversions: list[float], max_weight: float = 0.25
 ) -> pd.DataFrame:
