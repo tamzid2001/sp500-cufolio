@@ -233,6 +233,28 @@ an order instruction.
 The resulting target weights are research output only—not investment advice,
 account-specific share quantities, or order instructions.
 
+### FTMO US simulated assets: three-month 5-minute proxy audit
+
+The manual **FTMO US three-month causal five-minute proxy audit** Action
+verifies the active FTMO US simulated-asset manifest at run time, then covers
+every mapped asset: the 42 FX pairs plus US500, US30, US100, gold, silver, WTI
+oil, and BTCUSD. The reviewed mapping is in
+`assets/ftmo_us_dukascopy_mapping.csv` and uses native Dukascopy one-minute
+BID/ASK candles, reduced only when the exact final M1 endpoint exists.
+
+It fits a new capped long-only mean-variance forecast every five minutes with
+labels that end strictly before its decision. Forecast accuracy is measured
+against proxy mid returns; the separate executable-proxy series enters at a
+Dukascopy ASK endpoint and exits at the next BID endpoint. The workflow uploads
+the source quotes, official manifest snapshot, selected-symbol mapping,
+prediction ledger, holdings, JSON metrics, and its Markdown audit report.
+
+This is intentionally not an FTMO execution backtest. FTMO US is a simulated
+environment, and Dukascopy does not reproduce its quotes, fills, commissions,
+swaps, rollover contracts, volume limits, slippage, or account rules. The
+report names all omitted costs and must not be treated as an FTMO return,
+pass-probability, or order recommendation.
+
 ### One-hour targets with 15-minute rebalancing
 
 `cufolio_cpu.hourly_intraday_backtest` is a separate, research-only historical

@@ -1,0 +1,104 @@
+name: FTMO US three-month causal five-minute proxy audit
+
+on:
+  push:
+    branches:
+      - agent/full-universe-live-runner
+    paths:
+      - ".github/workflows/ftmo-us-three-month-five-minute-audit.yml"
+  workflow_dispatch:
+    inputs:
+      evaluation_end:
+        description: "Last completed UTC date to audit (YYYY-MM-DD); blank uses yesterday UTC."
+        required: false
+        type: string
+        default: ""
+      symbols:
+        description: "all, or comma-separated active FTMO US .sim symbols"
+        required: false
+        type: string
+        default: "all"
+      workers:
+        description: "Concurrent public Dukascopy requests (1-24; 8 is the rate-conscious default)"
+        required: false
+        type: string
+        default: "8"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ftmo-us-three-month-five-minute-proxy-audit
+  cancel-in-progress: false
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    env:
+      PYTHONPATH: ${{ github.workspace }}/src
+      REQUESTED_EVALUATION_END: ${{ github.event.inputs.evaluation_end || '' }}
+      REQUESTED_SYMBOLS: ${{ github.event.inputs.symbols || 'all' }}
+      DOWNLOAD_WORKERS: ${{ github.event.inputs.workers || '8' }}
+      OUTPUT_DIR: artifacts/ftmo_us_three_month_five_minute
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install audit dependencies
+        run: pip install -r requirements.txt
+
+      - name: Verify causal proxy-audit implementation
+        run: pytest -q tests/test_ftmo_us_five_minute_audit.py tests/test_optimization.py
+
+      - name: Resolve the exact three-month evaluation and warm-up dates
+        run: |
+          python - <<'PY' >> "$GITHUB_ENV"
+          import os
+          import pandas as pd
+
+          requested = os.environ.get("REQUESTED_EVALUATION_END", "").strip()
+          from datetime import timedelta
+
+          evaluation_end = pd.Timestamp(requested).date() if requested else (pd.Timestamp.now(tz="UTC").date() - timedelta(days=1))
+          evaluation_start = (pd.Timestamp(evaluation_end) - pd.DateOffset(months=3)).date()
+          # 30 calendar days yields substantially more than the 720 requested
+          # M5 training windows even when weekends and market closures remove
+          # some cross-asset endpoints.
+          download_start = evaluation_start - timedelta(days=30)
+          print(f"EVALUATION_START={evaluation_start.isoformat()}")
+          print(f"EVALUATION_END={evaluation_end.isoformat()}")
+          print(f"DOWNLOAD_START={download_start.isoformat()}")
+          PY
+
+      - name: Verify active FTMO US assets, download native proxy candles, and audit every five-minute prediction
+        run: |
+          set -euo pipefail
+          python -m cufolio_cpu.ftmo_us_five_minute_audit run \
+            --output-dir "$OUTPUT_DIR" \
+            --download-start "$DOWNLOAD_START" \
+            --evaluation-start "$EVALUATION_START" \
+            --evaluation-end "$EVALUATION_END" \
+            --symbols "$REQUESTED_SYMBOLS" \
+            --workers "$DOWNLOAD_WORKERS" \
+            --retries 3 \
+            --timeout-seconds 30 \
+            --top-n 10 \
+            --max-weight 0.20 \
+            --lookback-windows 720 \
+            --min-training-windows 250
+
+      - name: Publish audited result and limitations
+        run: cat "$OUTPUT_DIR/ftmo_us_five_minute_audit_report.md" >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ftmo-us-three-month-five-minute-proxy-audit-${{ github.run_id }}
+          path: artifacts/ftmo_us_three_month_five_minute/
+          if-no-files-found: warn
+          retention-days: 30
