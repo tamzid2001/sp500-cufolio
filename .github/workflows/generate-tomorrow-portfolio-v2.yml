@@ -27,7 +27,7 @@ permissions:
   contents: read
 
 env:
-  FORCE_JULY_30_RUN: "1"
+  FORCE_JULY_30_RUN: "2"
 
 jobs:
   generate:
@@ -45,11 +45,13 @@ jobs:
           python-version: "3.12"
           cache: pip
 
-      - name: Install project
-        run: pip install -e .
+      - name: Install project and test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e . pytest
 
       - name: Run unit tests
-        run: pytest -q
+        run: python -m pytest -q
 
       - name: Generate research portfolio from Alpaca IEX data
         run: |
