@@ -22,12 +22,11 @@ on:
       - "src/cufolio_cpu/intraday_forward_v2.py"
       - "scripts/generate_tomorrow_portfolio_v2.py"
       - ".github/workflows/generate-tomorrow-portfolio-v2.yml"
+      - "requirements.txt"
+      - "pyproject.toml"
 
 permissions:
   contents: read
-
-env:
-  FORCE_JULY_30_RUN: "2"
 
 jobs:
   generate:
@@ -44,11 +43,25 @@ jobs:
         with:
           python-version: "3.12"
           cache: pip
+          cache-dependency-path: requirements.txt
 
-      - name: Install project and test dependencies
+      - name: Install project and dependencies
         run: |
           python -m pip install --upgrade pip
-          python -m pip install -e . pytest
+          python -m pip install -r requirements.txt
+          python -m pip install -e . --no-deps
+
+      - name: Verify core imports
+        run: |
+          python - <<'PY'
+          import alpaca
+          import cvxpy
+          import numpy
+          import pandas
+          import scipy
+          import sklearn
+          print("Core imports succeeded")
+          PY
 
       - name: Run unit tests
         run: python -m pytest -q
