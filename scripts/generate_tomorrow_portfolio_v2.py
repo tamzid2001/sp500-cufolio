@@ -15,7 +15,9 @@ from cufolio_cpu.universe import current_sp500_universe
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--output-dir", default="artifacts/tomorrow_portfolio_v2")
-    parser.add_argument("--lookback-calendar-days", type=int, default=90)
+    # A 120-day window leaves enough labelled sessions for purged validation
+    # even after market holidays and the two-session forward-return horizon.
+    parser.add_argument("--lookback-calendar-days", type=int, default=120)
     parser.add_argument("--horizon-minutes", type=int, default=500)
     parser.add_argument("--top-n", type=int, default=20)
     parser.add_argument("--max-weight", type=float, default=0.10)

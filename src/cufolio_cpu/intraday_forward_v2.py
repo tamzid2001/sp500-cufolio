@@ -120,7 +120,7 @@ def _fit_predict(train: pd.DataFrame, test: pd.DataFrame) -> np.ndarray:
     return 0.5 * linear.predict(test.loc[:, FEATURE_COLUMNS]) + 0.5 * nonlinear.predict(test.loc[:, FEATURE_COLUMNS])
 
 
-def _purged_walk_forward(dataset: pd.DataFrame, *, validation_blocks: int = 6) -> pd.DataFrame:
+def _purged_walk_forward(dataset: pd.DataFrame, *, validation_blocks: int = 5) -> pd.DataFrame:
     timestamps = pd.DatetimeIndex(sorted(dataset["timestamp"].unique()))
     columns = ["fold", "train_rows", "test_rows", "test_start", "test_end", "mse", "spearman_ic", "directional_accuracy", "top_bottom_spread"]
     if len(timestamps) < validation_blocks * 10:

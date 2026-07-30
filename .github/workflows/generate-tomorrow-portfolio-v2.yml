@@ -6,7 +6,7 @@ on:
       lookback_calendar_days:
         description: Calendar-day lookback for Alpaca IEX bars
         required: false
-        default: "90"
+        default: "120"
       top_n:
         description: Number of long-only candidates
         required: false
@@ -70,7 +70,7 @@ jobs:
         run: |
           python scripts/generate_tomorrow_portfolio_v2.py \
             --output-dir artifacts/tomorrow_portfolio_v2 \
-            --lookback-calendar-days "${{ inputs.lookback_calendar_days || '90' }}" \
+            --lookback-calendar-days "${{ inputs.lookback_calendar_days || '120' }}" \
             --top-n "${{ inputs.top_n || '20' }}" \
             --max-weight "${{ inputs.max_weight || '0.10' }}"
 
