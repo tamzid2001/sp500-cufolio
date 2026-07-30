@@ -31,6 +31,7 @@ class FakePaperClient:
         self.submitted: list[dict[str, str]] = []
         self.closed_positions: list[str] = []
         self.bulk_close_requests: list[bool] = []
+        self.cancel_all_order_requests = 0
         self.asset_requests: list[str] = []
         self.mode = "paper"
         self.base_url = "https://paper-api.alpaca.markets/v2"
@@ -54,6 +55,12 @@ class FakePaperClient:
     def submit_order(self, payload: dict[str, str]) -> dict[str, object]:
         self.submitted.append(payload)
         return {"id": f"order-{len(self.submitted)}", "status": "accepted"}
+
+    def cancel_all_orders(self) -> list[dict[str, object]]:
+        self.cancel_all_order_requests += 1
+        cancelled = [{"id": order.get("id"), "status": 200} for order in self.open_orders]
+        self.open_orders = []
+        return cancelled
 
     def close_position(self, symbol: str) -> dict[str, object]:
         self.closed_positions.append(symbol)
@@ -204,6 +211,102 @@ def test_any_open_target_order_blocks_a_second_cycle() -> None:
     client = FakePaperClient(open_orders=[{"id": "manual-order"}])
     result = run_rebalance(client, {"AAA": Decimal("0.5"), "BBB": Decimal("0.5")}, execute=True)
     assert result["status"] == "waiting_for_open_target_orders"
+    assert client.submitted == []
+
+
+def test_complete_five_minute_rebalance_cancels_stale_orders_then_uses_current_target() -> None:
+    client = FakePaperClient(open_orders=[{"id": "prior-window-order"}])
+
+    result = run_rebalance(
+        client,
+        {"AAA": Decimal("0.5"), "BBB": Decimal("0.5")},
+        liquidate_non_target_positions=True,
+        complete_rebalance=True,
+        cancel_stale_open_orders=True,
+        execute=True,
+    )
+
+    assert result["stale_open_orders_cleared"] is True
+    assert result["stale_open_orders_cancel_requested"] == [
+        {"id": "prior-window-order", "status": 200}
+    ]
+    assert result["status"] == "buy_orders_submitted"
+    assert client.cancel_all_order_requests == 1
+    assert [order["symbol"] for order in client.submitted] == ["AAA", "BBB"]
+
+
+def test_complete_rebalance_refuses_new_orders_when_stale_orders_do_not_clear() -> None:
+    class StuckOrderClient(FakePaperClient):
+        def cancel_all_orders(self) -> list[dict[str, object]]:
+            self.cancel_all_order_requests += 1
+            return [{"id": order.get("id"), "status": 200} for order in self.open_orders]
+
+    client = StuckOrderClient(open_orders=[{"id": "still-open"}])
+
+    result = run_rebalance(
+        client,
+        {"AAA": Decimal("0.5"), "BBB": Decimal("0.5")},
+        liquidate_non_target_positions=True,
+        complete_rebalance=True,
+        cancel_stale_open_orders=True,
+        sell_fill_timeout_seconds=0,
+        execute=True,
+    )
+
+    assert result["status"] == "stale_open_orders_not_cleared"
+    assert result["remaining_open_order_ids"] == ["still-open"]
+    assert client.submitted == []
+
+
+def test_five_minute_replacement_exits_each_changed_target_weight_before_rebuying() -> None:
+    client = ImmediatelyFilledPaperClient(
+        account={"equity": "1000", "cash": "0"},
+        positions=[
+            {"symbol": "AAA", "side": "long", "market_value": "500", "qty": "5"},
+            {"symbol": "BBB", "side": "long", "market_value": "500", "qty": "5"},
+        ],
+    )
+
+    result = run_rebalance(
+        client,
+        {"AAA": Decimal("0.6"), "BBB": Decimal("0.4")},
+        previous_targets={"AAA": Decimal("0.5"), "BBB": Decimal("0.5")},
+        liquidate_non_target_positions=True,
+        complete_rebalance=True,
+        retain_only_unchanged_targets=True,
+        execute=True,
+    )
+
+    assert result["retained_unchanged_target_symbols"] == []
+    assert result["replaced_changed_target_symbols"] == ["AAA", "BBB"]
+    assert result["status"] == "sell_then_buy_orders_submitted"
+    assert [(order["symbol"], order["side"]) for order in client.submitted] == [
+        ("AAA", "sell"), ("BBB", "sell"), ("AAA", "buy"), ("BBB", "buy"),
+    ]
+
+
+def test_five_minute_replacement_retains_only_exactly_unchanged_target_weights() -> None:
+    client = FakePaperClient(
+        account={"equity": "1000", "cash": "0"},
+        positions=[
+            {"symbol": "AAA", "side": "long", "market_value": "500", "qty": "5"},
+            {"symbol": "BBB", "side": "long", "market_value": "500", "qty": "5"},
+        ],
+    )
+
+    result = run_rebalance(
+        client,
+        {"AAA": Decimal("0.5"), "BBB": Decimal("0.5")},
+        previous_targets={"AAA": Decimal("0.5"), "BBB": Decimal("0.5")},
+        liquidate_non_target_positions=True,
+        complete_rebalance=True,
+        retain_only_unchanged_targets=True,
+        execute=True,
+    )
+
+    assert result["retained_unchanged_target_symbols"] == ["AAA", "BBB"]
+    assert result["replaced_changed_target_symbols"] == []
+    assert result["status"] == "within_rebalance_tolerance_or_no_cash"
     assert client.submitted == []
 
 

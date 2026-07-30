@@ -173,6 +173,13 @@ class AlpacaTradingClient:
     def submit_order(self, payload: dict[str, str]) -> dict[str, Any]:
         return self._request("POST", "/orders", payload)
 
+    def cancel_all_orders(self) -> list[dict[str, Any]]:
+        """Request cancellation of every open order in this dedicated account."""
+        response = self._request("DELETE", "/orders")
+        if not isinstance(response, list):
+            raise TradingError("Alpaca cancel-all-orders response was not a list")
+        return response
+
     def close_position(self, symbol: str) -> dict[str, Any]:
         return self._request("DELETE", f"/positions/{symbol}")
 
@@ -238,6 +245,28 @@ def _position_map(positions: list[dict[str, Any]], targets: dict[str, Decimal]) 
             raise PaperTradingError(f"{symbol} is a short position; refusing a long-only rebalance")
         result[symbol] = position
     return result
+
+
+def _unchanged_target_weights(
+    targets: dict[str, Decimal],
+    previous_targets: dict[str, Decimal] | None,
+    *,
+    tolerance: Decimal = Decimal("0.000000001"),
+) -> dict[str, Decimal]:
+    """Return only names whose allocation is unchanged from the prior target.
+
+    A five-minute target is a complete portfolio instruction, not merely a
+    ranking.  Reusing an overlap whose target allocation changed would leave
+    exposure from the prior prediction in the account.  The tiny tolerance is
+    only for CSV/solver serialization noise, not portfolio drift.
+    """
+    if previous_targets is None:
+        return {}
+    return {
+        symbol: weight
+        for symbol, weight in targets.items()
+        if symbol in previous_targets and abs(weight - previous_targets[symbol]) <= tolerance
+    }
 
 
 def _ensure_fractionable_assets(client: AlpacaTradingClient, targets: dict[str, Decimal]) -> None:
@@ -399,6 +428,9 @@ def run_rebalance(
     min_weight_drift: Decimal = Decimal("0.0025"),
     liquidate_non_target_positions: bool = False,
     complete_rebalance: bool = False,
+    cancel_stale_open_orders: bool = False,
+    previous_targets: dict[str, Decimal] | None = None,
+    retain_only_unchanged_targets: bool = False,
     sell_fill_timeout_seconds: float = 30,
     sell_fill_poll_seconds: float = 0.25,
     max_residual_sell_rounds: int = 2,
@@ -408,12 +440,17 @@ def run_rebalance(
 
     When ``liquidate_non_target_positions`` is enabled, the account is treated
     as dedicated to this strategy: positions absent from a new daily target are
-    sold before any target buys. Existing open orders always stop a new cycle.
+    sold before any target buys. With ``cancel_stale_open_orders``, a new
+    complete-rebalance window cancels and confirms clearance of old orders
+    before it sizes the current target.
 
     ``complete_rebalance`` is the per-window policy for a dedicated account.
-    It retains overlap symbols, sells only removed or overweight positions,
-    waits for those sells to clear, then refreshes positions, equity, and cash
-    before buying new or underweight symbols to the current target weights.
+    By default it retains overlap symbols, sells only removed or overweight
+    positions, waits for those sells to clear, then refreshes positions,
+    equity, and cash before buying new or underweight symbols to the current
+    target weights. With ``retain_only_unchanged_targets``, an overlap is
+    reusable only when its new target weight matches the immediately prior
+    target within serialization tolerance; every changed allocation exits.
     """
     if min_order_notional < Decimal("1"):
         raise ValueError("min_order_notional must be at least $1.00")
@@ -421,6 +458,10 @@ def run_rebalance(
         raise ValueError("min_weight_drift must be between 0 (inclusive) and 1 (exclusive)")
     if complete_rebalance and not liquidate_non_target_positions:
         raise ValueError("complete_rebalance requires liquidate_non_target_positions=True")
+    if cancel_stale_open_orders and not complete_rebalance:
+        raise ValueError("cancel_stale_open_orders requires complete_rebalance=True")
+    if retain_only_unchanged_targets and not complete_rebalance:
+        raise ValueError("retain_only_unchanged_targets requires complete_rebalance=True")
     if sell_fill_timeout_seconds < 0:
         raise ValueError("sell_fill_timeout_seconds must be non-negative")
     if sell_fill_poll_seconds <= 0:
@@ -441,6 +482,8 @@ def run_rebalance(
         "min_weight_drift": _as_number(min_weight_drift, Decimal("0.000000001")),
         "liquidate_non_target_positions": liquidate_non_target_positions,
         "complete_rebalance": complete_rebalance,
+        "cancel_stale_open_orders": cancel_stale_open_orders,
+        "retain_only_unchanged_targets": retain_only_unchanged_targets,
         "orders": [],
     }
     if not clock.get("is_open"):
@@ -449,9 +492,26 @@ def run_rebalance(
 
     outstanding = client.get_open_orders(None if liquidate_non_target_positions else list(targets))
     if outstanding:
-        report["status"] = "waiting_for_open_target_orders"
         report["open_order_ids"] = [order.get("id") for order in outstanding]
-        return report
+        can_replace_stale_orders = (
+            execute and complete_rebalance and liquidate_non_target_positions and cancel_stale_open_orders
+        )
+        if not can_replace_stale_orders:
+            report["status"] = "waiting_for_open_target_orders"
+            return report
+        cancellations = client.cancel_all_orders()
+        report["stale_open_orders_cancel_requested"] = cancellations
+        if not _wait_for_open_orders_to_clear(
+            client,
+            timeout_seconds=sell_fill_timeout_seconds,
+            poll_seconds=sell_fill_poll_seconds,
+        ):
+            report["status"] = "stale_open_orders_not_cleared"
+            report["remaining_open_order_ids"] = [
+                order.get("id") for order in client.get_open_orders(None)
+            ]
+            return report
+        report["stale_open_orders_cleared"] = True
 
     _ensure_fractionable_assets(client, targets)
     equity = _decimal(account.get("equity"), field="equity")
@@ -464,44 +524,60 @@ def run_rebalance(
     report["cash"] = _as_number(cash, CENT)
     all_positions = client.get_positions()
     positions = _position_map(all_positions, targets)
+    retained_targets = (
+        _unchanged_target_weights(targets, previous_targets)
+        if retain_only_unchanged_targets
+        else targets
+    )
+    reusable_positions = _position_map(all_positions, retained_targets)
+    report["retained_unchanged_target_symbols"] = sorted(retained_targets)
+    report["replaced_changed_target_symbols"] = sorted(set(targets).difference(retained_targets))
 
     sells = (
         _non_target_sell_intents(
-            all_positions, targets, min_order_notional=min_order_notional
+            all_positions, retained_targets, min_order_notional=min_order_notional
         )
         if liquidate_non_target_positions
         else []
     )
     sells.extend(
         _sell_intents(
-            targets,
-            positions,
+            retained_targets,
+            reusable_positions,
             equity=equity,
             min_order_notional=min_order_notional,
             min_weight_drift=min_weight_drift,
         )
     )
-    # Use cash already in the account to enter the next target immediately.
-    # Sale proceeds are never assumed available: after the sell phase clears,
-    # the remaining target is recalculated from the refreshed account state.
-    cash_funded_buys = _buy_intents(
+    # A strict five-minute replacement must first remove every prior
+    # allocation that changed. Daily complete rebalances retain their existing
+    # cash-funded-buy behavior.
+    cash_funded_buys = ([] if sells and retain_only_unchanged_targets else _buy_intents(
         targets,
         positions,
         equity=equity,
         cash=cash,
         min_order_notional=min_order_notional,
         min_weight_drift=min_weight_drift,
-    )
+    ))
     intents = (
-        [*cash_funded_buys, *sells]
-        if sells and complete_rebalance
-        else (sells or cash_funded_buys)
+        sells
+        if sells and retain_only_unchanged_targets
+        else ([*cash_funded_buys, *sells] if sells and complete_rebalance else (sells or cash_funded_buys))
     )
     report["orders"] = [intent.to_dict() for intent in intents]
     if not intents:
         report["status"] = "within_rebalance_tolerance_or_no_cash"
         return report
-    report["status"] = "buy_then_sell_orders_planned" if sells and cash_funded_buys and complete_rebalance else ("sell_orders_planned" if sells else "buy_orders_planned")
+    report["status"] = (
+        "sell_orders_planned"
+        if sells and retain_only_unchanged_targets
+        else (
+            "buy_then_sell_orders_planned"
+            if sells and cash_funded_buys and complete_rebalance
+            else ("sell_orders_planned" if sells else "buy_orders_planned")
+        )
+    )
     if not execute:
         return report
 
@@ -640,7 +716,11 @@ def run_rebalance(
             }
         )
     report["submitted_orders"] = submitted
-    report["status"] = "buy_then_sell_then_buy_orders_submitted" if cash_funded_buys else "sell_then_buy_orders_submitted"
+    report["status"] = (
+        "sell_then_buy_orders_submitted"
+        if retain_only_unchanged_targets
+        else ("buy_then_sell_then_buy_orders_submitted" if cash_funded_buys else "sell_then_buy_orders_submitted")
+    )
     return report
 
 

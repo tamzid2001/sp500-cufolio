@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from datetime import date, timedelta
+from decimal import Decimal
 
 import pandas as pd
 import pytest
@@ -12,6 +13,7 @@ from cufolio_cpu.five_minute_paper_session import (
     _load_checkpoint,
     _merge_current_minutes,
     _minute_cache_freshness_path,
+    _previous_target_weights,
     _persist_checkpoint,
     _completed_bar_at,
     _regular_minute_cache_projection,
@@ -127,6 +129,20 @@ def test_five_minute_checkpoint_write_is_atomic_and_immediately_restorable(tmp_p
         "forecast_and_order:2026-07-29T13:30:00+00:00"
     ]
     assert not list(tmp_path.glob(".state.json.tmp"))
+
+
+def test_checkpoint_restores_the_immediately_preceding_target_weights_only() -> None:
+    ledger = [
+        {"event": "skipped_unavailable_five_minute_target"},
+        {
+            "event": "five_minute_forecast_target_order",
+            "target_weights": {"aaa": "0.4", "BBB": "0.6"},
+        },
+    ]
+
+    assert _previous_target_weights(ledger) == {"AAA": Decimal("0.4"), "BBB": Decimal("0.6")}
+    assert _previous_target_weights([{"event": "five_minute_forecast_target_order"}]) is None
+    assert _previous_target_weights([*ledger, {"event": "skipped_unavailable_five_minute_target"}]) is None
 
 
 def test_websocket_precompute_does_not_issue_redundant_rest_repair(monkeypatch) -> None:
