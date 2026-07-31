@@ -9,7 +9,8 @@
     "forecast_and_order:2026-07-31T13:50:00+00:00",
     "forecast_and_order:2026-07-31T13:55:00+00:00",
     "forecast_and_order:2026-07-31T14:00:00+00:00",
-    "forecast_and_order:2026-07-31T14:05:00+00:00"
+    "forecast_and_order:2026-07-31T14:05:00+00:00",
+    "forecast_and_order:2026-07-31T14:10:00+00:00"
   ],
   "ledger": [
     {
@@ -2706,6 +2707,397 @@
         ],
         "post_sell_equity": "94028.73",
         "post_sell_cash": "84584.54"
+      }
+    },
+    {
+      "event": "five_minute_forecast_target_order",
+      "scheduled_at": "2026-07-31T14:10:00+00:00",
+      "observed_at": "2026-07-31T14:10:00.000714+00:00",
+      "target_end": "2026-07-31T14:15:00+00:00",
+      "forecast_horizon_minutes": 5,
+      "cache_refresh_seconds": 34.4882674849996,
+      "candidate_file": "candidate_20260731T1410Z.csv",
+      "forecast_status": {
+        "forecast_status": "ok",
+        "decision_timestamp": "2026-07-31T14:10:00+00:00",
+        "training_observations": 780,
+        "training_sessions": 11,
+        "input_assets": 6982,
+        "assets_with_decision_price": 1994,
+        "required_candidates_for_weight_cap": 10,
+        "minimum_training_sessions": 10,
+        "minimum_covariance_scenarios": 500,
+        "training_end": "2026-07-31T14:05:00+00:00",
+        "eligible_assets": 366,
+        "candidate_count": 20,
+        "covariance_scenarios": 501,
+        "candidate_weight_capacity": 2.0,
+        "reason": "ok",
+        "optimizer_status": "optimal",
+        "expected_portfolio_log_return": 0.0005473642561777413,
+        "expected_portfolio_simple_return": 0.0005475140873283703,
+        "weights_generated": true,
+        "decision_price_timestamp": "2026-07-31T14:09:00+00:00",
+        "target_end": "2026-07-31T14:15:00+00:00",
+        "forecast_interval_minutes": 5,
+        "forecast_horizon_minutes": 5,
+        "causality_rule": "training target_end is strictly earlier than the decision and the decision price is the preceding completed one-minute close",
+        "training_prepared_at": "2026-07-31T14:09:05.016857+00:00"
+      },
+      "target_weights": {
+        "SOXS": "0.1",
+        "CSGP": "0.1",
+        "IP": "0.1",
+        "MDLZ": "0.1",
+        "T": "0.1",
+        "WMT": "0.1",
+        "NFLX": "0.1",
+        "VZ": "0.1",
+        "BAC": "0.1",
+        "BKNG": "0.0000707907536761448",
+        "AMZN": "0.0999290614502681",
+        "MSFT": "1.6421783970533742E-8",
+        "SPY": "1.6421783970533742E-8",
+        "AAPL": "1.6421783970533742E-8",
+        "AVGO": "1.6421783970533742E-8",
+        "GOOGL": "1.6421783970533742E-8",
+        "GOOG": "1.6421783970533742E-8",
+        "INTC": "1.6421783970533742E-8",
+        "NVDA": "1.6421783970533742E-8",
+        "TSLA": "1.6421783970533742E-8"
+      },
+      "paper_rebalance": {
+        "trading_mode": "paper",
+        "trading_endpoint": "https://paper-api.alpaca.markets/v2",
+        "execute": true,
+        "target_symbols": [
+          "SOXS",
+          "CSGP",
+          "IP",
+          "MDLZ",
+          "T",
+          "WMT",
+          "NFLX",
+          "VZ",
+          "BAC",
+          "BKNG",
+          "AMZN",
+          "MSFT",
+          "SPY",
+          "AAPL",
+          "AVGO",
+          "GOOGL",
+          "GOOG",
+          "INTC",
+          "NVDA",
+          "TSLA"
+        ],
+        "clock_timestamp": "2026-07-31T10:10:37.931692176-04:00",
+        "market_open": true,
+        "min_weight_drift": "0.000500000",
+        "liquidate_non_target_positions": true,
+        "complete_rebalance": true,
+        "cancel_stale_open_orders": true,
+        "retain_only_unchanged_targets": true,
+        "orders": [
+          {
+            "symbol": "AAPL",
+            "side": "sell",
+            "qty": "31.125252525",
+            "target_weight": "0.000000000",
+            "current_notional": "9420.36",
+            "target_notional": "0.00"
+          },
+          {
+            "symbol": "AVGO",
+            "side": "sell",
+            "qty": "24.436789680",
+            "target_weight": "0.000000000",
+            "current_notional": "9305.28",
+            "target_notional": "0.00"
+          },
+          {
+            "symbol": "CIFR",
+            "side": "sell",
+            "qty": "92.751447661",
+            "target_weight": "0.000000000",
+            "current_notional": "2060.93",
+            "target_notional": "0.00"
+          },
+          {
+            "symbol": "INTC",
+            "side": "sell",
+            "qty": "100.458939264",
+            "target_weight": "0.000000000",
+            "current_notional": "9260.30",
+            "target_notional": "0.00"
+          },
+          {
+            "symbol": "LCID",
+            "side": "sell",
+            "qty": "1202.669654289",
+            "target_weight": "0.000000000",
+            "current_notional": "9248.52",
+            "target_notional": "0.00"
+          },
+          {
+            "symbol": "NVDA",
+            "side": "sell",
+            "qty": "47.830780192",
+            "target_weight": "0.000000000",
+            "current_notional": "9351.87",
+            "target_notional": "0.00"
+          },
+          {
+            "symbol": "SPCX",
+            "side": "sell",
+            "qty": "86.089526253",
+            "target_weight": "0.000000000",
+            "current_notional": "9298.96",
+            "target_notional": "0.00"
+          },
+          {
+            "symbol": "SPY",
+            "side": "sell",
+            "qty": "9.881372416",
+            "target_weight": "0.000000000",
+            "current_notional": "7299.17",
+            "target_notional": "0.00"
+          },
+          {
+            "symbol": "TSM",
+            "side": "sell",
+            "qty": "23.296490010",
+            "target_weight": "0.000000000",
+            "current_notional": "9318.59",
+            "target_notional": "0.00"
+          },
+          {
+            "symbol": "SOXS",
+            "side": "sell",
+            "qty": "6.638318447",
+            "target_weight": "0.100000000",
+            "current_notional": "9737.98",
+            "target_notional": "9374.54"
+          },
+          {
+            "symbol": "NFLX",
+            "side": "sell",
+            "qty": "0.953381242",
+            "target_weight": "0.100000000",
+            "current_notional": "9443.15",
+            "target_notional": "9374.54"
+          },
+          {
+            "symbol": "CSGP",
+            "side": "buy",
+            "notional": "9371.81",
+            "target_weight": "0.100000000",
+            "current_notional": "0.00",
+            "target_notional": "9373.83"
+          },
+          {
+            "symbol": "IP",
+            "side": "buy",
+            "notional": "9371.81",
+            "target_weight": "0.100000000",
+            "current_notional": "0.00",
+            "target_notional": "9373.83"
+          },
+          {
+            "symbol": "MDLZ",
+            "side": "buy",
+            "notional": "9371.81",
+            "target_weight": "0.100000000",
+            "current_notional": "0.00",
+            "target_notional": "9373.83"
+          },
+          {
+            "symbol": "T",
+            "side": "buy",
+            "notional": "9371.81",
+            "target_weight": "0.100000000",
+            "current_notional": "0.00",
+            "target_notional": "9373.83"
+          },
+          {
+            "symbol": "WMT",
+            "side": "buy",
+            "notional": "9371.81",
+            "target_weight": "0.100000000",
+            "current_notional": "0.00",
+            "target_notional": "9373.83"
+          },
+          {
+            "symbol": "VZ",
+            "side": "buy",
+            "notional": "9371.81",
+            "target_weight": "0.100000000",
+            "current_notional": "0.00",
+            "target_notional": "9373.83"
+          },
+          {
+            "symbol": "BAC",
+            "side": "buy",
+            "notional": "9371.81",
+            "target_weight": "0.100000000",
+            "current_notional": "0.00",
+            "target_notional": "9373.83"
+          },
+          {
+            "symbol": "AMZN",
+            "side": "buy",
+            "notional": "9365.16",
+            "target_weight": "0.099929061",
+            "current_notional": "0.00",
+            "target_notional": "9367.18"
+          }
+        ],
+        "equity": "93745.40",
+        "cash": "0.12",
+        "retained_unchanged_target_symbols": [
+          "NFLX",
+          "SOXS"
+        ],
+        "replaced_changed_target_symbols": [
+          "AAPL",
+          "AMZN",
+          "AVGO",
+          "BAC",
+          "BKNG",
+          "CSGP",
+          "GOOG",
+          "GOOGL",
+          "INTC",
+          "IP",
+          "MDLZ",
+          "MSFT",
+          "NVDA",
+          "SPY",
+          "T",
+          "TSLA",
+          "VZ",
+          "WMT"
+        ],
+        "status": "sell_then_buy_orders_submitted",
+        "submitted_orders": [
+          {
+            "symbol": "AAPL",
+            "side": "sell",
+            "id": "17f2257c-7ac6-42bd-b5eb-8f61baf3a4a0",
+            "status": "pending_new"
+          },
+          {
+            "symbol": "AVGO",
+            "side": "sell",
+            "id": "8368ea4e-c024-40a4-9b89-d5caf0748f63",
+            "status": "pending_new"
+          },
+          {
+            "symbol": "CIFR",
+            "side": "sell",
+            "id": "28b47631-3b4d-49b6-8b85-66d74be1c1c4",
+            "status": "pending_new"
+          },
+          {
+            "symbol": "INTC",
+            "side": "sell",
+            "id": "69ebf1ae-4861-4649-a417-50eab1afc4d9",
+            "status": "pending_new"
+          },
+          {
+            "symbol": "LCID",
+            "side": "sell",
+            "id": "6d5dfc7c-0faf-4d15-a097-25f3675f9615",
+            "status": "pending_new"
+          },
+          {
+            "symbol": "NVDA",
+            "side": "sell",
+            "id": "3215bbc4-3f56-46f9-9aa2-a8f3f2355044",
+            "status": "pending_new"
+          },
+          {
+            "symbol": "SPCX",
+            "side": "sell",
+            "id": "a72bf560-f765-4887-8158-c97f1fb9d2c6",
+            "status": "pending_new"
+          },
+          {
+            "symbol": "SPY",
+            "side": "sell",
+            "id": "ce4b84dc-7990-416d-bf2b-d543f1c2675b",
+            "status": "pending_new"
+          },
+          {
+            "symbol": "TSM",
+            "side": "sell",
+            "id": "bd9eaec3-30c2-4dec-ac60-a58dbf8b507a",
+            "status": "pending_new"
+          },
+          {
+            "symbol": "SOXS",
+            "side": "sell",
+            "id": "662a0633-52d0-4ff9-b069-d36659f7424c",
+            "status": "pending_new"
+          },
+          {
+            "symbol": "NFLX",
+            "side": "sell",
+            "id": "211fde2e-85a0-40b7-bbb8-6b55efbe81de",
+            "status": "pending_new"
+          },
+          {
+            "symbol": "CSGP",
+            "side": "buy",
+            "id": "454d1bd0-9d7b-4ee8-a8f1-2ca72f6bed72",
+            "status": "pending_new"
+          },
+          {
+            "symbol": "IP",
+            "side": "buy",
+            "id": "ca1b1b62-fbaf-4d8d-870d-d81c71df0802",
+            "status": "pending_new"
+          },
+          {
+            "symbol": "MDLZ",
+            "side": "buy",
+            "id": "e66efa8a-eb17-43af-abb3-ef73191af2ac",
+            "status": "pending_new"
+          },
+          {
+            "symbol": "T",
+            "side": "buy",
+            "id": "8a0334b9-9f20-402f-a2c3-726f517ad61e",
+            "status": "pending_new"
+          },
+          {
+            "symbol": "WMT",
+            "side": "buy",
+            "id": "15737378-6b6b-40bf-b92b-63ef47e5f2f5",
+            "status": "pending_new"
+          },
+          {
+            "symbol": "VZ",
+            "side": "buy",
+            "id": "a340bcad-10ea-4aa3-be4a-3f291b80afee",
+            "status": "pending_new"
+          },
+          {
+            "symbol": "BAC",
+            "side": "buy",
+            "id": "ea314446-edf9-476e-9e5d-19653d11b31c",
+            "status": "pending_new"
+          },
+          {
+            "symbol": "AMZN",
+            "side": "buy",
+            "id": "b9bb71e5-5b08-40bb-8f8f-9906ad4021f1",
+            "status": "pending_new"
+          }
+        ],
+        "post_sell_equity": "93738.31",
+        "post_sell_cash": "74967.86"
       }
     }
   ]
