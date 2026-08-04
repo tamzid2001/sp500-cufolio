@@ -2,7 +2,8 @@
   "format_version": 1,
   "session_date": "2026-08-04",
   "completed_events": [
-    "forecast_and_order:2026-08-04T13:30:00+00:00"
+    "forecast_and_order:2026-08-04T13:30:00+00:00",
+    "forecast_and_order:2026-08-04T13:35:00+00:00"
   ],
   "ledger": [
     {
@@ -10,6 +11,268 @@
       "scheduled_at": "2026-08-04T13:30:00+00:00",
       "observed_at": "2026-08-04T13:30:00.000610+00:00",
       "reason": "causal candidate unavailable: insufficient_assets_with_complete_training_and_decision_prices"
+    },
+    {
+      "event": "five_minute_forecast_target_order",
+      "scheduled_at": "2026-08-04T13:35:00+00:00",
+      "observed_at": "2026-08-04T13:35:00.000649+00:00",
+      "target_end": "2026-08-04T13:40:00+00:00",
+      "forecast_horizon_minutes": 5,
+      "cache_refresh_seconds": 34.962482600000385,
+      "candidate_file": "candidate_20260804T1335Z.csv",
+      "forecast_status": {
+        "forecast_status": "ok",
+        "decision_timestamp": "2026-08-04T13:35:00+00:00",
+        "training_observations": 780,
+        "training_sessions": 10,
+        "input_assets": 6990,
+        "assets_with_decision_price": 1508,
+        "required_candidates_for_weight_cap": 10,
+        "minimum_training_sessions": 10,
+        "minimum_covariance_scenarios": 500,
+        "training_end": "2026-08-03T20:00:00+00:00",
+        "eligible_assets": 360,
+        "candidate_count": 20,
+        "covariance_scenarios": 500,
+        "candidate_weight_capacity": 2.0,
+        "reason": "ok",
+        "optimizer_status": "optimal",
+        "expected_portfolio_log_return": 0.0012102823833070044,
+        "expected_portfolio_simple_return": 0.001211015070587031,
+        "weights_generated": true,
+        "decision_price_timestamp": "2026-08-04T13:34:00+00:00",
+        "target_end": "2026-08-04T13:40:00+00:00",
+        "forecast_interval_minutes": 5,
+        "forecast_horizon_minutes": 5,
+        "causality_rule": "training target_end is strictly earlier than the decision and the decision price is the preceding completed one-minute close",
+        "training_prepared_at": "2026-08-04T13:34:00.000675+00:00"
+      },
+      "target_weights": {
+        "SOXS": "0.1",
+        "BTDR": "0.1",
+        "NOW": "0.1",
+        "FIG": "0.1",
+        "KVYO": "0.1",
+        "INTU": "0.1",
+        "NFLX": "0.1",
+        "KO": "0.1",
+        "CVNA": "0.1",
+        "GOOG": "0.0999999988284612",
+        "GOOGL": "1.1715385858393742E-10",
+        "BKNG": "1.1715385858393742E-10",
+        "AMZN": "1.1715385858393742E-10",
+        "MSFT": "1.1715385858393742E-10",
+        "IREN": "1.1715385858393742E-10",
+        "SPY": "1.1715385858393742E-10",
+        "MU": "1.1715385858393742E-10",
+        "AAPL": "1.1715385858393742E-10",
+        "NVDA": "1.1715385858393742E-10",
+        "SPCX": "1.1715385858393742E-10"
+      },
+      "paper_rebalance": {
+        "trading_mode": "paper",
+        "trading_endpoint": "https://paper-api.alpaca.markets/v2",
+        "execute": true,
+        "target_symbols": [
+          "SOXS",
+          "BTDR",
+          "NOW",
+          "FIG",
+          "KVYO",
+          "INTU",
+          "NFLX",
+          "KO",
+          "CVNA",
+          "GOOG",
+          "GOOGL",
+          "BKNG",
+          "AMZN",
+          "MSFT",
+          "IREN",
+          "SPY",
+          "MU",
+          "AAPL",
+          "NVDA",
+          "SPCX"
+        ],
+        "clock_timestamp": "2026-08-04T09:35:37.695979644-04:00",
+        "market_open": true,
+        "min_weight_drift": "0.000500000",
+        "liquidate_non_target_positions": true,
+        "complete_rebalance": true,
+        "cancel_stale_open_orders": true,
+        "retain_only_unchanged_targets": true,
+        "orders": [
+          {
+            "symbol": "SOXS",
+            "side": "buy",
+            "notional": "9223.97",
+            "target_weight": "0.100000000",
+            "current_notional": "0.00",
+            "target_notional": "9223.97"
+          },
+          {
+            "symbol": "BTDR",
+            "side": "buy",
+            "notional": "9223.97",
+            "target_weight": "0.100000000",
+            "current_notional": "0.00",
+            "target_notional": "9223.97"
+          },
+          {
+            "symbol": "NOW",
+            "side": "buy",
+            "notional": "9223.97",
+            "target_weight": "0.100000000",
+            "current_notional": "0.00",
+            "target_notional": "9223.97"
+          },
+          {
+            "symbol": "FIG",
+            "side": "buy",
+            "notional": "9223.97",
+            "target_weight": "0.100000000",
+            "current_notional": "0.00",
+            "target_notional": "9223.97"
+          },
+          {
+            "symbol": "KVYO",
+            "side": "buy",
+            "notional": "9223.97",
+            "target_weight": "0.100000000",
+            "current_notional": "0.00",
+            "target_notional": "9223.97"
+          },
+          {
+            "symbol": "INTU",
+            "side": "buy",
+            "notional": "9223.97",
+            "target_weight": "0.100000000",
+            "current_notional": "0.00",
+            "target_notional": "9223.97"
+          },
+          {
+            "symbol": "NFLX",
+            "side": "buy",
+            "notional": "9223.97",
+            "target_weight": "0.100000000",
+            "current_notional": "0.00",
+            "target_notional": "9223.97"
+          },
+          {
+            "symbol": "KO",
+            "side": "buy",
+            "notional": "9223.97",
+            "target_weight": "0.100000000",
+            "current_notional": "0.00",
+            "target_notional": "9223.97"
+          },
+          {
+            "symbol": "CVNA",
+            "side": "buy",
+            "notional": "9223.97",
+            "target_weight": "0.100000000",
+            "current_notional": "0.00",
+            "target_notional": "9223.97"
+          },
+          {
+            "symbol": "GOOG",
+            "side": "buy",
+            "notional": "9223.97",
+            "target_weight": "0.099999998",
+            "current_notional": "0.00",
+            "target_notional": "9223.97"
+          }
+        ],
+        "equity": "92239.76",
+        "cash": "92239.76",
+        "retained_unchanged_target_symbols": [],
+        "replaced_changed_target_symbols": [
+          "AAPL",
+          "AMZN",
+          "BKNG",
+          "BTDR",
+          "CVNA",
+          "FIG",
+          "GOOG",
+          "GOOGL",
+          "INTU",
+          "IREN",
+          "KO",
+          "KVYO",
+          "MSFT",
+          "MU",
+          "NFLX",
+          "NOW",
+          "NVDA",
+          "SOXS",
+          "SPCX",
+          "SPY"
+        ],
+        "status": "buy_orders_submitted",
+        "submitted_orders": [
+          {
+            "symbol": "SOXS",
+            "side": "buy",
+            "id": "d179db66-8b66-45ad-bd4d-ad8cf1d614ab",
+            "status": "pending_new"
+          },
+          {
+            "symbol": "BTDR",
+            "side": "buy",
+            "id": "5f536f62-76bc-4ad0-9429-fe9aabc76dc5",
+            "status": "pending_new"
+          },
+          {
+            "symbol": "NOW",
+            "side": "buy",
+            "id": "b1a2db5b-b1bd-4317-9d76-5849a24c1b8e",
+            "status": "pending_new"
+          },
+          {
+            "symbol": "FIG",
+            "side": "buy",
+            "id": "298f1582-0e1e-464a-ba13-d14fbcabaffa",
+            "status": "pending_new"
+          },
+          {
+            "symbol": "KVYO",
+            "side": "buy",
+            "id": "bb2a454f-7740-4391-ae40-97846ffe3318",
+            "status": "pending_new"
+          },
+          {
+            "symbol": "INTU",
+            "side": "buy",
+            "id": "3c8b72df-e598-4cdc-84db-18551adb1f82",
+            "status": "pending_new"
+          },
+          {
+            "symbol": "NFLX",
+            "side": "buy",
+            "id": "7f51aff5-d7c8-42b4-953a-2aed5c43ed21",
+            "status": "pending_new"
+          },
+          {
+            "symbol": "KO",
+            "side": "buy",
+            "id": "54d373e7-89a7-4a2c-9545-0eeb92dd0aa6",
+            "status": "pending_new"
+          },
+          {
+            "symbol": "CVNA",
+            "side": "buy",
+            "id": "803dfa96-1333-4d7b-8026-5d3d7b78f307",
+            "status": "pending_new"
+          },
+          {
+            "symbol": "GOOG",
+            "side": "buy",
+            "id": "16e9d96a-a67f-4569-acc5-6e6b3dd6bbaf",
+            "status": "pending_new"
+          }
+        ]
+      }
     }
   ]
 }
