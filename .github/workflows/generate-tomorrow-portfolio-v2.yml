@@ -1,0 +1,87 @@
+name: Generate Tomorrow Portfolio V2
+
+on:
+  workflow_dispatch:
+    inputs:
+      lookback_calendar_days:
+        description: Calendar-day lookback for Alpaca IEX bars
+        required: false
+        default: "120"
+      top_n:
+        description: Number of long-only candidates
+        required: false
+        default: "20"
+      max_weight:
+        description: Maximum weight per stock
+        required: false
+        default: "0.10"
+  push:
+    branches:
+      - improve-forward-ml-metrics
+    paths:
+      - "src/cufolio_cpu/intraday_forward_v2.py"
+      - "scripts/generate_tomorrow_portfolio_v2.py"
+      - ".github/workflows/generate-tomorrow-portfolio-v2.yml"
+      - "requirements.txt"
+      - "pyproject.toml"
+
+permissions:
+  contents: read
+
+jobs:
+  generate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      ALPACA_PAPER_API_KEY: ${{ secrets.ALPACA_PAPER_API_KEY || secrets.ALPACA_API_KEY }}
+      ALPACA_PAPER_SECRET_KEY: ${{ secrets.ALPACA_PAPER_SECRET_KEY || secrets.ALPACA_SECRET_KEY }}
+      PYTHONPATH: src
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install project and dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+          python -m pip install -e . --no-deps
+
+      - name: Verify core imports
+        run: |
+          python - <<'PY'
+          import alpaca
+          import cvxpy
+          import numpy
+          import pandas
+          import scipy
+          import sklearn
+          print("Core imports succeeded")
+          PY
+
+      - name: Run unit tests
+        run: python -m pytest -q
+
+      - name: Generate research portfolio from Alpaca IEX data
+        run: |
+          python scripts/generate_tomorrow_portfolio_v2.py \
+            --output-dir artifacts/tomorrow_portfolio_v2 \
+            --lookback-calendar-days "${{ inputs.lookback_calendar_days || '120' }}" \
+            --top-n "${{ inputs.top_n || '20' }}" \
+            --max-weight "${{ inputs.max_weight || '0.10' }}"
+
+      - name: Add run metadata
+        run: |
+          printf '%s\n' "commit=${GITHUB_SHA}" "run_id=${GITHUB_RUN_ID}" "generated_at=$(date -u +%FT%TZ)" > artifacts/tomorrow_portfolio_v2/run_metadata.txt
+
+      - name: Upload portfolio and validation
+        uses: actions/upload-artifact@v4
+        with:
+          name: tomorrow-long-only-portfolio-v2
+          path: artifacts/tomorrow_portfolio_v2
+          if-no-files-found: error
+          retention-days: 30
