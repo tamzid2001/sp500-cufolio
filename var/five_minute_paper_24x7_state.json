@@ -2,7 +2,8 @@
   "format_version": 1,
   "session_date": "2026-08-18",
   "completed_events": [
-    "forecast_and_order:2026-08-18T13:30:00+00:00"
+    "forecast_and_order:2026-08-18T13:30:00+00:00",
+    "forecast_and_order:2026-08-18T13:35:00+00:00"
   ],
   "ledger": [
     {
@@ -10,6 +11,250 @@
       "scheduled_at": "2026-08-18T13:30:00+00:00",
       "observed_at": "2026-08-18T13:30:00.000655+00:00",
       "reason": "causal candidate unavailable: insufficient_complete_candidates_for_weight_cap"
+    },
+    {
+      "event": "five_minute_forecast_target_order",
+      "scheduled_at": "2026-08-18T13:35:00+00:00",
+      "observed_at": "2026-08-18T13:35:00.000614+00:00",
+      "target_end": "2026-08-18T13:40:00+00:00",
+      "forecast_horizon_minutes": 5,
+      "cache_refresh_seconds": 35.01255362499978,
+      "candidate_file": "candidate_20260818T1335Z.csv",
+      "forecast_status": {
+        "forecast_status": "ok",
+        "decision_timestamp": "2026-08-18T13:35:00+00:00",
+        "training_observations": 780,
+        "training_sessions": 10,
+        "input_assets": 7000,
+        "assets_with_decision_price": 1398,
+        "required_candidates_for_weight_cap": 10,
+        "minimum_training_sessions": 10,
+        "minimum_covariance_scenarios": 500,
+        "training_end": "2026-08-17T20:00:00+00:00",
+        "eligible_assets": 331,
+        "candidate_count": 14,
+        "covariance_scenarios": 500,
+        "candidate_weight_capacity": 1.4000000000000001,
+        "reason": "ok",
+        "optimizer_status": "optimal",
+        "expected_portfolio_log_return": 0.0010076738096167811,
+        "expected_portfolio_simple_return": 0.0010081816834461345,
+        "weights_generated": true,
+        "decision_price_timestamp": "2026-08-18T13:34:00+00:00",
+        "target_end": "2026-08-18T13:40:00+00:00",
+        "forecast_interval_minutes": 5,
+        "forecast_horizon_minutes": 5,
+        "causality_rule": "training target_end is strictly earlier than the decision and the decision price is the preceding completed one-minute close",
+        "training_prepared_at": "2026-08-18T13:34:00.000547+00:00"
+      },
+      "target_weights": {
+        "DDOG": "0.1",
+        "U": "0.1",
+        "UBER": "0.1",
+        "PLTR": "0.1",
+        "SPCX": "0.1",
+        "KLAC": "0.1",
+        "MSFT": "0.1",
+        "SMCI": "0.1",
+        "SPY": "0.099999999755072",
+        "NVDA": "0.0999999993561853",
+        "BKNG": "2.2218569576774408E-10",
+        "AAPL": "2.2218569576774408E-10",
+        "CIFR": "2.2218569576774408E-10",
+        "INTC": "2.2218569576774408E-10"
+      },
+      "paper_rebalance": {
+        "trading_mode": "paper",
+        "trading_endpoint": "https://paper-api.alpaca.markets/v2",
+        "execute": true,
+        "target_symbols": [
+          "DDOG",
+          "U",
+          "UBER",
+          "PLTR",
+          "SPCX",
+          "KLAC",
+          "MSFT",
+          "SMCI",
+          "SPY",
+          "NVDA",
+          "BKNG",
+          "AAPL",
+          "CIFR",
+          "INTC"
+        ],
+        "clock_timestamp": "2026-08-18T09:35:36.947529821-04:00",
+        "market_open": true,
+        "min_weight_drift": "0.000500000",
+        "liquidate_non_target_positions": true,
+        "complete_rebalance": true,
+        "cancel_stale_open_orders": true,
+        "retain_only_unchanged_targets": true,
+        "orders": [
+          {
+            "symbol": "DDOG",
+            "side": "buy",
+            "notional": "7038.37",
+            "target_weight": "0.100000000",
+            "current_notional": "0.00",
+            "target_notional": "7038.37"
+          },
+          {
+            "symbol": "U",
+            "side": "buy",
+            "notional": "7038.37",
+            "target_weight": "0.100000000",
+            "current_notional": "0.00",
+            "target_notional": "7038.37"
+          },
+          {
+            "symbol": "UBER",
+            "side": "buy",
+            "notional": "7038.37",
+            "target_weight": "0.100000000",
+            "current_notional": "0.00",
+            "target_notional": "7038.37"
+          },
+          {
+            "symbol": "PLTR",
+            "side": "buy",
+            "notional": "7038.37",
+            "target_weight": "0.100000000",
+            "current_notional": "0.00",
+            "target_notional": "7038.37"
+          },
+          {
+            "symbol": "SPCX",
+            "side": "buy",
+            "notional": "7038.37",
+            "target_weight": "0.100000000",
+            "current_notional": "0.00",
+            "target_notional": "7038.37"
+          },
+          {
+            "symbol": "KLAC",
+            "side": "buy",
+            "notional": "7038.37",
+            "target_weight": "0.100000000",
+            "current_notional": "0.00",
+            "target_notional": "7038.37"
+          },
+          {
+            "symbol": "MSFT",
+            "side": "buy",
+            "notional": "7038.37",
+            "target_weight": "0.100000000",
+            "current_notional": "0.00",
+            "target_notional": "7038.37"
+          },
+          {
+            "symbol": "SMCI",
+            "side": "buy",
+            "notional": "7038.37",
+            "target_weight": "0.100000000",
+            "current_notional": "0.00",
+            "target_notional": "7038.37"
+          },
+          {
+            "symbol": "SPY",
+            "side": "buy",
+            "notional": "7038.36",
+            "target_weight": "0.099999999",
+            "current_notional": "0.00",
+            "target_notional": "7038.36"
+          },
+          {
+            "symbol": "NVDA",
+            "side": "buy",
+            "notional": "7038.36",
+            "target_weight": "0.099999999",
+            "current_notional": "0.00",
+            "target_notional": "7038.36"
+          }
+        ],
+        "equity": "70383.70",
+        "cash": "70383.70",
+        "retained_unchanged_target_symbols": [],
+        "replaced_changed_target_symbols": [
+          "AAPL",
+          "BKNG",
+          "CIFR",
+          "DDOG",
+          "INTC",
+          "KLAC",
+          "MSFT",
+          "NVDA",
+          "PLTR",
+          "SMCI",
+          "SPCX",
+          "SPY",
+          "U",
+          "UBER"
+        ],
+        "status": "buy_orders_submitted",
+        "submitted_orders": [
+          {
+            "symbol": "DDOG",
+            "side": "buy",
+            "id": "be7fb338-d3ea-448e-a206-53ae1bc75613",
+            "status": "pending_new"
+          },
+          {
+            "symbol": "U",
+            "side": "buy",
+            "id": "e5c230f0-01e9-4a71-a3cf-e7facaa1bae2",
+            "status": "pending_new"
+          },
+          {
+            "symbol": "UBER",
+            "side": "buy",
+            "id": "1bacaea1-6adb-4a1d-9979-e8862371aae9",
+            "status": "pending_new"
+          },
+          {
+            "symbol": "PLTR",
+            "side": "buy",
+            "id": "b24ec2c3-76ad-44e2-9bca-a9f50b47ed4a",
+            "status": "pending_new"
+          },
+          {
+            "symbol": "SPCX",
+            "side": "buy",
+            "id": "94112ed6-d10c-48c3-a34a-cba1f6e1d318",
+            "status": "pending_new"
+          },
+          {
+            "symbol": "KLAC",
+            "side": "buy",
+            "id": "51632ab1-59bf-4f1d-9281-4cbd3e12c038",
+            "status": "pending_new"
+          },
+          {
+            "symbol": "MSFT",
+            "side": "buy",
+            "id": "295a97ad-ca1d-4440-8556-072b387ad19d",
+            "status": "pending_new"
+          },
+          {
+            "symbol": "SMCI",
+            "side": "buy",
+            "id": "81144fb6-9263-4e86-80ae-a83fbc8f53d6",
+            "status": "pending_new"
+          },
+          {
+            "symbol": "SPY",
+            "side": "buy",
+            "id": "53cdd086-dc22-410b-a999-f64b56738dd1",
+            "status": "pending_new"
+          },
+          {
+            "symbol": "NVDA",
+            "side": "buy",
+            "id": "cc65dd9b-15e4-4835-aec5-7b9c2a98a952",
+            "status": "pending_new"
+          }
+        ]
+      }
     }
   ]
 }
