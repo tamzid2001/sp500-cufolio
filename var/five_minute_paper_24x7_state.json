@@ -11,7 +11,8 @@
     "forecast_and_order:2026-08-20T14:00:00+00:00",
     "forecast_and_order:2026-08-20T14:05:00+00:00",
     "forecast_and_order:2026-08-20T14:10:00+00:00",
-    "forecast_and_order:2026-08-20T14:15:00+00:00"
+    "forecast_and_order:2026-08-20T14:15:00+00:00",
+    "forecast_and_order:2026-08-20T14:20:00+00:00"
   ],
   "ledger": [
     {
@@ -3269,6 +3270,388 @@
         ],
         "post_sell_equity": "64411.33",
         "post_sell_cash": "57949.68"
+      }
+    },
+    {
+      "event": "five_minute_forecast_target_order",
+      "scheduled_at": "2026-08-20T14:20:00+00:00",
+      "observed_at": "2026-08-20T14:20:03.625470+00:00",
+      "target_end": "2026-08-20T14:25:00+00:00",
+      "forecast_horizon_minutes": 5,
+      "cache_refresh_seconds": 35.25414859199918,
+      "candidate_file": "candidate_20260820T1420Z.csv",
+      "forecast_status": {
+        "forecast_status": "ok",
+        "decision_timestamp": "2026-08-20T14:20:00+00:00",
+        "training_observations": 780,
+        "training_sessions": 11,
+        "input_assets": 6996,
+        "assets_with_decision_price": 1476,
+        "required_candidates_for_weight_cap": 10,
+        "minimum_training_sessions": 10,
+        "minimum_covariance_scenarios": 500,
+        "training_end": "2026-08-20T14:15:00+00:00",
+        "eligible_assets": 322,
+        "candidate_count": 17,
+        "covariance_scenarios": 500,
+        "candidate_weight_capacity": 1.7000000000000002,
+        "reason": "ok",
+        "optimizer_status": "optimal",
+        "expected_portfolio_log_return": 0.0006855402604919361,
+        "expected_portfolio_simple_return": 0.0006857752969222238,
+        "weights_generated": true,
+        "decision_price_timestamp": "2026-08-20T14:19:00+00:00",
+        "target_end": "2026-08-20T14:25:00+00:00",
+        "forecast_interval_minutes": 5,
+        "forecast_horizon_minutes": 5,
+        "causality_rule": "training target_end is strictly earlier than the decision and the decision price is the preceding completed one-minute close",
+        "training_prepared_at": "2026-08-20T14:19:13.343347+00:00"
+      },
+      "target_weights": {
+        "INFQ": "0.0999999735724291",
+        "ONDS": "0.1",
+        "S": "0.0999999926309611",
+        "RKT": "0.1",
+        "SMCI": "0.0999999699245183",
+        "PLTR": "0.0999999675910645",
+        "HPE": "0.0999999259475482",
+        "TSLA": "0.0999985322842259",
+        "INTC": "0.0089685502452084",
+        "KLAC": "0.0950426541347357",
+        "IWM": "0.0959898995323418",
+        "MU": "8.902282776131661E-8",
+        "SPY": "8.902282776131661E-8",
+        "AAPL": "8.902282776131661E-8",
+        "NVDA": "8.902282776131661E-8",
+        "BKNG": "8.902282776131661E-8",
+        "CIFR": "8.902282776131661E-8"
+      },
+      "paper_rebalance": {
+        "trading_mode": "paper",
+        "trading_endpoint": "https://paper-api.alpaca.markets/v2",
+        "execute": true,
+        "target_symbols": [
+          "INFQ",
+          "ONDS",
+          "S",
+          "RKT",
+          "SMCI",
+          "PLTR",
+          "HPE",
+          "TSLA",
+          "INTC",
+          "KLAC",
+          "IWM",
+          "MU",
+          "SPY",
+          "AAPL",
+          "NVDA",
+          "BKNG",
+          "CIFR"
+        ],
+        "clock_timestamp": "2026-08-20T10:20:40.696782182-04:00",
+        "market_open": true,
+        "min_weight_drift": "0.000500000",
+        "liquidate_non_target_positions": true,
+        "complete_rebalance": true,
+        "cancel_stale_open_orders": true,
+        "retain_only_unchanged_targets": true,
+        "orders": [
+          {
+            "symbol": "CIFR",
+            "side": "sell",
+            "qty": "408.555837563",
+            "target_weight": "0.000000000",
+            "current_notional": "6442.92",
+            "target_notional": "0.00"
+          },
+          {
+            "symbol": "EQX",
+            "side": "sell",
+            "qty": "512.240445859",
+            "target_weight": "0.000000000",
+            "current_notional": "6436.30",
+            "target_notional": "0.00"
+          },
+          {
+            "symbol": "GDX",
+            "side": "sell",
+            "qty": "65.783670549",
+            "target_weight": "0.000000000",
+            "current_notional": "6455.68",
+            "target_notional": "0.00"
+          },
+          {
+            "symbol": "IREN",
+            "side": "sell",
+            "qty": "153.559188544",
+            "target_weight": "0.000000000",
+            "current_notional": "6434.13",
+            "target_notional": "0.00"
+          },
+          {
+            "symbol": "LUNR",
+            "side": "sell",
+            "qty": "361.592156862",
+            "target_weight": "0.000000000",
+            "current_notional": "6436.34",
+            "target_notional": "0.00"
+          },
+          {
+            "symbol": "PLTR",
+            "side": "sell",
+            "qty": "36.881887959",
+            "target_weight": "0.000000000",
+            "current_notional": "6449.16",
+            "target_notional": "0.00"
+          },
+          {
+            "symbol": "SMCI",
+            "side": "sell",
+            "qty": "175.246053347",
+            "target_weight": "0.000000000",
+            "current_notional": "6480.59",
+            "target_notional": "0.00"
+          },
+          {
+            "symbol": "SPCX",
+            "side": "sell",
+            "qty": "48.129914785",
+            "target_weight": "0.000000000",
+            "current_notional": "6396.94",
+            "target_notional": "0.00"
+          },
+          {
+            "symbol": "TSLA",
+            "side": "sell",
+            "qty": "18.795142740",
+            "target_weight": "0.000000000",
+            "current_notional": "6437.52",
+            "target_notional": "0.00"
+          },
+          {
+            "symbol": "INFQ",
+            "side": "buy",
+            "notional": "6438.55",
+            "target_weight": "0.099999973",
+            "current_notional": "0.00",
+            "target_notional": "6438.55"
+          },
+          {
+            "symbol": "S",
+            "side": "buy",
+            "notional": "6438.56",
+            "target_weight": "0.099999992",
+            "current_notional": "0.00",
+            "target_notional": "6438.56"
+          },
+          {
+            "symbol": "RKT",
+            "side": "buy",
+            "notional": "6438.56",
+            "target_weight": "0.100000000",
+            "current_notional": "0.00",
+            "target_notional": "6438.56"
+          },
+          {
+            "symbol": "SMCI",
+            "side": "buy",
+            "notional": "6438.55",
+            "target_weight": "0.099999969",
+            "current_notional": "0.00",
+            "target_notional": "6438.55"
+          },
+          {
+            "symbol": "PLTR",
+            "side": "buy",
+            "notional": "6438.55",
+            "target_weight": "0.099999967",
+            "current_notional": "0.00",
+            "target_notional": "6438.55"
+          },
+          {
+            "symbol": "HPE",
+            "side": "buy",
+            "notional": "6438.55",
+            "target_weight": "0.099999925",
+            "current_notional": "0.00",
+            "target_notional": "6438.55"
+          },
+          {
+            "symbol": "TSLA",
+            "side": "buy",
+            "notional": "6438.46",
+            "target_weight": "0.099998532",
+            "current_notional": "0.00",
+            "target_notional": "6438.46"
+          },
+          {
+            "symbol": "INTC",
+            "side": "buy",
+            "notional": "577.44",
+            "target_weight": "0.008968550",
+            "current_notional": "0.00",
+            "target_notional": "577.44"
+          },
+          {
+            "symbol": "KLAC",
+            "side": "buy",
+            "notional": "6119.37",
+            "target_weight": "0.095042654",
+            "current_notional": "0.00",
+            "target_notional": "6119.37"
+          },
+          {
+            "symbol": "IWM",
+            "side": "buy",
+            "notional": "6180.36",
+            "target_weight": "0.095989899",
+            "current_notional": "0.00",
+            "target_notional": "6180.36"
+          }
+        ],
+        "equity": "64373.75",
+        "cash": "0.12",
+        "retained_unchanged_target_symbols": [
+          "ONDS"
+        ],
+        "replaced_changed_target_symbols": [
+          "AAPL",
+          "BKNG",
+          "CIFR",
+          "HPE",
+          "INFQ",
+          "INTC",
+          "IWM",
+          "KLAC",
+          "MU",
+          "NVDA",
+          "PLTR",
+          "RKT",
+          "S",
+          "SMCI",
+          "SPY",
+          "TSLA"
+        ],
+        "status": "sell_then_buy_orders_submitted",
+        "submitted_orders": [
+          {
+            "symbol": "CIFR",
+            "side": "sell",
+            "id": "84777ced-d3d6-4614-afa3-88d751b9a097",
+            "status": "pending_new"
+          },
+          {
+            "symbol": "EQX",
+            "side": "sell",
+            "id": "8251e561-717e-4278-b503-3db4af558faa",
+            "status": "pending_new"
+          },
+          {
+            "symbol": "GDX",
+            "side": "sell",
+            "id": "7affb671-5bb7-42ed-9950-aa88e68827ff",
+            "status": "pending_new"
+          },
+          {
+            "symbol": "IREN",
+            "side": "sell",
+            "id": "232b0113-e5bd-4c0c-9557-1ef4c4054e7b",
+            "status": "pending_new"
+          },
+          {
+            "symbol": "LUNR",
+            "side": "sell",
+            "id": "4c745835-4ba1-4f43-8bc3-95270153335b",
+            "status": "pending_new"
+          },
+          {
+            "symbol": "PLTR",
+            "side": "sell",
+            "id": "798dd1d2-5546-4593-b0a6-5755345fc17f",
+            "status": "pending_new"
+          },
+          {
+            "symbol": "SMCI",
+            "side": "sell",
+            "id": "f70c613a-47c8-4f9b-bf8f-952310713ea2",
+            "status": "pending_new"
+          },
+          {
+            "symbol": "SPCX",
+            "side": "sell",
+            "id": "2401d2ca-cfac-4f01-a037-55357da7c8bc",
+            "status": "pending_new"
+          },
+          {
+            "symbol": "TSLA",
+            "side": "sell",
+            "id": "bfc69890-3897-47db-9cff-10883427f265",
+            "status": "pending_new"
+          },
+          {
+            "symbol": "INFQ",
+            "side": "buy",
+            "id": "3dc0ee62-3511-47d5-a6d2-e47bdda9d1e8",
+            "status": "pending_new"
+          },
+          {
+            "symbol": "S",
+            "side": "buy",
+            "id": "bfcb9cd8-50cc-48f8-95a5-232c1447da7a",
+            "status": "pending_new"
+          },
+          {
+            "symbol": "RKT",
+            "side": "buy",
+            "id": "49701561-8010-49c4-a0b3-affdfd40c68a",
+            "status": "pending_new"
+          },
+          {
+            "symbol": "SMCI",
+            "side": "buy",
+            "id": "fc7d11fa-1d89-404a-959d-3492ff9b6be8",
+            "status": "pending_new"
+          },
+          {
+            "symbol": "PLTR",
+            "side": "buy",
+            "id": "203a7ccc-f328-4921-8620-497c1c26615d",
+            "status": "pending_new"
+          },
+          {
+            "symbol": "HPE",
+            "side": "buy",
+            "id": "c1fa0a47-f698-4a38-878a-cc20e52b05f5",
+            "status": "pending_new"
+          },
+          {
+            "symbol": "TSLA",
+            "side": "buy",
+            "id": "7e19c13e-7189-468e-b0fe-f52214e53cf6",
+            "status": "pending_new"
+          },
+          {
+            "symbol": "INTC",
+            "side": "buy",
+            "id": "59ba6cb8-6eb6-4c4d-803e-8cd8392227f9",
+            "status": "pending_new"
+          },
+          {
+            "symbol": "KLAC",
+            "side": "buy",
+            "id": "629f143b-d005-4955-ba47-0ab17befa51e",
+            "status": "pending_new"
+          },
+          {
+            "symbol": "IWM",
+            "side": "buy",
+            "id": "f37a7a67-63c7-4454-9266-08f3219ed605",
+            "status": "pending_new"
+          }
+        ],
+        "post_sell_equity": "64385.61",
+        "post_sell_cash": "57966.00"
       }
     }
   ]
