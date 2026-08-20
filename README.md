@@ -233,6 +233,37 @@ an order instruction.
 The resulting target weights are research output only—not investment advice,
 account-specific share quantities, or order instructions.
 
+### FTMO US simulated assets: three-month 5-minute proxy audit
+
+The manual **FTMO US three-month causal five-minute proxy audit** Action
+verifies the active FTMO US simulated-asset manifest at run time, then covers
+every mapped asset: the 42 FX pairs plus US500, US30, US100, gold, silver, WTI
+oil, and BTCUSD. The reviewed mapping is in
+`assets/ftmo_us_dukascopy_mapping.csv` and uses native Dukascopy one-minute
+BID/ASK candles, reduced only when the exact final M1 endpoint exists.
+
+It forms a new capped long-only equal-weight allocation of the highest trailing
+five-minute forecasts, using labels that end strictly before its decision. Forecast accuracy is measured
+against proxy mid returns; the separate executable-proxy series enters at a
+Dukascopy ASK endpoint and exits at the next BID endpoint. The workflow uploads
+the exact five-minute proxy endpoints used by the model, official manifest snapshot, selected-symbol mapping,
+prediction ledger, holdings, JSON metrics, and its Markdown audit report.
+
+This is intentionally not an FTMO execution backtest. FTMO US is a simulated
+environment, and Dukascopy does not reproduce its quotes, fills, commissions,
+swaps, rollover contracts, volume limits, slippage, or account rules. The
+report names all omitted costs and must not be treated as an FTMO return,
+pass-probability, or order recommendation.
+
+The separate **FTMO US three-month H1 H4 D1 proxy audit** Action downloads the
+same M1 BID/ASK proxy data once, then requires each hourly, four-hour, or daily
+decision to have its exact final M1 endpoint. It evaluates three months with a
+90-day warm-up: H1 uses 720/250 trailing/minimum windows, H4 uses 360/100, and
+D1 uses 60/20. Each timeframe receives two reproducible ledgers and reports:
+one portfolio rebalances at every decision; the other selects its first eligible
+causal portfolio and holds that basket unchanged through the final common exact
+endpoint. They are proxy-feed research comparisons, not FTMO execution results.
+
 ### One-hour targets with 15-minute rebalancing
 
 `cufolio_cpu.hourly_intraday_backtest` is a separate, research-only historical
