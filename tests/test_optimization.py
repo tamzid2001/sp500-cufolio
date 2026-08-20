@@ -2,7 +2,12 @@ import numpy as np
 import pandas as pd
 
 from cufolio_cpu.backtest import walk_forward_rebalance
-from cufolio_cpu.optimize import efficient_frontier, mean_cvar_weights, mean_variance_weights
+from cufolio_cpu.optimize import (
+    efficient_frontier,
+    forecast_diagonal_mean_variance_weights,
+    mean_cvar_weights,
+    mean_variance_weights,
+)
 
 
 def sample_returns() -> pd.DataFrame:
@@ -43,6 +48,18 @@ def test_mean_variance_regularizes_a_singular_complete_case_covariance() -> None
     assert np.isfinite(result.expected_return)
     assert np.isclose(result.weights.sum(), 1.0)
     assert (result.weights <= 0.35 + 1e-8).all()
+
+
+def test_forecast_diagonal_mean_variance_weights_respects_caps() -> None:
+    result = forecast_diagonal_mean_variance_weights(
+        pd.Series({"AAPL": 0.03, "MSFT": 0.02, "NVDA": 0.01}),
+        pd.Series({"AAPL": 0.004, "MSFT": 0.003, "NVDA": 0.002}),
+        max_weight=0.50,
+    )
+
+    assert np.isclose(result.weights.sum(), 1.0)
+    assert (result.weights >= 0).all()
+    assert (result.weights <= 0.50 + 1e-8).all()
 
 
 def test_frontier_and_causal_backtest_run() -> None:
