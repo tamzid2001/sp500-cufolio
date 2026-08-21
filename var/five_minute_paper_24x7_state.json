@@ -17,7 +17,8 @@
     "forecast_and_order:2026-08-21T14:30:00+00:00",
     "forecast_and_order:2026-08-21T14:35:00+00:00",
     "forecast_and_order:2026-08-21T14:40:00+00:00",
-    "forecast_and_order:2026-08-21T14:45:00+00:00"
+    "forecast_and_order:2026-08-21T14:45:00+00:00",
+    "forecast_and_order:2026-08-21T14:50:00+00:00"
   ],
   "ledger": [
     {
@@ -4980,6 +4981,132 @@
         ],
         "post_sell_equity": "64537.52",
         "post_sell_cash": "45147.69"
+      }
+    },
+    {
+      "event": "five_minute_forecast_target_order",
+      "scheduled_at": "2026-08-21T14:50:00+00:00",
+      "observed_at": "2026-08-21T14:50:00.000698+00:00",
+      "target_end": "2026-08-21T14:55:00+00:00",
+      "forecast_horizon_minutes": 5,
+      "cache_refresh_seconds": 36.77930711100089,
+      "candidate_file": "candidate_20260821T1450Z.csv",
+      "forecast_status": {
+        "forecast_status": "ok",
+        "decision_timestamp": "2026-08-21T14:50:00+00:00",
+        "training_observations": 780,
+        "training_sessions": 11,
+        "input_assets": 6993,
+        "assets_with_decision_price": 1427,
+        "required_candidates_for_weight_cap": 10,
+        "minimum_training_sessions": 10,
+        "minimum_covariance_scenarios": 500,
+        "training_end": "2026-08-21T14:45:00+00:00",
+        "eligible_assets": 310,
+        "candidate_count": 11,
+        "covariance_scenarios": 500,
+        "candidate_weight_capacity": 1.1,
+        "reason": "ok",
+        "optimizer_status": "optimal",
+        "expected_portfolio_log_return": 5.623547569192403e-05,
+        "expected_portfolio_simple_return": 5.623705693592771e-05,
+        "weights_generated": true,
+        "decision_price_timestamp": "2026-08-21T14:49:00+00:00",
+        "target_end": "2026-08-21T14:55:00+00:00",
+        "forecast_interval_minutes": 5,
+        "forecast_horizon_minutes": 5,
+        "causality_rule": "training target_end is strictly earlier than the decision and the decision price is the preceding completed one-minute close",
+        "training_prepared_at": "2026-08-21T14:49:18.196266+00:00"
+      },
+      "target_weights": {
+        "PURR": "0.1",
+        "BKNG": "0.1",
+        "AAPL": "0.1",
+        "TSLA": "0.1",
+        "MU": "0.1",
+        "SMCI": "0.1",
+        "SPCX": "0.1",
+        "KLAC": "0.1",
+        "PLTR": "0.1",
+        "INTC": "0.099999995610654",
+        "NVDA": "4.389345914512788E-9"
+      },
+      "paper_rebalance": {
+        "trading_mode": "paper",
+        "trading_endpoint": "https://paper-api.alpaca.markets/v2",
+        "execute": true,
+        "target_symbols": [
+          "PURR",
+          "BKNG",
+          "AAPL",
+          "TSLA",
+          "MU",
+          "SMCI",
+          "SPCX",
+          "KLAC",
+          "PLTR",
+          "INTC",
+          "NVDA"
+        ],
+        "clock_timestamp": "2026-08-21T10:50:39.233996243-04:00",
+        "market_open": true,
+        "min_weight_drift": "0.000500000",
+        "liquidate_non_target_positions": true,
+        "complete_rebalance": true,
+        "cancel_stale_open_orders": true,
+        "retain_only_unchanged_targets": true,
+        "orders": [
+          {
+            "symbol": "NVDA",
+            "side": "sell",
+            "qty": "30.016938898",
+            "target_weight": "0.000000000",
+            "current_notional": "6456.34",
+            "target_notional": "0.00"
+          },
+          {
+            "symbol": "SMCI",
+            "side": "buy",
+            "notional": "6456.42",
+            "target_weight": "0.100000000",
+            "current_notional": "0.00",
+            "target_notional": "6460.92"
+          }
+        ],
+        "equity": "64595.96",
+        "cash": "0.08",
+        "retained_unchanged_target_symbols": [
+          "AAPL",
+          "BKNG",
+          "INTC",
+          "KLAC",
+          "MU",
+          "PLTR",
+          "PURR",
+          "SPCX",
+          "TSLA"
+        ],
+        "replaced_changed_target_symbols": [
+          "NVDA",
+          "SMCI"
+        ],
+        "status": "sell_then_buy_orders_submitted",
+        "submitted_orders": [
+          {
+            "symbol": "NVDA",
+            "side": "sell",
+            "id": "fe334982-1aed-4885-8f61-7ad75db8fb43",
+            "status": "pending_new"
+          },
+          {
+            "symbol": "SMCI",
+            "side": "buy",
+            "id": "3c51b94b-ef1a-4b5a-8767-21e4a06d4a32",
+            "status": "pending_new"
+          }
+        ],
+        "post_sell_equity": "64609.28",
+        "post_sell_cash": "6456.42"
       }
     }
   ]
