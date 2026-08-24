@@ -5,7 +5,8 @@
     "forecast_and_order:2026-08-24T13:30:00+00:00",
     "forecast_and_order:2026-08-24T13:35:00+00:00",
     "forecast_and_order:2026-08-24T13:40:00+00:00",
-    "forecast_and_order:2026-08-24T13:45:00+00:00"
+    "forecast_and_order:2026-08-24T13:45:00+00:00",
+    "forecast_and_order:2026-08-24T13:50:00+00:00"
   ],
   "ledger": [
     {
@@ -907,6 +908,247 @@
         ],
         "post_sell_equity": "62935.41",
         "post_sell_cash": "37738.79"
+      }
+    },
+    {
+      "event": "five_minute_forecast_target_order",
+      "scheduled_at": "2026-08-24T13:50:00+00:00",
+      "observed_at": "2026-08-24T13:50:00.000698+00:00",
+      "target_end": "2026-08-24T13:55:00+00:00",
+      "forecast_horizon_minutes": 5,
+      "cache_refresh_seconds": 35.33000256299965,
+      "candidate_file": "candidate_20260824T1350Z.csv",
+      "forecast_status": {
+        "forecast_status": "ok",
+        "decision_timestamp": "2026-08-24T13:50:00+00:00",
+        "training_observations": 780,
+        "training_sessions": 11,
+        "input_assets": 6991,
+        "assets_with_decision_price": 1474,
+        "required_candidates_for_weight_cap": 10,
+        "minimum_training_sessions": 10,
+        "minimum_covariance_scenarios": 500,
+        "training_end": "2026-08-24T13:45:00+00:00",
+        "eligible_assets": 302,
+        "candidate_count": 12,
+        "covariance_scenarios": 500,
+        "candidate_weight_capacity": 1.2000000000000002,
+        "reason": "ok",
+        "optimizer_status": "optimal",
+        "expected_portfolio_log_return": 0.00023929560872755186,
+        "expected_portfolio_simple_return": 0.00023932424220563965,
+        "weights_generated": true,
+        "decision_price_timestamp": "2026-08-24T13:49:00+00:00",
+        "target_end": "2026-08-24T13:55:00+00:00",
+        "forecast_interval_minutes": 5,
+        "forecast_horizon_minutes": 5,
+        "causality_rule": "training target_end is strictly earlier than the decision and the decision price is the preceding completed one-minute close",
+        "training_prepared_at": "2026-08-24T13:49:16.464237+00:00"
+      },
+      "target_weights": {
+        "MRNA": "0.1",
+        "NFLX": "0.1",
+        "UBER": "0.1",
+        "BSX": "0.1",
+        "AAPL": "0.1",
+        "GDX": "0.1",
+        "PLTR": "0.1",
+        "NVDA": "0.1",
+        "KLAC": "0.0999999999549831",
+        "INTC": "0.0999999998871457",
+        "SPCX": "7.893551090543127E-11",
+        "SMCI": "7.893551090543127E-11"
+      },
+      "paper_rebalance": {
+        "trading_mode": "paper",
+        "trading_endpoint": "https://paper-api.alpaca.markets/v2",
+        "execute": true,
+        "target_symbols": [
+          "MRNA",
+          "NFLX",
+          "UBER",
+          "BSX",
+          "AAPL",
+          "GDX",
+          "PLTR",
+          "NVDA",
+          "KLAC",
+          "INTC",
+          "SPCX",
+          "SMCI"
+        ],
+        "clock_timestamp": "2026-08-24T09:50:37.799071798-04:00",
+        "market_open": true,
+        "min_weight_drift": "0.000500000",
+        "liquidate_non_target_positions": true,
+        "complete_rebalance": true,
+        "cancel_stale_open_orders": true,
+        "retain_only_unchanged_targets": true,
+        "orders": [
+          {
+            "symbol": "CMG",
+            "side": "sell",
+            "qty": "168.220914683",
+            "target_weight": "0.000000000",
+            "current_notional": "6264.54",
+            "target_notional": "0.00"
+          },
+          {
+            "symbol": "GDX",
+            "side": "sell",
+            "qty": "61.092463092",
+            "target_weight": "0.000000000",
+            "current_notional": "6320.62",
+            "target_notional": "0.00"
+          },
+          {
+            "symbol": "SPCX",
+            "side": "sell",
+            "qty": "46.248271804",
+            "target_weight": "0.000000000",
+            "current_notional": "6231.49",
+            "target_notional": "0.00"
+          },
+          {
+            "symbol": "TSLA",
+            "side": "sell",
+            "qty": "17.878570819",
+            "target_weight": "0.000000000",
+            "current_notional": "6309.43",
+            "target_notional": "0.00"
+          },
+          {
+            "symbol": "MRNA",
+            "side": "sell",
+            "qty": "0.274381113",
+            "target_weight": "0.100000000",
+            "current_notional": "6337.05",
+            "target_notional": "6299.76"
+          },
+          {
+            "symbol": "PLTR",
+            "side": "sell",
+            "qty": "0.197364177",
+            "target_weight": "0.100000000",
+            "current_notional": "6334.05",
+            "target_notional": "6299.76"
+          },
+          {
+            "symbol": "NFLX",
+            "side": "buy",
+            "notional": "6298.18",
+            "target_weight": "0.100000000",
+            "current_notional": "0.00",
+            "target_notional": "6299.70"
+          },
+          {
+            "symbol": "UBER",
+            "side": "buy",
+            "notional": "6298.18",
+            "target_weight": "0.100000000",
+            "current_notional": "0.00",
+            "target_notional": "6299.70"
+          },
+          {
+            "symbol": "GDX",
+            "side": "buy",
+            "notional": "6298.18",
+            "target_weight": "0.100000000",
+            "current_notional": "0.00",
+            "target_notional": "6299.70"
+          },
+          {
+            "symbol": "KLAC",
+            "side": "buy",
+            "notional": "6298.17",
+            "target_weight": "0.099999999",
+            "current_notional": "0.00",
+            "target_notional": "6299.70"
+          }
+        ],
+        "equity": "62997.63",
+        "cash": "0.11",
+        "retained_unchanged_target_symbols": [
+          "AAPL",
+          "BSX",
+          "INTC",
+          "MRNA",
+          "NVDA",
+          "PLTR",
+          "SMCI"
+        ],
+        "replaced_changed_target_symbols": [
+          "GDX",
+          "KLAC",
+          "NFLX",
+          "SPCX",
+          "UBER"
+        ],
+        "status": "sell_then_buy_orders_submitted",
+        "submitted_orders": [
+          {
+            "symbol": "CMG",
+            "side": "sell",
+            "id": "3f27b043-fb1f-46d1-b786-3957ad770688",
+            "status": "pending_new"
+          },
+          {
+            "symbol": "GDX",
+            "side": "sell",
+            "id": "2bf0c4cc-66ec-48f6-ae6b-1a6dd32803af",
+            "status": "pending_new"
+          },
+          {
+            "symbol": "SPCX",
+            "side": "sell",
+            "id": "dccf9a4a-57ff-4a0e-ada5-a61900831fba",
+            "status": "pending_new"
+          },
+          {
+            "symbol": "TSLA",
+            "side": "sell",
+            "id": "7f9f41ed-fe6d-4c5f-9f7f-8598b0ad90d4",
+            "status": "pending_new"
+          },
+          {
+            "symbol": "MRNA",
+            "side": "sell",
+            "id": "7cdea4c2-f6a6-4098-947b-38527d010121",
+            "status": "pending_new"
+          },
+          {
+            "symbol": "PLTR",
+            "side": "sell",
+            "id": "31792105-5aaa-48db-bc66-9205558b0eae",
+            "status": "pending_new"
+          },
+          {
+            "symbol": "NFLX",
+            "side": "buy",
+            "id": "e54a21af-259d-4799-88a2-3fb59c7d5dce",
+            "status": "pending_new"
+          },
+          {
+            "symbol": "UBER",
+            "side": "buy",
+            "id": "cd8382c9-0f31-43da-83b8-15fbce6d6b82",
+            "status": "pending_new"
+          },
+          {
+            "symbol": "GDX",
+            "side": "buy",
+            "id": "a596a56c-d328-44a6-8f1b-5e8975c47b12",
+            "status": "pending_new"
+          },
+          {
+            "symbol": "KLAC",
+            "side": "buy",
+            "id": "6739441e-486a-4c00-abde-5b0b4f50cc17",
+            "status": "pending_new"
+          }
+        ],
+        "post_sell_equity": "62997.07",
+        "post_sell_cash": "25192.72"
       }
     }
   ]
