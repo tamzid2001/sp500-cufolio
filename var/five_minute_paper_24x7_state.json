@@ -49,7 +49,8 @@
     "forecast_and_order:2026-08-24T17:10:00+00:00",
     "forecast_and_order:2026-08-24T17:15:00+00:00",
     "forecast_and_order:2026-08-24T17:20:00+00:00",
-    "forecast_and_order:2026-08-24T17:25:00+00:00"
+    "forecast_and_order:2026-08-24T17:25:00+00:00",
+    "forecast_and_order:2026-08-24T17:30:00+00:00"
   ],
   "ledger": [
     {
@@ -15505,6 +15506,202 @@
         ],
         "post_sell_equity": "62567.99",
         "post_sell_cash": "31307.32"
+      }
+    },
+    {
+      "event": "five_minute_forecast_target_order",
+      "scheduled_at": "2026-08-24T17:30:00+00:00",
+      "observed_at": "2026-08-24T17:30:00.000668+00:00",
+      "target_end": "2026-08-24T17:35:00+00:00",
+      "forecast_horizon_minutes": 5,
+      "cache_refresh_seconds": 36.93786123700011,
+      "candidate_file": "candidate_20260824T1730Z.csv",
+      "forecast_status": {
+        "forecast_status": "ok",
+        "decision_timestamp": "2026-08-24T17:30:00+00:00",
+        "training_observations": 780,
+        "training_sessions": 11,
+        "input_assets": 6967,
+        "assets_with_decision_price": 1226,
+        "required_candidates_for_weight_cap": 10,
+        "minimum_training_sessions": 10,
+        "minimum_covariance_scenarios": 500,
+        "training_end": "2026-08-24T17:25:00+00:00",
+        "eligible_assets": 271,
+        "candidate_count": 11,
+        "covariance_scenarios": 500,
+        "candidate_weight_capacity": 1.1,
+        "reason": "ok",
+        "optimizer_status": "optimal",
+        "expected_portfolio_log_return": 0.00014571250319109745,
+        "expected_portfolio_simple_return": 0.00014572311977354056,
+        "weights_generated": true,
+        "decision_price_timestamp": "2026-08-24T17:29:00+00:00",
+        "target_end": "2026-08-24T17:35:00+00:00",
+        "forecast_interval_minutes": 5,
+        "forecast_horizon_minutes": 5,
+        "causality_rule": "training target_end is strictly earlier than the decision and the decision price is the preceding completed one-minute close",
+        "training_prepared_at": "2026-08-24T17:29:16.195544+00:00"
+      },
+      "target_weights": {
+        "PURR": "0.0999999999766294",
+        "CELH": "0.1",
+        "KLAC": "0.1",
+        "TSLA": "0.1",
+        "PLTR": "0.1",
+        "AAPL": "0.1",
+        "CIFR": "0.1",
+        "NVDA": "0.1",
+        "INTC": "0.0999999994236727",
+        "SPCX": "0.0999999989695183",
+        "SMCI": "1.6301793526185546E-9"
+      },
+      "paper_rebalance": {
+        "trading_mode": "paper",
+        "trading_endpoint": "https://paper-api.alpaca.markets/v2",
+        "execute": true,
+        "target_symbols": [
+          "PURR",
+          "CELH",
+          "KLAC",
+          "TSLA",
+          "PLTR",
+          "AAPL",
+          "CIFR",
+          "NVDA",
+          "INTC",
+          "SPCX",
+          "SMCI"
+        ],
+        "clock_timestamp": "2026-08-24T13:30:39.082839359-04:00",
+        "market_open": true,
+        "min_weight_drift": "0.000500000",
+        "liquidate_non_target_positions": true,
+        "complete_rebalance": true,
+        "cancel_stale_open_orders": true,
+        "retain_only_unchanged_targets": true,
+        "orders": [
+          {
+            "symbol": "SMCI",
+            "side": "sell",
+            "qty": "176.130385806",
+            "target_weight": "0.000000000",
+            "current_notional": "6243.15",
+            "target_notional": "0.00"
+          },
+          {
+            "symbol": "SPCX",
+            "side": "sell",
+            "qty": "46.152356406",
+            "target_weight": "0.000000000",
+            "current_notional": "6273.95",
+            "target_notional": "0.00"
+          },
+          {
+            "symbol": "SPY",
+            "side": "sell",
+            "qty": "8.191950018",
+            "target_weight": "0.000000000",
+            "current_notional": "6254.06",
+            "target_notional": "0.00"
+          },
+          {
+            "symbol": "PURR",
+            "side": "buy",
+            "notional": "35.00",
+            "target_weight": "0.099999999",
+            "current_notional": "6222.04",
+            "target_notional": "6257.11"
+          },
+          {
+            "symbol": "CIFR",
+            "side": "buy",
+            "notional": "6244.32",
+            "target_weight": "0.100000000",
+            "current_notional": "0.00",
+            "target_notional": "6257.11"
+          },
+          {
+            "symbol": "INTC",
+            "side": "buy",
+            "notional": "6244.32",
+            "target_weight": "0.099999999",
+            "current_notional": "0.00",
+            "target_notional": "6257.11"
+          },
+          {
+            "symbol": "SPCX",
+            "side": "buy",
+            "notional": "6244.32",
+            "target_weight": "0.099999998",
+            "current_notional": "0.00",
+            "target_notional": "6257.11"
+          }
+        ],
+        "equity": "62576.12",
+        "cash": "0.09",
+        "retained_unchanged_target_symbols": [
+          "AAPL",
+          "CELH",
+          "KLAC",
+          "NVDA",
+          "PLTR",
+          "PURR",
+          "TSLA"
+        ],
+        "replaced_changed_target_symbols": [
+          "CIFR",
+          "INTC",
+          "SMCI",
+          "SPCX"
+        ],
+        "status": "sell_then_buy_orders_submitted",
+        "submitted_orders": [
+          {
+            "symbol": "SMCI",
+            "side": "sell",
+            "id": "71aeae83-d758-4a9e-aa21-220bd1fe6fdf",
+            "status": "pending_new"
+          },
+          {
+            "symbol": "SPCX",
+            "side": "sell",
+            "id": "a2b211b2-5f99-4aca-92cf-fd9abb13a4cf",
+            "status": "pending_new"
+          },
+          {
+            "symbol": "SPY",
+            "side": "sell",
+            "id": "80fc7620-88c9-41fa-b606-ebb07d11d27c",
+            "status": "pending_new"
+          },
+          {
+            "symbol": "PURR",
+            "side": "buy",
+            "id": "8f28a889-2116-43f8-b8a6-ec6e33530c18",
+            "status": "pending_new"
+          },
+          {
+            "symbol": "CIFR",
+            "side": "buy",
+            "id": "8d1d7c34-6336-43c8-a297-c723d321ad49",
+            "status": "pending_new"
+          },
+          {
+            "symbol": "INTC",
+            "side": "buy",
+            "id": "33c4123d-6847-4693-9908-1fe2085d0c39",
+            "status": "pending_new"
+          },
+          {
+            "symbol": "SPCX",
+            "side": "buy",
+            "id": "30701701-0c79-48ba-82bf-e301c6ba7584",
+            "status": "pending_new"
+          }
+        ],
+        "post_sell_equity": "62571.18",
+        "post_sell_cash": "18767.99"
       }
     }
   ]
